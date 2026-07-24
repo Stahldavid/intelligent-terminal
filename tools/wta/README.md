@@ -46,6 +46,10 @@ wta list-panes                            # list panes in first tab
 wta active-pane                           # show focused pane
 wta new-tab -c "pwsh.exe" -n "Build"      # create tab running pwsh
 wta split-pane -H -c "pwsh.exe"           # split horizontal
+wta workspace -d . -n "Agents" --pane "codex" --pane "npm test"
+                                               # preview a balanced workspace plan
+wta workspace -d . -n "Agents" --pane "codex" --pane "npm test" --apply
+                                               # create the planned workspace
 wta capture-pane -t 3 -l 50              # read last 50 lines from pane 3
 wta kill-pane -t 3                        # close pane 3
 wta pane-status -t 3                      # check if running
@@ -53,6 +57,13 @@ wta wait-for -t 3 --timeout 30           # wait for pane 3 to exit
 wta resolve-command which --json          # resolve aliases/functions from the PowerShell profile
 wta list-windows --json                   # raw JSON output
 ```
+
+`wta workspace` is preview-first: without `--apply` it prints the exact JSON
+plan and makes no Terminal changes. Repeat `--pane` one to four times to define
+the commands. Two panes split side-by-side, while three and four panes use a
+balanced grid. With `--apply`, WTA creates the tab and splits through the
+existing Terminal COM protocol; later steps stop immediately if any creation
+response is missing its pane identity.
 
 Short aliases are supported: `lsw`, `lst`, `lsp`, `neww`, `splitw`, `send`, `capturep`, `killp`, `setenv`.
 

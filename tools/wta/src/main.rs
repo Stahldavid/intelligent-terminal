@@ -39,6 +39,7 @@ mod theme;
 mod ui;
 mod ui_trace;
 mod win32;
+mod workspace;
 mod wsl;
 mod wsl_acp;
 
@@ -414,6 +415,25 @@ enum Command {
         /// Command to run in the new pane
         #[arg(short = 'c', long)]
         command: Option<String>,
+    },
+
+    /// Preview or create a balanced multi-pane workspace
+    Workspace {
+        /// Working directory shared by the workspace panes
+        #[arg(short = 'd', long, default_value = ".")]
+        cwd: String,
+
+        /// Workspace tab title
+        #[arg(short = 'n', long)]
+        title: Option<String>,
+
+        /// Command for a pane; repeat once per pane (maximum 4)
+        #[arg(long = "pane", required = true, value_name = "COMMAND")]
+        panes: Vec<String>,
+
+        /// Apply the plan to the current Intelligent Terminal instance
+        #[arg(long)]
+        apply: bool,
     },
 
     /// Capture pane output (like tmux capture-pane -p)
@@ -858,6 +878,22 @@ async fn main() -> Result<()> {
             }
             let result = channel.request("split_pane", params).await?;
             print_output(&result, json_mode, format_created_pane);
+            Ok(())
+        }
+        Some(Command::Workspace {
+            cwd,
+            title,
+            panes,
+            apply,
+        }) => {
+            let plan = workspace::build_plan(&cwd, title, panes)?;
+            if apply {
+                let channel = connect_channel().await?;
+                let result = workspace::apply_plan(&channel, &plan).await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            }
             Ok(())
         }
 
