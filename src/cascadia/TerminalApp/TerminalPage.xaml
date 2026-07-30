@@ -10,8 +10,15 @@
       xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
       xmlns:mtu="using:Microsoft.Terminal.UI"
       xmlns:mux="using:Microsoft.UI.Xaml.Controls"
+      xmlns:primitives="using:Windows.UI.Xaml.Controls.Primitives"
       Background="Transparent"
       mc:Ignorable="d">
+
+    <Page.KeyboardAccelerators>
+        <KeyboardAccelerator Key="B"
+                             Modifiers="Control,Shift"
+                             Invoked="_WorkspaceSidebarAcceleratorInvoked" />
+    </Page.KeyboardAccelerators>
 
     <Grid x:Name="Root"
           Background="Transparent">
@@ -57,24 +64,683 @@
             </mux:InfoBar>
         </StackPanel>
 
-        <!-- Solid filler behind TabContent so any transparent edge pixels
-             (pane border, padding rounding, etc.) between the pane and the
-             BottomBar read as a seamless continuation of the BottomBar
-             instead of showing the desktop behind the window. Uses the
-             BottomBar color so the gap — if any — visually merges into
-             the bar. Declared before TabContent so it sits behind. -->
-        <Border Grid.Row="2"
-                Background="#000000"
-                IsHitTestVisible="False" />
-
-        <Grid x:Name="TabContent"
+        <!-- Native workspace shell. The sidebar and pane content share one
+             layout surface so resizing/collapsing never reparents a TermControl
+             or an isolated BrowserPaneContent controller. -->
+        <Grid x:Name="WorkspaceShell"
               Grid.Row="2"
-              HorizontalAlignment="Stretch"
-              VerticalAlignment="Stretch">
-            <Grid.Background>
-                <ImageBrush />
-            </Grid.Background>
-        </Grid>
+              Grid.RowSpan="2"
+              UseLayoutRounding="True">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition x:Name="WorkspaceSidebarColumn"
+                                  Width="292"
+                                  MinWidth="232"
+                                  MaxWidth="360" />
+                <ColumnDefinition x:Name="WorkspaceSidebarSeparatorColumn"
+                                  Width="1" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <Border x:Name="WorkspaceSidebarRoot"
+                    Grid.Row="0"
+                    Grid.RowSpan="2"
+                    Grid.Column="0"
+                    Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+                <Grid Padding="10,9,10,8">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+
+                    <Grid Grid.Row="0"
+                          Margin="4,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0"
+                                    VerticalAlignment="Center">
+                            <TextBlock x:Uid="WorkspaceSidebarTitle"
+                                       Text="Workspaces"
+                                       FontFamily="Segoe UI Variable"
+                                       FontSize="14"
+                                       FontWeight="SemiBold" />
+                            <TextBlock x:Name="WorkspaceSidebarSummary"
+                                       Margin="0,1,0,0"
+                                       FontSize="11"
+                                       Opacity="0.56"
+                                       Text="0 workspaces" />
+                        </StackPanel>
+                        <Button x:Name="WorkspaceSidebarSearchButton"
+                                x:Uid="WorkspaceSidebarSearchButton"
+                                Grid.Column="1"
+                                Width="28"
+                                Height="28"
+                                Padding="0"
+                                Background="Transparent"
+                                BorderBrush="Transparent"
+                                ToolTipService.ToolTip="Find a workspace"
+                                AutomationProperties.Name="Find a workspace"
+                                Click="_WorkspaceSidebarSearchClicked">
+                            <FontIcon FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                      FontSize="12"
+                                      Glyph="&#xE721;" />
+                        </Button>
+                        <mux:SplitButton x:Name="WorkspaceSidebarNewButton"
+                                         x:Uid="WorkspaceSidebarNewButton"
+                                         Grid.Column="2"
+                                         Width="44"
+                                         Height="28"
+                                         Padding="0"
+                                         Background="Transparent"
+                                         BorderBrush="Transparent"
+                                         ToolTipService.ToolTip="New terminal or agent workspace"
+                                         AutomationProperties.Name="New terminal or agent workspace"
+                                         Click="_WorkspaceSidebarNewClicked">
+                            <FontIcon FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                      FontSize="13"
+                                      Glyph="&#xE710;" />
+                        </mux:SplitButton>
+                        <Button x:Name="WorkspaceSidebarAttentionButton"
+                                x:Uid="WorkspaceSidebarAttentionButton"
+                                Grid.Column="3"
+                                Width="28"
+                                Height="28"
+                                Padding="0"
+                                Background="Transparent"
+                                BorderBrush="Transparent"
+                                ToolTipService.ToolTip="Attention center"
+                                AutomationProperties.Name="Open attention center"
+                                Click="_WorkspaceSidebarAttentionClicked">
+                            <Grid>
+                                <FontIcon FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                          FontSize="13"
+                                          Glyph="&#xE7BA;" />
+                                <TextBlock x:Name="WorkspaceSidebarAttentionCount"
+                                           Margin="14,-13,0,0"
+                                           MinWidth="13"
+                                           Padding="2,0"
+                                           HorizontalAlignment="Center"
+                                           VerticalAlignment="Center"
+                                           FontSize="9"
+                                           TextAlignment="Center"
+                                           Visibility="Collapsed" />
+                            </Grid>
+                        </Button>
+                        <Button x:Name="WorkspaceSidebarFleetButton"
+                                x:Uid="WorkspaceSidebarFleetButton"
+                                Grid.Column="4"
+                                Width="28"
+                                Height="28"
+                                Padding="0"
+                                Background="Transparent"
+                                BorderBrush="Transparent"
+                                ToolTipService.ToolTip="Agents and teams"
+                                AutomationProperties.Name="Open agents and teams"
+                                Click="_WorkspaceSidebarFleetClicked">
+                            <FontIcon FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                      FontSize="13"
+                                      Glyph="&#xE8F1;" />
+                        </Button>
+                        <Button x:Name="WorkspaceSidebarCollapseButton"
+                                x:Uid="WorkspaceSidebarCollapseButton"
+                                Grid.Column="5"
+                                Width="28"
+                                Height="28"
+                                Padding="0"
+                                Background="Transparent"
+                                BorderBrush="Transparent"
+                                ToolTipService.ToolTip="Collapse workspace sidebar (Ctrl+Shift+B)"
+                                Click="_WorkspaceSidebarToggleClicked">
+                            <FontIcon FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                      FontSize="13"
+                                      Glyph="&#xE76B;" />
+                        </Button>
+                    </Grid>
+
+                    <TextBox x:Name="WorkspaceSidebarSearch"
+                             x:Uid="WorkspaceSidebarSearch"
+                             Grid.Row="1"
+                             Height="30"
+                             Margin="0,0,0,8"
+                             Padding="8,3"
+                             FontSize="12"
+                             PlaceholderText="Find a workspace"
+                             Visibility="Collapsed"
+                             TextChanged="_WorkspaceSidebarSearchChanged"
+                             AutomationProperties.Name="Find a workspace" />
+
+                    <ScrollViewer Grid.Row="2"
+                                  HorizontalContentAlignment="Stretch"
+                                  HorizontalScrollBarVisibility="Disabled"
+                                  VerticalScrollBarVisibility="Auto"
+                                  VerticalScrollMode="Auto">
+                        <StackPanel x:Name="WorkspaceSidebarItems"
+                                    HorizontalAlignment="Stretch"
+                                    Spacing="3" />
+                    </ScrollViewer>
+
+                    <Grid Grid.Row="3"
+                          Margin="0,8,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <Button x:Name="WorkspaceSidebarRecentButton"
+                                x:Uid="WorkspaceSidebarRecentButton"
+                                Grid.Column="0"
+                                HorizontalAlignment="Left"
+                                Padding="6,4"
+                                Background="Transparent"
+                                BorderBrush="Transparent"
+                                ToolTipService.ToolTip="Show recently closed workspaces"
+                                Click="_WorkspaceSidebarRecentClicked">
+                            <StackPanel Orientation="Horizontal"
+                                        Spacing="7">
+                                <FontIcon FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                          FontSize="13"
+                                          Glyph="&#xE81C;" />
+                                <TextBlock x:Name="WorkspaceSidebarRecentLabel"
+                                           x:Uid="WorkspaceSidebarRecentLabel"
+                                           FontSize="12"
+                                           Text="Recently closed" />
+                            </StackPanel>
+                        </Button>
+                        <Button x:Name="WorkspaceSidebarGitButton"
+                                x:Uid="WorkspaceSidebarGitButton"
+                                Grid.Column="1"
+                                Width="30"
+                                Height="30"
+                                Padding="0"
+                                Background="Transparent"
+                                BorderBrush="Transparent"
+                                ToolTipService.ToolTip="Native Git status and diff"
+                                AutomationProperties.Name="Open Git workspace view"
+                                Click="_WorkspaceSidebarGitClicked">
+                            <FontIcon FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                      FontSize="13"
+                                      Glyph="&#xE8A5;" />
+                        </Button>
+                        <Button x:Name="WorkspaceSidebarDoctorButton"
+                                x:Uid="WorkspaceSidebarDoctorButton"
+                                Grid.Column="2"
+                                Width="30"
+                                Height="30"
+                                Padding="0"
+                                Background="Transparent"
+                                BorderBrush="Transparent"
+                                ToolTipService.ToolTip="Workspace diagnostics"
+                                AutomationProperties.Name="Run workspace diagnostics"
+                                Click="_WorkspaceSidebarDoctorClicked">
+                            <FontIcon FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                      FontSize="13"
+                                      Glyph="&#xE9D9;" />
+                        </Button>
+                        <Button x:Name="WorkspaceSidebarRefreshButton"
+                                x:Uid="WorkspaceSidebarRefreshButton"
+                                Grid.Column="3"
+                                Width="30"
+                                Height="30"
+                                Padding="0"
+                                Background="Transparent"
+                                BorderBrush="Transparent"
+                                ToolTipService.ToolTip="Refresh workspace metadata"
+                                Click="_WorkspaceSidebarRefreshClicked">
+                            <FontIcon FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                      FontSize="13"
+                                      Glyph="&#xE72C;" />
+                        </Button>
+                    </Grid>
+
+                </Grid>
+            </Border>
+
+            <!-- Dedicated layout column: neither the sidebar nor the terminal
+                 can leave a fractional-DPI hole here. The opaque base is
+                 separate from the translucent visible rule. -->
+            <Border x:Name="WorkspaceSidebarSeparatorUnderlay"
+                    Grid.Row="0"
+                    Grid.RowSpan="2"
+                    Grid.Column="1"
+                    HorizontalAlignment="Stretch"
+                    Background="{ThemeResource SystemControlBackgroundAltHighBrush}"
+                    IsHitTestVisible="False" />
+
+            <Grid x:Name="TabContent"
+                  Grid.Row="0"
+                  Grid.Column="2"
+                  HorizontalAlignment="Stretch"
+                  VerticalAlignment="Stretch">
+                <Grid.Background>
+                    <ImageBrush />
+                </Grid.Background>
+            </Grid>
+
+            <!-- The visible 1-DIP rule alpha-blends against the opaque
+                 underlay above, never against the transparent window. -->
+            <Border x:Name="WorkspaceSidebarSeparator"
+                    Grid.Row="0"
+                    Grid.RowSpan="2"
+                    Grid.Column="1"
+                    HorizontalAlignment="Stretch"
+                    Background="{ThemeResource SystemControlForegroundBaseLowBrush}"
+                    IsHitTestVisible="False"
+                    Canvas.ZIndex="90" />
+
+            <!-- Wide transparent hit target; it never supplies visual pixels. -->
+            <primitives:Thumb x:Name="WorkspaceSidebarSplitter"
+                              Grid.Row="0"
+                              Grid.RowSpan="2"
+                              Grid.Column="1"
+                              Width="7"
+                              HorizontalAlignment="Center"
+                              Background="Transparent"
+                              Canvas.ZIndex="100"
+                              DragDelta="_WorkspaceSidebarResizeDelta"
+                              DragCompleted="_WorkspaceSidebarResizeCompleted"
+                              AutomationProperties.Name="Resize workspace sidebar" />
+
+            <Button x:Name="WorkspaceSidebarRevealButton"
+                    x:Uid="WorkspaceSidebarRevealButton"
+                    Grid.Row="0"
+                    Grid.Column="2"
+                    Width="34"
+                    Height="34"
+                    Margin="8"
+                    Padding="0"
+                    HorizontalAlignment="Left"
+                    VerticalAlignment="Top"
+                    Background="#CC111111"
+                    BorderBrush="#26FFFFFF"
+                    Visibility="Collapsed"
+                    ToolTipService.ToolTip="Show workspace sidebar (Ctrl+Shift+B)"
+                    Click="_WorkspaceSidebarToggleClicked"
+                    Canvas.ZIndex="50">
+                <FontIcon FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                          FontSize="14"
+                          Glyph="&#xE76C;" />
+            </Button>
+
+            <!-- Persistent, workspace-scoped control surface for native agent
+                 teams. This is deliberately an in-page overlay instead of a
+                 ContentDialog: users can switch workspaces from the sidebar,
+                 inspect a worker, and return to its terminal without changing
+                 the underlying tab/pane/surface ownership model. -->
+            <Border x:Name="WorkspaceFleetOverlay"
+                    Grid.Row="0"
+                    Grid.RowSpan="2"
+                    Grid.Column="2"
+                    Background="{ThemeResource ApplicationPageBackgroundThemeBrush}"
+                    BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}"
+                    BorderThickness="0,0,0,0"
+                    Visibility="Collapsed"
+                    Canvas.ZIndex="140">
+                <Grid Padding="20,16,20,18">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="190" />
+                    </Grid.RowDefinitions>
+
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel>
+                            <TextBlock x:Name="WorkspaceFleetTitleText"
+                                       Text="Agents &amp; Tasks"
+                                       FontFamily="Segoe UI Variable"
+                                       FontSize="22"
+                                       FontWeight="SemiBold" />
+                            <TextBlock x:Name="WorkspaceFleetScopeText"
+                                       Margin="0,3,0,0"
+                                       Text="Focused workspace"
+                                       FontSize="12"
+                                       Opacity="0.62" />
+                        </StackPanel>
+                        <Button Grid.Column="1"
+                                Margin="0,0,6,0"
+                                Padding="10,5"
+                                Background="Transparent"
+                                BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}"
+                                Click="_WorkspaceFleetAddClicked"
+                                AutomationProperties.Name="Add a native team, worker, or task">
+                            <StackPanel Orientation="Horizontal"
+                                        Spacing="7">
+                                <FontIcon FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                          FontSize="12"
+                                          Glyph="&#xE710;" />
+                                <TextBlock Text="Add"
+                                           FontSize="12" />
+                            </StackPanel>
+                        </Button>
+                        <Button Grid.Column="2"
+                                Margin="0,0,6,0"
+                                Padding="10,5"
+                                Background="Transparent"
+                                BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}"
+                                Click="_WorkspaceFleetRefreshClicked"
+                                AutomationProperties.Name="Refresh agents and tasks">
+                            <StackPanel Orientation="Horizontal"
+                                        Spacing="7">
+                                <FontIcon FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                          FontSize="12"
+                                          Glyph="&#xE72C;" />
+                                <TextBlock Text="Refresh"
+                                           FontSize="12" />
+                            </StackPanel>
+                        </Button>
+                        <Button Grid.Column="3"
+                                Width="32"
+                                Height="32"
+                                Padding="0"
+                                Background="Transparent"
+                                BorderBrush="Transparent"
+                                Click="_WorkspaceFleetCloseClicked"
+                                ToolTipService.ToolTip="Close Agents &amp; Tasks"
+                                AutomationProperties.Name="Close Agents and Tasks">
+                            <FontIcon FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                      FontSize="13"
+                                      Glyph="&#xE711;" />
+                        </Button>
+                    </Grid>
+
+                    <Grid Grid.Row="1"
+                          Margin="0,16,0,14">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Border Grid.Column="0"
+                                Margin="0,0,6,0"
+                                Padding="12,9"
+                                CornerRadius="6"
+                                Background="{ThemeResource SystemControlHighlightListLowBrush}">
+                            <StackPanel>
+                                <TextBlock Text="AGENTS"
+                                           FontSize="10"
+                                           CharacterSpacing="60"
+                                           Opacity="0.55" />
+                                <TextBlock x:Name="WorkspaceFleetAgentCount"
+                                           Margin="0,2,0,0"
+                                           Text="0"
+                                           FontSize="19"
+                                           FontWeight="SemiBold" />
+                            </StackPanel>
+                        </Border>
+                        <Border Grid.Column="1"
+                                Margin="6,0"
+                                Padding="12,9"
+                                CornerRadius="6"
+                                Background="{ThemeResource SystemControlHighlightListLowBrush}">
+                            <StackPanel>
+                                <TextBlock Text="RUNNING"
+                                           FontSize="10"
+                                           CharacterSpacing="60"
+                                           Opacity="0.55" />
+                                <TextBlock x:Name="WorkspaceFleetRunningCount"
+                                           Margin="0,2,0,0"
+                                           Text="0"
+                                           FontSize="19"
+                                           FontWeight="SemiBold"
+                                           Foreground="#FF4ECB71" />
+                            </StackPanel>
+                        </Border>
+                        <Border Grid.Column="2"
+                                Margin="6,0"
+                                Padding="12,9"
+                                CornerRadius="6"
+                                Background="{ThemeResource SystemControlHighlightListLowBrush}">
+                            <StackPanel>
+                                <TextBlock Text="NEEDS ATTENTION"
+                                           FontSize="10"
+                                           CharacterSpacing="60"
+                                           Opacity="0.55" />
+                                <TextBlock x:Name="WorkspaceFleetAttentionCount"
+                                           Margin="0,2,0,0"
+                                           Text="0"
+                                           FontSize="19"
+                                           FontWeight="SemiBold"
+                                           Foreground="#FFFFB900" />
+                            </StackPanel>
+                        </Border>
+                        <Border Grid.Column="3"
+                                Margin="6,0,0,0"
+                                Padding="12,9"
+                                CornerRadius="6"
+                                Background="{ThemeResource SystemControlHighlightListLowBrush}">
+                            <StackPanel>
+                                <TextBlock Text="OPEN TASKS"
+                                           FontSize="10"
+                                           CharacterSpacing="60"
+                                           Opacity="0.55" />
+                                <TextBlock x:Name="WorkspaceFleetTaskCount"
+                                           Margin="0,2,0,0"
+                                           Text="0"
+                                           FontSize="19"
+                                           FontWeight="SemiBold"
+                                           Foreground="#FF4CC2FF" />
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+
+                    <Grid Grid.Row="2">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="0.85*" />
+                            <ColumnDefinition Width="1.7*" />
+                        </Grid.ColumnDefinitions>
+
+                        <Border Grid.Column="0"
+                                Margin="0,0,7,0"
+                                CornerRadius="7"
+                                BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}"
+                                BorderThickness="1"
+                                Background="{ThemeResource SystemControlBackgroundAltHighBrush}">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+                                <TextBlock Margin="14,11,14,8"
+                                           Text="Agent mesh"
+                                           FontSize="13"
+                                           FontWeight="SemiBold" />
+                                <ScrollViewer Grid.Row="1"
+                                              HorizontalScrollBarVisibility="Disabled"
+                                              VerticalScrollBarVisibility="Auto">
+                                    <StackPanel x:Name="WorkspaceFleetAgentItems"
+                                                Padding="8,0,8,10"
+                                                Spacing="5" />
+                                </ScrollViewer>
+                            </Grid>
+                        </Border>
+
+                        <Border Grid.Column="1"
+                                Margin="7,0,0,0"
+                                CornerRadius="7"
+                                BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}"
+                                BorderThickness="1"
+                                Background="{ThemeResource SystemControlBackgroundAltHighBrush}">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+                                <Grid Margin="14,11,14,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="Task board"
+                                               FontSize="13"
+                                               FontWeight="SemiBold" />
+                                    <TextBlock x:Name="WorkspaceFleetTeamSummary"
+                                               Grid.Column="1"
+                                               FontSize="11"
+                                               Opacity="0.58" />
+                                </Grid>
+                                <Grid Grid.Row="1"
+                                      Margin="8,0,8,10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid Grid.Column="0"
+                                          Margin="0,0,4,0">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="*" />
+                                        </Grid.RowDefinitions>
+                                        <TextBlock Margin="6,3,6,7"
+                                                   Text="QUEUED"
+                                                   FontSize="10"
+                                                   CharacterSpacing="60"
+                                                   Opacity="0.55" />
+                                        <ScrollViewer Grid.Row="1"
+                                                      VerticalScrollBarVisibility="Auto">
+                                            <StackPanel x:Name="WorkspaceFleetQueuedTasks"
+                                                        Spacing="5" />
+                                        </ScrollViewer>
+                                    </Grid>
+                                    <Grid Grid.Column="1"
+                                          Margin="4,0">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="*" />
+                                        </Grid.RowDefinitions>
+                                        <TextBlock Margin="6,3,6,7"
+                                                   Text="IN PROGRESS"
+                                                   FontSize="10"
+                                                   CharacterSpacing="60"
+                                                   Opacity="0.55" />
+                                        <ScrollViewer Grid.Row="1"
+                                                      VerticalScrollBarVisibility="Auto">
+                                            <StackPanel x:Name="WorkspaceFleetRunningTasks"
+                                                        Spacing="5" />
+                                        </ScrollViewer>
+                                    </Grid>
+                                    <Grid Grid.Column="2"
+                                          Margin="4,0,0,0">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="*" />
+                                        </Grid.RowDefinitions>
+                                        <TextBlock Margin="6,3,6,7"
+                                                   Text="COMPLETED"
+                                                   FontSize="10"
+                                                   CharacterSpacing="60"
+                                                   Opacity="0.55" />
+                                        <ScrollViewer Grid.Row="1"
+                                                      VerticalScrollBarVisibility="Auto">
+                                            <StackPanel x:Name="WorkspaceFleetCompletedTasks"
+                                                        Spacing="5" />
+                                        </ScrollViewer>
+                                    </Grid>
+                                </Grid>
+                            </Grid>
+                        </Border>
+                    </Grid>
+
+                    <Grid Grid.Row="3"
+                          Margin="0,14,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Border Grid.Column="0"
+                                Margin="0,0,7,0"
+                                CornerRadius="7"
+                                BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}"
+                                BorderThickness="1"
+                                Background="{ThemeResource SystemControlBackgroundAltHighBrush}">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+                                <Grid Margin="14,10,14,7">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="Compute targets"
+                                               FontSize="13"
+                                               FontWeight="SemiBold" />
+                                    <Button Grid.Column="1"
+                                            Margin="0,0,8,0"
+                                            Padding="7,2"
+                                            FontSize="9"
+                                            Content="Discover"
+                                            Click="_WorkspaceFleetDiscoverTargetsClicked"
+                                            AutomationProperties.Name="Discover local, WSL, and SSH compute targets" />
+                                    <TextBlock x:Name="WorkspaceFleetTargetSummary"
+                                               Grid.Column="2"
+                                               FontSize="10"
+                                               Opacity="0.58" />
+                                </Grid>
+                                <ScrollViewer Grid.Row="1"
+                                              VerticalScrollBarVisibility="Auto">
+                                    <StackPanel x:Name="WorkspaceFleetTargetItems"
+                                                Padding="8,0,8,9"
+                                                Spacing="5" />
+                                </ScrollViewer>
+                            </Grid>
+                        </Border>
+                        <Border Grid.Column="1"
+                                Margin="7,0,0,0"
+                                CornerRadius="7"
+                                BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}"
+                                BorderThickness="1"
+                                Background="{ThemeResource SystemControlBackgroundAltHighBrush}">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+                                <Grid Margin="14,10,14,7">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="Jobs &amp; verified transfers"
+                                               FontSize="13"
+                                               FontWeight="SemiBold" />
+                                    <TextBlock x:Name="WorkspaceFleetJobSummary"
+                                               Grid.Column="1"
+                                               FontSize="10"
+                                               Opacity="0.58" />
+                                </Grid>
+                                <ScrollViewer Grid.Row="1"
+                                              VerticalScrollBarVisibility="Auto">
+                                    <StackPanel x:Name="WorkspaceFleetJobItems"
+                                                Padding="8,0,8,9"
+                                                Spacing="5" />
+                                </ScrollViewer>
+                            </Grid>
+                        </Border>
+                    </Grid>
+                </Grid>
+            </Border>
 
         <!-- Bottom Bar: window-level AI agent toolbar. Always visible as
              window chrome, but its state reflects the *active tab*'s agent
@@ -89,7 +755,8 @@
              Stacking a 1px Border on top of the solid-black outer Border
              makes the alpha blend correctly. -->
         <Border x:Name="BottomBarRoot"
-                Grid.Row="3"
+                Grid.Row="1"
+                Grid.Column="2"
                 Background="#000000"
                 VerticalAlignment="Top">
         <Grid>
@@ -203,11 +870,39 @@
                 </Button>
             </StackPanel>
 
+            <Button x:Name="AgentMeshStatusButton"
+                    Grid.Column="2"
+                    Margin="10,4"
+                    Padding="10,0"
+                    HorizontalAlignment="Center"
+                    Background="Transparent"
+                    BorderBrush="Transparent"
+                    Click="_WorkspaceSidebarFleetClicked"
+                    ToolTipService.ToolTip="Open Agents &amp; Tasks for the focused workspace"
+                    AutomationProperties.Name="Open Agents and Tasks">
+                <StackPanel Orientation="Horizontal"
+                            Spacing="7">
+                    <Border x:Name="AgentMeshStatusDot"
+                            Width="7"
+                            Height="7"
+                            CornerRadius="3.5"
+                            Background="#FF787878"
+                            VerticalAlignment="Center" />
+                    <TextBlock x:Name="AgentMeshStatusText"
+                               Text="Agent mesh · no agents"
+                               FontSize="11"
+                               Opacity="0.72"
+                               VerticalAlignment="Center" />
+                </StackPanel>
+            </Button>
+
             <!-- Button 3: Session list toggle — opens the agent pane (if needed)
                  and switches wta into the Agents/sessions view. Mirrors the
                  Ctrl+Shift+/ keybinding. Anchored to the right edge of the
                  BottomBar via the spacer column (Column 2, Width="*"). -->
             <Button x:Name="SessionToggleButton"
+                    AutomationProperties.Name="Sessions and history"
+                    AutomationProperties.HelpText="Ctrl+Shift+/"
                     Grid.Column="3"
                     Width="32"
                     Height="32"
@@ -218,7 +913,7 @@
                 <ToolTipService.ToolTip>
                     <ToolTip>
                         <StackPanel>
-                            <TextBlock Text="Show sessions"
+                            <TextBlock Text="Sessions &amp; history"
                                        FontFamily="Segoe UI Variable"
                                        FontSize="12"
                                        FontWeight="Normal"
@@ -246,6 +941,7 @@
         </Grid>
         </Grid>
         </Border>
+        </Grid>
 
         <!--
             GH#12775 et. al: After switching to ControlsV2, it seems that
@@ -319,6 +1015,419 @@
                 </TextBlock.ContextFlyout>
                 <Run x:Name="NoticeMessage" />
             </TextBlock>
+        </ContentDialog>
+
+        <ContentDialog x:Name="WorkspaceGroupDialog"
+                       Grid.Row="2"
+                       Title="Move workspace to group"
+                       PrimaryButtonText="Move"
+                       CloseButtonText="Cancel"
+                       DefaultButton="Primary">
+            <TextBox x:Name="WorkspaceGroupNameTextBox"
+                     Header="Group name"
+                     PlaceholderText="e.g. Client projects"
+                     AutomationProperties.Name="Workspace group name" />
+        </ContentDialog>
+
+        <ContentDialog x:Name="WorkspaceComposerDialog"
+                       Grid.Row="2"
+                       Title="Compose agent workspace"
+                       PrimaryButtonText="Create"
+                       CloseButtonText="Cancel"
+                       DefaultButton="Primary">
+            <StackPanel Width="560"
+                        Spacing="10">
+                <TextBlock Text="Create a native, declarative pane layout. The manifest is saved under .intelligent-terminal/manifests; browser surfaces use isolated WebView2 profiles and fail-closed policy."
+                           TextWrapping="Wrap"
+                           Opacity="0.72" />
+                <ComboBox x:Name="WorkspaceComposerTemplate"
+                          Header="Template"
+                          SelectedIndex="1"
+                          AutomationProperties.Name="Workspace template">
+                    <ComboBoxItem Content="Pair programming"
+                                  Tag="pair" />
+                    <ComboBoxItem Content="Feature team"
+                                  Tag="feature" />
+                    <ComboBoxItem Content="Hotfix race with worktrees"
+                                  Tag="hotfix-race" />
+                    <ComboBoxItem Content="Research"
+                                  Tag="research" />
+                    <ComboBoxItem Content="Release"
+                                  Tag="release" />
+                    <ComboBoxItem Content="Remote over SSH"
+                                  Tag="remote" />
+                </ComboBox>
+                <TextBox x:Name="WorkspaceComposerName"
+                         Header="Workspace name"
+                         PlaceholderText="e.g. Checkout hardening"
+                         AutomationProperties.Name="Workspace name" />
+                <TextBox x:Name="WorkspaceComposerRoot"
+                         Header="Project root"
+                         PlaceholderText="C:\path\to\repository"
+                         AutomationProperties.Name="Workspace project root" />
+                <TextBlock Text="Creation is bounded to four panes. Worktrees are created only by templates that explicitly declare them and are never auto-removed."
+                           FontSize="12"
+                           TextWrapping="Wrap"
+                           Opacity="0.62" />
+                <Button Content="Preview manifest"
+                        HorizontalAlignment="Left"
+                        Click="_WorkspaceComposerPreviewClicked"
+                        AutomationProperties.Name="Preview workspace manifest" />
+                <TextBox x:Name="WorkspaceComposerPreview"
+                         MaxHeight="220"
+                         IsReadOnly="True"
+                         AcceptsReturn="True"
+                         TextWrapping="NoWrap"
+                         FontFamily="Cascadia Mono"
+                         FontSize="10"
+                         ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         Visibility="Collapsed"
+                         AutomationProperties.Name="Workspace manifest preview" />
+            </StackPanel>
+        </ContentDialog>
+
+        <ContentDialog x:Name="WorkspaceTeamComposerDialog"
+                       Grid.Row="2"
+                       Title="Add to Agents &amp; Tasks"
+                       PrimaryButtonText="Apply"
+                       CloseButtonText="Cancel"
+                       DefaultButton="Primary">
+            <StackPanel Width="520"
+                        Spacing="10">
+                <TextBlock Text="Create a workspace-scoped team, launch a Codex worker in its own terminal pane, or add a durable task. The WTA control plane remains the source of truth."
+                           TextWrapping="Wrap"
+                           Opacity="0.7" />
+                <ComboBox x:Name="WorkspaceTeamComposerOperation"
+                          Header="Operation"
+                          SelectedIndex="0"
+                          SelectionChanged="_WorkspaceTeamComposerOperationChanged"
+                          AutomationProperties.Name="Team operation">
+                    <ComboBoxItem Content="Create native team"
+                                  Tag="team" />
+                    <ComboBoxItem Content="Add agent worker"
+                                  Tag="worker" />
+                    <ComboBoxItem Content="Add task"
+                                  Tag="task" />
+                </ComboBox>
+
+                <StackPanel x:Name="WorkspaceTeamCreateFields"
+                            Spacing="8">
+                    <TextBox x:Name="WorkspaceTeamCreateName"
+                             Header="Team name"
+                             PlaceholderText="e.g. checkout-hardening"
+                             AutomationProperties.Name="New team name" />
+                    <TextBox x:Name="WorkspaceTeamCreateLeader"
+                             Header="Leader identity"
+                             Text="leader"
+                             AutomationProperties.Name="Team leader identity" />
+                </StackPanel>
+
+                <StackPanel x:Name="WorkspaceTeamWorkerFields"
+                            Spacing="8"
+                            Visibility="Collapsed">
+                    <TextBox x:Name="WorkspaceTeamWorkerTeam"
+                             Header="Team name"
+                             PlaceholderText="Existing native team"
+                             AutomationProperties.Name="Worker team name" />
+                    <TextBox x:Name="WorkspaceTeamWorkerId"
+                             Header="Worker ID"
+                             PlaceholderText="e.g. frontend"
+                             AutomationProperties.Name="Worker ID" />
+                    <TextBox x:Name="WorkspaceTeamWorkerRole"
+                             Header="Role"
+                             PlaceholderText="e.g. UI implementation"
+                             AutomationProperties.Name="Worker role" />
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="WorkspaceTeamWorkerAgent"
+                                 Grid.Column="0"
+                                 Margin="0,0,5,0"
+                                 Header="Agent command"
+                                 Text="codex"
+                                 AutomationProperties.Name="Worker agent command" />
+                        <TextBox x:Name="WorkspaceTeamWorkerModel"
+                                 Grid.Column="1"
+                                 Margin="5,0,0,0"
+                                 Header="Model (optional)"
+                                 AutomationProperties.Name="Worker model" />
+                    </Grid>
+                    <TextBlock Text="The worker is launched in a dedicated terminal pane with scoped team instructions, heartbeat and task ownership."
+                               FontSize="11"
+                               TextWrapping="Wrap"
+                               Opacity="0.58" />
+                </StackPanel>
+
+                <StackPanel x:Name="WorkspaceTeamTaskFields"
+                            Spacing="8"
+                            Visibility="Collapsed">
+                    <TextBox x:Name="WorkspaceTeamTaskTeam"
+                             Header="Team name"
+                             PlaceholderText="Existing native team"
+                             AutomationProperties.Name="Task team name" />
+                    <TextBox x:Name="WorkspaceTeamTaskId"
+                             Header="Task ID"
+                             PlaceholderText="e.g. implement-sidebar"
+                             AutomationProperties.Name="Task ID" />
+                    <TextBox x:Name="WorkspaceTeamTaskTitle"
+                             Header="Title"
+                             PlaceholderText="Short outcome"
+                             AutomationProperties.Name="Task title" />
+                    <TextBox x:Name="WorkspaceTeamTaskPrompt"
+                             Header="Instructions"
+                             MinHeight="92"
+                             AcceptsReturn="True"
+                             TextWrapping="Wrap"
+                             PlaceholderText="Exact scope, acceptance criteria and constraints"
+                             AutomationProperties.Name="Task instructions" />
+                </StackPanel>
+            </StackPanel>
+        </ContentDialog>
+
+        <ContentDialog x:Name="WorkspaceAttentionDialog"
+                       Grid.Row="2"
+                       Title="Attention center"
+                       CloseButtonText="Close"
+                       DefaultButton="Close">
+            <ScrollViewer MaxHeight="560"
+                          MinWidth="620"
+                          VerticalScrollBarVisibility="Auto">
+                <StackPanel x:Name="WorkspaceAttentionItems"
+                            Spacing="8" />
+            </ScrollViewer>
+        </ContentDialog>
+
+        <ContentDialog x:Name="WorkspaceGitDialog"
+                       Grid.Row="2"
+                       Title="Git workspace"
+                       CloseButtonText="Close"
+                       DefaultButton="Close">
+            <Grid Width="760"
+                  Height="560">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <TextBlock x:Name="WorkspaceGitSummary"
+                           Margin="0,0,0,10"
+                           TextWrapping="Wrap" />
+                <TextBox x:Name="WorkspaceGitOutput"
+                         Grid.Row="1"
+                         IsReadOnly="True"
+                         AcceptsReturn="True"
+                         FontFamily="Cascadia Mono"
+                         FontSize="11"
+                         ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         TextWrapping="NoWrap"
+                         AutomationProperties.Name="Git status and diff" />
+            </Grid>
+        </ContentDialog>
+
+        <ContentDialog x:Name="WorkspaceDoctorDialog"
+                       Grid.Row="2"
+                       Title="Workspace diagnostics"
+                       CloseButtonText="Close"
+                       DefaultButton="Close">
+            <TextBox x:Name="WorkspaceDoctorOutput"
+                     Width="700"
+                     MaxHeight="560"
+                     IsReadOnly="True"
+                     AcceptsReturn="True"
+                     TextWrapping="Wrap"
+                     FontFamily="Cascadia Mono"
+                     FontSize="11"
+                     ScrollViewer.VerticalScrollBarVisibility="Auto"
+                     AutomationProperties.Name="Workspace diagnostic results" />
+        </ContentDialog>
+
+        <ContentDialog x:Name="WorkspaceRemoteFilesDialog"
+                       Grid.Row="2"
+                       Title="Remote files"
+                       CloseButtonText="Close"
+                       DefaultButton="Close">
+            <Grid Width="760"
+                  Height="560">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <Button Grid.Column="0"
+                            Margin="0,0,6,0"
+                            Padding="9,4"
+                            Content="Up"
+                            Click="_WorkspaceRemoteFilesUpClicked"
+                            AutomationProperties.Name="Go to parent remote directory" />
+                    <TextBox x:Name="WorkspaceRemoteFilePath"
+                             Grid.Column="1"
+                             IsReadOnly="True"
+                             FontFamily="Cascadia Mono"
+                             FontSize="11"
+                             VerticalContentAlignment="Center"
+                             AutomationProperties.Name="Remote workspace path" />
+                    <Button Grid.Column="2"
+                            Margin="6,0,0,0"
+                            Padding="9,4"
+                            Content="Refresh"
+                            Click="_WorkspaceRemoteFilesRefreshClicked"
+                            AutomationProperties.Name="Refresh remote files" />
+                </Grid>
+                <TextBlock x:Name="WorkspaceRemoteFileStatus"
+                           Grid.Row="1"
+                           Margin="0,7,0,7"
+                           FontSize="11"
+                           Opacity="0.66"
+                           Text="Connecting to the verified remote node…"
+                           TextWrapping="Wrap" />
+                <StackPanel x:Name="WorkspaceRemoteFileRootSetup"
+                            Grid.Row="2"
+                            Margin="0,0,0,8"
+                            Spacing="6"
+                            Visibility="Collapsed">
+                    <TextBlock Text="No filesystem root is authorized for this workspace. Add an explicit remote project/worktree root; HOME is broad access and remains read-only unless you opt in."
+                               FontSize="10"
+                               Opacity="0.72"
+                               TextWrapping="Wrap" />
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="120" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="150" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="WorkspaceRemoteFileRootLabel"
+                                 Grid.Column="0"
+                                 Margin="0,0,6,0"
+                                 PlaceholderText="Label"
+                                 Text="Project"
+                                 AutomationProperties.Name="Remote file root label" />
+                        <TextBox x:Name="WorkspaceRemoteFileRootPath"
+                                 Grid.Column="1"
+                                 Margin="0,0,6,0"
+                                 PlaceholderText="/home/user/project or $HOME"
+                                 FontFamily="Cascadia Mono"
+                                 AutomationProperties.Name="Remote file root path" />
+                        <ComboBox x:Name="WorkspaceRemoteFileRootSource"
+                                  Grid.Column="2"
+                                  Margin="0,0,6,0"
+                                  SelectedIndex="0"
+                                  AutomationProperties.Name="Remote file root source">
+                            <ComboBoxItem Content="Project" Tag="project" />
+                            <ComboBoxItem Content="Worktree" Tag="worktree" />
+                            <ComboBoxItem Content="HOME (broad)" Tag="explicit_home" />
+                        </ComboBox>
+                        <Button Grid.Column="3"
+                                Padding="9,4"
+                                Content="Authorize read-only"
+                                Click="_WorkspaceRemoteFileAuthorizeRootClicked"
+                                AutomationProperties.Name="Authorize remote file root" />
+                    </Grid>
+                    <StackPanel Orientation="Horizontal"
+                                Spacing="12">
+                        <CheckBox x:Name="WorkspaceRemoteFileRootWriteConsent"
+                                  Content="Allow create and rename"
+                                  AutomationProperties.Name="Allow remote file writes for this root" />
+                        <CheckBox x:Name="WorkspaceRemoteFileRootDeleteConsent"
+                                  Content="Allow delete"
+                                  AutomationProperties.Name="Allow remote file deletes for this root" />
+                        <CheckBox x:Name="WorkspaceRemoteFileWideScopeConsent"
+                                  Content="I understand that HOME exposes personal configuration, credentials and other projects"
+                                  AutomationProperties.Name="Acknowledge broad remote file access" />
+                    </StackPanel>
+                </StackPanel>
+                <Grid Grid.Row="3">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="3*" />
+                        <ColumnDefinition Width="2*" />
+                    </Grid.ColumnDefinitions>
+                    <Border Grid.Column="0"
+                            Margin="0,0,6,0"
+                            BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}"
+                            BorderThickness="1"
+                            CornerRadius="5">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <StackPanel x:Name="WorkspaceRemoteFileItems"
+                                        Padding="6"
+                                        Spacing="3" />
+                        </ScrollViewer>
+                    </Border>
+                    <Border Grid.Column="1"
+                            Margin="6,0,0,0"
+                            BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}"
+                            BorderThickness="1"
+                            CornerRadius="5">
+                        <TextBox x:Name="WorkspaceRemoteFilePreview"
+                                 Padding="9"
+                                 IsReadOnly="True"
+                                 AcceptsReturn="True"
+                                 TextWrapping="NoWrap"
+                                 FontFamily="Cascadia Mono"
+                                 FontSize="10"
+                                 PlaceholderText="Select a UTF-8 text file to preview it."
+                                 ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                                 ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                 AutomationProperties.Name="Remote text file preview" />
+                    </Border>
+                </Grid>
+                <Grid Grid.Row="4"
+                      Margin="0,9,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0"
+                                Orientation="Horizontal"
+                                Spacing="7">
+                        <TextBox x:Name="WorkspaceRemoteFileName"
+                                 Width="210"
+                                 PlaceholderText="New folder or file name"
+                                 AutomationProperties.Name="Remote file action name" />
+                        <CheckBox x:Name="WorkspaceRemoteFileMutationConsent"
+                                  Content="Allow changes"
+                                  VerticalAlignment="Center"
+                                  AutomationProperties.Name="Confirm remote file changes" />
+                    </StackPanel>
+                    <Button x:Name="WorkspaceRemoteFileNewFolderButton"
+                            Grid.Column="1"
+                            Margin="6,0,0,0"
+                            Padding="8,4"
+                            Content="New folder"
+                            Click="_WorkspaceRemoteFileNewFolderClicked" />
+                    <Button x:Name="WorkspaceRemoteFileRenameButton"
+                            Grid.Column="2"
+                            Margin="6,0,0,0"
+                            Padding="8,4"
+                            Content="Rename"
+                            Click="_WorkspaceRemoteFileRenameClicked" />
+                    <Button x:Name="WorkspaceRemoteFileDownloadButton"
+                            Grid.Column="3"
+                            Margin="6,0,0,0"
+                            Padding="8,4"
+                            Content="Download"
+                            Click="_WorkspaceRemoteFileDownloadClicked" />
+                    <Button x:Name="WorkspaceRemoteFileDeleteButton"
+                            Grid.Column="4"
+                            Margin="6,0,0,0"
+                            Padding="8,4"
+                            Content="Delete"
+                            Click="_WorkspaceRemoteFileDeleteClicked" />
+                </Grid>
+            </Grid>
         </ContentDialog>
 
         <ContentDialog x:Name="UriErrorDialog"

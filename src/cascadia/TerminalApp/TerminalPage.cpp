@@ -20,8 +20,10 @@
 #include "../inc/AgentRegistry.h"
 #include "../inc/AgentPolicy.h"
 #include "../inc/AgentPaneBackend.h"
+#include "../inc/WtaProcess.h"
 #include "../TerminalSettingsAppAdapterLib/TerminalSettings.h"
 #include "AgentPaneContent.h"
+#include "BrowserPaneContent.h"
 #include "AgentPaneDragStash.h"
 #include "AgentPaneLog.h"
 #include "App.h"
@@ -534,6 +536,7 @@ namespace winrt::TerminalApp::implementation
         _CreateNewTabFlyout();
 
         _UpdateTabWidthMode();
+        _InitializeWorkspaceSidebar();
 
         // Settings AllowDependentAnimations will affect whether animations are
         // enabled application-wide, so we don't need to check it each time we
@@ -1073,7 +1076,7 @@ namespace winrt::TerminalApp::implementation
         }
         if (lower == "codex")
         {
-            return winrt::hstring{ L"npx -y @agentclientprotocol/codex-acp@1.1.0" };
+            return winrt::hstring{ L"npx -y @agentclientprotocol/codex-acp@1.1.7" };
         }
         if (lower == "opencode")
         {
@@ -1649,26 +1652,41 @@ namespace winrt::TerminalApp::implementation
         {
             return rawPane;
         }
-        const auto innerTerm = rawPane->GetContent().try_as<winrt::TerminalApp::TerminalPaneContent>();
+
+        winrt::TerminalApp::IPaneContent innerContent{ nullptr };
+        if (const auto surfaceStack = rawPane->GetSurfaceStack())
+        {
+            // Ordinary terminal panes are promoted to SurfaceStackPaneContent.
+            // Transfer the active surface out of that visual tree before
+            // AgentPaneContent attaches the terminal root to its own host.
+            // DetachActiveSurface deliberately does not close the session.
+            innerContent = rawPane->DetachActiveSurface();
+        }
+        else
+        {
+            innerContent = rawPane->GetContent();
+
+            // Compatibility path for panes created before surface stacks (and
+            // for any future unstacked terminal content). Their outer Border
+            // owns the terminal root directly, so release that ownership here.
+            if (const auto rootGrid = rawPane->GetRootElement())
+            {
+                if (rootGrid.Children().Size() > 0)
+                {
+                    if (const auto border = rootGrid.Children().GetAt(0).try_as<winrt::Windows::UI::Xaml::Controls::Border>())
+                    {
+                        border.Child(nullptr);
+                    }
+                }
+            }
+        }
+
+        const auto innerTerm = innerContent.try_as<winrt::TerminalApp::TerminalPaneContent>();
         if (!innerTerm)
         {
             // Defensive fallback — shouldn't happen for a terminal-content pane.
             _agentPaneLog("_WrapInAgentPaneContent: rawPane content is not TerminalPaneContent — using unwrapped pane");
             return rawPane;
-        }
-        // The raw Pane's first border currently parents the TermControl;
-        // release it before AgentPaneContent re-parents it as the wrapper's
-        // ContentPresenter child. Without this, XAML throws because the
-        // TermControl would be in two visual trees at once.
-        if (const auto rootGrid = rawPane->GetRootElement())
-        {
-            if (rootGrid.Children().Size() > 0)
-            {
-                if (const auto border = rootGrid.Children().GetAt(0).try_as<winrt::Windows::UI::Xaml::Controls::Border>())
-                {
-                    border.Child(nullptr);
-                }
-            }
         }
         auto agentContent = winrt::make<winrt::TerminalApp::implementation::AgentPaneContent>(innerTerm);
         // Apply the cached fallback immediately when a pane is created
@@ -1789,6 +1807,263 @@ namespace winrt::TerminalApp::implementation
         _RaiseProtocolEvent("tab_changed", tabParams);
     }
 
+    void TerminalPage::_NotifySurfaceLifecycleChanged(
+        const winrt::com_ptr<Tab>& tab,
+        const std::shared_ptr<Pane>& pane,
+        const Windows::Foundation::Collections::ValueSet& change)
+    {
+        if (!tab || !pane || !change)
+        {
+            return;
+        }
+
+        const auto lookup = [&change](const std::wstring_view key) -> IInspectable {
+            const hstring name{ key };
+            return change.HasKey(name) ? change.Lookup(name) : nullptr;
+        };
+        const auto kindValue = lookup(L"kind");
+        const auto kind = winrt::to_string(winrt::unbox_value_or<hstring>(kindValue, L""));
+        std::string_view method;
+        if (kind == "created")
+        {
+            method = "surface_created";
+        }
+        else if (kind == "activated")
+        {
+            method = "surface_activated";
+        }
+        else if (kind == "closed")
+        {
+            method = "surface_closed";
+        }
+        else if (kind == "moved")
+        {
+            method = "surface_moved";
+        }
+        else if (kind == "detached")
+        {
+            method = "surface_detached";
+        }
+        else
+        {
+            return;
+        }
+
+        Json::Value params;
+        params["protocol_version"] = 1;
+        params["window_id"] = std::to_string(_WindowProperties.WindowId());
+        params["workspace_id"] = winrt::to_string(tab->StableId());
+        params["tab_id"] = winrt::to_string(tab->StableId()); // legacy alias
+        params["surface_local_id"] = winrt::unbox_value_or<uint32_t>(lookup(L"surface_local_id"), 0);
+        params["surface_index"] = winrt::unbox_value_or<uint32_t>(lookup(L"surface_index"), 0);
+        params["surface_count"] = winrt::unbox_value_or<uint32_t>(lookup(L"surface_count"), 0);
+        params["focus_generation"] = Json::UInt64(_focusGeneration);
+        if (const auto paneId = pane->Id())
+        {
+            params["pane_id"] = std::to_string(*paneId);
+        }
+        const auto surfaceSessionId = winrt::unbox_value_or<hstring>(lookup(L"surface_id"), L"");
+        if (!surfaceSessionId.empty())
+        {
+            params["surface_id"] = winrt::to_string(surfaceSessionId);
+            params["terminal_session_id"] = winrt::to_string(surfaceSessionId);
+        }
+        _RaiseProtocolEvent(method, params);
+
+        // A Plain Terminal does not necessarily host an ACP pane/wta-master,
+        // so the protocol event above cannot be the only lifecycle authority.
+        // Delete-by-identity is idempotent: if a live master processes the
+        // event first, the direct host cleanup becomes a harmless no-op.
+        if (kind == "closed" && !surfaceSessionId.empty())
+        {
+            _RemoveClosedSurfaceBinding(tab->StableId(), surfaceSessionId);
+        }
+    }
+
+    safe_void_coroutine TerminalPage::_RemoveClosedSurfaceBinding(
+        winrt::hstring workspaceId,
+        winrt::hstring surfaceId)
+    try
+    {
+        auto strong = get_strong();
+        const auto wtaPath = ::Microsoft::Terminal::WtaProcess::ResolveWtaExePath();
+        if (wtaPath.empty() || workspaceId.empty() || surfaceId.empty())
+        {
+            co_return;
+        }
+        const auto quote = [](const std::wstring_view value) {
+            std::wstring result;
+            QuoteAndEscapeCommandlineArg(value, result);
+            return result;
+        };
+        const auto windowId = winrt::to_hstring(_WindowProperties.WindowId());
+        const auto args =
+            std::wstring{ L"compute binding delete-surface --window " } + quote(windowId) +
+            L" --workspace " + quote(workspaceId) +
+            L" --surface " + quote(surfaceId);
+        co_await winrt::resume_background();
+        // Empty JSON (`null`) is still success: it means the ACP lifecycle
+        // consumer removed the same binding first.
+        ::Microsoft::Terminal::WtaProcess::RunWtaCaptureStdout(
+            wtaPath,
+            args,
+            12'000);
+    }
+    CATCH_LOG();
+
+    void TerminalPage::_NotifyAgentFocusChanged(const winrt::com_ptr<Tab>& tab)
+    {
+        if (!tab || tab->StableId().empty())
+        {
+            return;
+        }
+
+        auto pane = tab->GetActivePane();
+        if (!pane)
+        {
+            return;
+        }
+
+        // The agent pane is a dock/companion. Its terminal is not the user's
+        // active work surface, so retain the pane that the agent pane follows.
+        if (pane->IsAgentPane())
+        {
+            if (const auto root = tab->GetRootPane())
+            {
+                root->WalkTree([&pane](const auto& candidate) {
+                    if (candidate->IsSourceOfAgentPane())
+                    {
+                        pane = candidate;
+                    }
+                });
+            }
+        }
+
+        const auto terminalSessionId = pane->GetSessionId();
+        if (terminalSessionId == winrt::guid{})
+        {
+            return;
+        }
+
+        // The dock follows the focused surface's runtime. Conversation state
+        // can switch surfaces without a restart when the adapter/source is
+        // unchanged; crossing Host/WSL/SSH or agent identity rebuilds only
+        // this workspace's helper while the shared master keeps other agents
+        // alive.
+        {
+            winrt::hstring agentId = _settings.GlobalSettings().EffectiveAcpAgent();
+            winrt::hstring source{ L"host" };
+            winrt::hstring wslDistro;
+            winrt::hstring sshTarget;
+            winrt::hstring remoteSessionId;
+            if (const auto runtime = tab->SurfaceAgentRuntimeFor(terminalSessionId))
+            {
+                agentId = runtime->agentId;
+                source = runtime->source;
+                wslDistro = runtime->wslDistro;
+                sshTarget = runtime->sshTarget;
+                remoteSessionId = runtime->remoteSessionId;
+            }
+            else if (tab->HasAgentOverride())
+            {
+                agentId = tab->AgentIdOverride();
+                source = tab->AgentSourceOverride();
+                wslDistro = tab->AgentWslDistroOverride();
+            }
+            const auto desired = fmt::format(
+                L"{}|{}|{}|{}|{}",
+                std::wstring_view{ agentId },
+                std::wstring_view{ source },
+                std::wstring_view{ wslDistro },
+                std::wstring_view{ sshTarget },
+                std::wstring_view{ remoteSessionId });
+            if (tab->FindAgentPane() &&
+                !tab->ActiveAgentRuntimeKey().empty() &&
+                tab->ActiveAgentRuntimeKey() != desired)
+            {
+                const bool wasVisible = !tab->HasStashedAgentPane();
+                const auto stableId = tab->StableId();
+                Dispatcher().RunAsync(
+                    winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                    [weakThis = get_weak(), stableId, wasVisible]() {
+                        if (const auto self = weakThis.get())
+                        {
+                            if (const auto owner = self->_FindTabByStableId(stableId))
+                            {
+                                self->_TeardownAgentPane(owner);
+                                self->_AutoCreateHiddenAgentPaneShared(
+                                    owner,
+                                    false,
+                                    !wasVisible);
+                            }
+                        }
+                    });
+            }
+        }
+
+        Json::Value params;
+        params["protocol_version"] = 1;
+        params["window_id"] = std::to_string(_WindowProperties.WindowId());
+        params["workspace_id"] = winrt::to_string(tab->StableId());
+        params["tab_id"] = winrt::to_string(tab->StableId()); // legacy alias
+        params["terminal_session_id"] = winrt::to_string(winrt::to_hstring(terminalSessionId));
+        // The connection SessionId is the stable identity of the live
+        // surface. The pane-local ordinal is sent separately for display only.
+        params["surface_id"] = winrt::to_string(winrt::to_hstring(terminalSessionId));
+        params["focus_generation"] = Json::UInt64(++_focusGeneration);
+
+        if (const auto paneId = pane->Id())
+        {
+            params["pane_id"] = std::to_string(*paneId);
+        }
+        if (const auto stack = pane->GetSurfaceStack())
+        {
+            params["surface_local_id"] = stack.ActiveSurfaceId();
+            params["surface_count"] = stack.SurfaceCount();
+        }
+        else
+        {
+            params["surface_local_id"] = 1;
+            params["surface_count"] = 1;
+        }
+
+        if (const auto control = pane->GetTerminalControl())
+        {
+            params["cwd"] = winrt::to_string(control.WorkingDirectory());
+        }
+        winrt::hstring profileName;
+        // Resolve the profile from the surface we actually follow. When the
+        // companion AgentPane has keyboard focus, Tab::GetFocusedProfile()
+        // describes the companion's inner terminal ("Agent Pane") rather than
+        // the user's source surface.
+        if (const auto profile = pane->GetProfile())
+        {
+            profileName = profile.Name();
+            params["profile"] = winrt::to_string(profileName);
+        }
+
+        if (const auto agentContent = tab->FindAgentPaneContent())
+        {
+            const auto paneLabel = pane->Id() ?
+                                       winrt::hstring{ fmt::format(L"Pane {}", *pane->Id()) } :
+                                       winrt::hstring{ L"Pane" };
+            const auto surfaceLabel = winrt::hstring{
+                fmt::format(L"Surface {}", params["surface_local_id"].asUInt())
+            };
+            const auto cwd = pane->GetTerminalControl() ?
+                                 pane->GetTerminalControl().WorkingDirectory() :
+                                 winrt::hstring{};
+            agentContent.UpdateFocusContext(
+                tab->Title(),
+                paneLabel,
+                surfaceLabel,
+                profileName,
+                cwd);
+        }
+
+        _RaiseProtocolEvent("focus_changed", params);
+    }
+
     // C++ → wta request for changing per-tab agent-pane UI state. The target
     // tab carries its own StableId. wta echoes back via `agent_state_changed`
     // which lands in `OnAgentStateChanged`, which routes by `tab_id` to the
@@ -1799,6 +2074,7 @@ namespace winrt::TerminalApp::implementation
     {
         Json::Value params;
         params["window_id"] = std::to_string(_WindowProperties.WindowId());
+        std::string logSuffix;
 
         if (tab)
         {
@@ -1806,10 +2082,66 @@ namespace winrt::TerminalApp::implementation
             if (!stableId.empty())
             {
                 params["tab_id"] = winrt::to_string(stableId);
+                params["workspace_id"] = winrt::to_string(stableId);
+            }
+
+            // Address the state mutation to the terminal surface the dock is
+            // following. On the first click that creates/unstashes the agent
+            // pane, `set_agent_state` can arrive at WTA a few milliseconds
+            // before the normal `focus_changed` event. Without this identity,
+            // WTA has to store the mutation on the legacy workspace key and
+            // the subsequent focus event activates a fresh surface in Chat,
+            // making the native header say "Agent sessions" while the body is
+            // still the Chat view.
+            auto sourcePane = tab->GetActivePane();
+            if (sourcePane && sourcePane->IsAgentPane())
+            {
+                if (const auto root = tab->GetRootPane())
+                {
+                    root->WalkTree([&sourcePane](const auto& candidate) {
+                        if (candidate->IsSourceOfAgentPane())
+                        {
+                            sourcePane = candidate;
+                        }
+                    });
+                }
+            }
+            if (sourcePane)
+            {
+                const auto sourceSessionId = sourcePane->GetSessionId();
+                if (sourceSessionId != winrt::guid{})
+                {
+                    const auto surfaceId = winrt::to_string(winrt::to_hstring(sourceSessionId));
+                    params["surface_id"] = surfaceId;
+                    params["terminal_session_id"] = surfaceId;
+                    logSuffix += " surface_id=" + surfaceId;
+                }
+            }
+
+            // WTA helpers are authenticated with the workspace capability
+            // minted from this tab's StableId. `tab_id` above is therefore the
+            // authoritative authorization/routing key. Also include the
+            // helper's pane session as useful event metadata and as a
+            // compatibility path for older surface-scoped helper builds.
+            if (const auto agentPane = tab->FindAgentPane())
+            {
+                if (const auto agentControl = agentPane->GetTerminalControl())
+                {
+                    const auto agentPaneSessionId = _FindSessionIdForControl(agentControl);
+                    if (!agentPaneSessionId.empty())
+                    {
+                        params["pane_id"] = agentPaneSessionId;
+                        logSuffix += " pane_id=" + agentPaneSessionId;
+                    }
+                }
+            }
+
+            if (params.isMember("tab_id"))
+            {
+                logSuffix += " tab_id=" + params["tab_id"].asString();
             }
         }
 
-        std::string logSuffix;
         if (view.has_value())
         {
             params["view"] = std::string{ *view };
@@ -1902,6 +2234,9 @@ namespace winrt::TerminalApp::implementation
         {
             extraArgs.emplace_back(L"--no-autofix");
         }
+        pushFlagValue(L"--confirmation-read-ops", globals.AiConfirmationReadOps());
+        pushFlagValue(L"--confirmation-create-ops", globals.AiConfirmationCreateOps());
+        pushFlagValue(L"--confirmation-input-ops", globals.AiConfirmationInputOps());
         if (const auto lang = _ResolveEffectiveLanguage(globals); !lang.empty())
         {
             pushFlagValue(L"--language", lang);
@@ -1960,9 +2295,33 @@ namespace winrt::TerminalApp::implementation
         winrt::hstring agentCliPath;
         winrt::hstring effectiveAgentSource{ L"host" };
         winrt::hstring effectiveAgentWslDistro;
+        winrt::hstring effectiveAgentSshTarget;
+        winrt::hstring effectiveAgentRemoteSession;
+        const auto activeSurfaceRuntime = [&]() -> std::optional<Tab::SurfaceAgentRuntime> {
+            if (const auto activePane = tab->GetActivePane())
+            {
+                const auto sessionId = activePane->GetSessionId();
+                if (sessionId != winrt::guid{})
+                {
+                    return tab->SurfaceAgentRuntimeFor(sessionId);
+                }
+            }
+            return std::nullopt;
+        }();
+        const bool hasSurfaceAgentOverride = activeSurfaceRuntime.has_value();
         const bool hasAgentOverride = tab->HasAgentOverride();
         bool hasProfileBackend = false;
-        if (hasAgentOverride)
+        if (activeSurfaceRuntime)
+        {
+            effectiveAgentId = activeSurfaceRuntime->agentId;
+            effectiveModel = activeSurfaceRuntime->model;
+            effectiveAgentSource = activeSurfaceRuntime->source;
+            effectiveAgentWslDistro = activeSurfaceRuntime->wslDistro;
+            effectiveAgentSshTarget = activeSurfaceRuntime->sshTarget;
+            effectiveAgentRemoteSession = activeSurfaceRuntime->remoteSessionId;
+            agentCliPath = _ResolveAgentCliPathForId(effectiveAgentId, effectiveModel, {});
+        }
+        else if (hasAgentOverride)
         {
             effectiveAgentId = tab->AgentIdOverride();
             effectiveModel = tab->AgentModelOverride();
@@ -2019,7 +2378,7 @@ namespace winrt::TerminalApp::implementation
         // to the global/default agent (the same resolution as the
         // no-override case). The GPO all-agents-blocked case is still caught
         // by the policy check below.
-        if (!hasAgentOverride && !hasProfileBackend)
+        if (!hasSurfaceAgentOverride && !hasAgentOverride && !hasProfileBackend)
         {
             effectiveAgentId = globals.EffectiveAcpAgent();
             effectiveModel = globals.AcpModel();
@@ -2042,7 +2401,7 @@ namespace winrt::TerminalApp::implementation
             }
         }
 
-        if ((hasAgentOverride || hasProfileBackend) && agentCliPath.empty())
+        if ((hasSurfaceAgentOverride || hasAgentOverride || hasProfileBackend) && agentCliPath.empty())
         {
             _agentPaneLog("_AutoCreateHiddenAgentPaneShared: explicit agent selection cannot be launched");
             return false;
@@ -2056,6 +2415,14 @@ namespace winrt::TerminalApp::implementation
             _agentPaneLog("_AutoCreateHiddenAgentPaneShared: ABORT — all agents blocked by GPO policy");
             return false;
         }
+
+        tab->ActiveAgentRuntimeKey(fmt::format(
+            L"{}|{}|{}|{}|{}",
+            std::wstring_view{ effectiveAgentId },
+            std::wstring_view{ effectiveAgentSource },
+            std::wstring_view{ effectiveAgentWslDistro },
+            std::wstring_view{ effectiveAgentSshTarget },
+            std::wstring_view{ effectiveAgentRemoteSession }));
 
         // Build the per-process settings the master will inherit.
         // These are baked at first-spawn time only; subsequent acquires
@@ -2141,6 +2508,8 @@ namespace winrt::TerminalApp::implementation
         appendHelperFlagValue(L"--agent-id", effectiveAgentId);
         appendHelperFlagValue(L"--agent-source", effectiveAgentSource);
         appendHelperFlagValue(L"--agent-wsl-distro", effectiveAgentWslDistro);
+        appendHelperFlagValue(L"--agent-ssh-target", effectiveAgentSshTarget);
+        appendHelperFlagValue(L"--agent-remote-session", effectiveAgentRemoteSession);
         {
             namespace Reg = ::Microsoft::Terminal::Settings::Model::AgentRegistry;
             std::wstring allowedIds;
@@ -2274,7 +2643,10 @@ namespace winrt::TerminalApp::implementation
             args.StartingDirectory(startingDirectory);
         }
 
-        auto rawPane = _MakeTerminalPane(args, nullptr, nullptr);
+        // This private argument is the sole authority for minting a
+        // workspace-scoped Terminal Protocol capability. It is not serialized
+        // into NewTerminalArgs and cannot be reproduced by copying helperCmd.
+        auto rawPane = _MakeTerminalPane(args, nullptr, nullptr, stableId);
         if (!rawPane)
         {
             _agentPaneLog("_AutoCreateHiddenAgentPaneShared: _MakeTerminalPane returned null");
@@ -2412,9 +2784,26 @@ namespace winrt::TerminalApp::implementation
                 {
                     self->_UpdateBottomBarState();
                 }
+                self->_RefreshWorkspaceSidebar(false);
             }
         });
 
+        content.NativeChatAction(
+            [weakSelf](const winrt::TerminalApp::AgentPaneContent&,
+                       const winrt::hstring& actionJson) {
+                if (const auto self = weakSelf.get())
+                {
+                    Json::Value params;
+                    Json::CharReaderBuilder reader;
+                    std::string errors;
+                    std::istringstream stream{ winrt::to_string(actionJson) };
+                    if (Json::parseFromStream(reader, stream, &params, &errors) &&
+                        params.isObject())
+                    {
+                        self->_RaiseProtocolEvent("native_chat_action", params);
+                    }
+                }
+            });
     }
 
     // Window-level bottom-bar "agent toggle" click. Targets the active tab:
@@ -2435,7 +2824,10 @@ namespace winrt::TerminalApp::implementation
                 const bool isStashed = agentPane && agentPane->IsHidden();
                 if (!isStashed && agentContent.IsSessionsView())
                 {
-                    _RequestAgentStateForTab(activeTab, "chat", std::nullopt);
+                    // Treat this as one atomic mode switch. Explicitly keeping
+                    // the pane open prevents a delayed/stale visibility
+                    // projection from turning "open Chat" into a no-op.
+                    _RequestAgentStateForTab(activeTab, "chat", /*pane_open*/ true);
                     _UpdateBottomBarState();
                     return;
                 }
@@ -4233,7 +4625,8 @@ namespace winrt::TerminalApp::implementation
     // - the desired connection
     TerminalConnection::ITerminalConnection TerminalPage::_CreateConnectionFromSettings(Profile profile,
                                                                                         IControlSettings settings,
-                                                                                        const bool inheritCursor)
+                                                                                        const bool inheritCursor,
+                                                                                        const winrt::hstring& trustedWorkspaceCapabilityId)
     {
         static const auto textMeasurement = [&]() -> std::wstring_view {
             switch (_settings.GlobalSettings().TextMeasurement())
@@ -4309,6 +4702,12 @@ namespace winrt::TerminalApp::implementation
             if (inheritCursor)
             {
                 valueSet.Insert(L"inheritCursor", Windows::Foundation::PropertyValue::CreateBoolean(true));
+            }
+            if (!trustedWorkspaceCapabilityId.empty())
+            {
+                valueSet.Insert(
+                    L"trustedWorkspaceCapabilityId",
+                    Windows::Foundation::PropertyValue::CreateString(trustedWorkspaceCapabilityId));
             }
         }
 
@@ -4740,6 +5139,117 @@ namespace winrt::TerminalApp::implementation
             {
                 update(tabImpl);
             }
+        }
+    }
+
+    void TerminalPage::OnNativeChatSnapshot(hstring eventJson)
+    {
+        Json::Value event;
+        Json::CharReaderBuilder reader;
+        std::string errors;
+        std::istringstream stream{ winrt::to_string(eventJson) };
+        if (!Json::parseFromStream(reader, stream, &event, &errors))
+        {
+            return;
+        }
+        const auto& params = event["params"];
+        if (!params.isObject() ||
+            !params.isMember("workspace_id") ||
+            !params["workspace_id"].isString())
+        {
+            return;
+        }
+        const auto workspaceId = winrt::to_hstring(params["workspace_id"].asString());
+        if (workspaceId.empty())
+        {
+            return;
+        }
+        if (const auto tab = _FindTabByStableId(workspaceId))
+        {
+            if (const auto content = tab->FindAgentPaneContent())
+            {
+                content.ApplyNativeChatSnapshot(eventJson);
+            }
+        }
+    }
+
+    void TerminalPage::OnRemoteRelayEvent(hstring eventJson)
+    {
+        Json::Value event;
+        Json::CharReaderBuilder reader;
+        std::string errors;
+        std::istringstream stream{ winrt::to_string(eventJson) };
+        if (!Json::parseFromStream(reader, stream, &event, &errors))
+        {
+            return;
+        }
+        const auto& params = event["params"];
+        if (!params.isObject() ||
+            !params.isMember("workspace_id") ||
+            !params["workspace_id"].isString() ||
+            !params.isMember("kind") ||
+            !params["kind"].isString() ||
+            !params.isMember("payload") ||
+            !params["payload"].isObject())
+        {
+            return;
+        }
+
+        const auto workspaceId = winrt::to_hstring(params["workspace_id"].asString());
+        const auto tab = _FindTabByStableId(workspaceId);
+        if (!tab)
+        {
+            return;
+        }
+        const auto kind = params["kind"].asString();
+        const auto& payload = params["payload"];
+        if (kind == "focus")
+        {
+            uint32_t index = 0;
+            if (_tabs.IndexOf(*tab, index))
+            {
+                _SelectTab(index);
+                tab->Focus(FocusState::Programmatic);
+            }
+            return;
+        }
+
+        winrt::hstring title;
+        winrt::hstring detail;
+        if (kind == "notify")
+        {
+            title = winrt::to_hstring(payload.get("title", "Remote agent").asString());
+            detail = winrt::to_hstring(payload.get("body", "").asString());
+        }
+        else if (kind == "status")
+        {
+            title = L"Remote agent";
+            detail = winrt::to_hstring(payload.get("detail", payload.get("state", "")).asString());
+        }
+        else if (kind == "progress")
+        {
+            title = L"Remote agent progress";
+            detail = winrt::to_hstring(payload.get("label", "").asString());
+        }
+        else
+        {
+            return;
+        }
+
+        const auto summary = detail.empty() ? title : detail;
+        _MarkWorkspaceUnread(workspaceId, summary);
+        if (kind == "notify")
+        {
+            if (const auto pane = tab->GetActivePane())
+            {
+                _SendDesktopNotification(title, detail, tab, pane->GetContent());
+            }
+        }
+        else
+        {
+            auto& metadata = _WorkspaceSidebarMetadataFor(tab);
+            metadata.lastNotification = summary;
+            _RefreshWorkspaceSidebar(false);
         }
     }
 
@@ -5743,12 +6253,166 @@ namespace winrt::TerminalApp::implementation
         return {};
     }
 
+    void TerminalPage::_RemoteStorageItemsDroppedHandler(
+        const IInspectable& sender,
+        const StorageItemsDroppedEventArgs& eventArgs)
+    {
+        const auto term = sender.try_as<TermControl>();
+        if (!term || !eventArgs || eventArgs.Paths().Size() == 0)
+        {
+            return;
+        }
+
+        for (const auto& projectedTab : _tabs)
+        {
+            const auto tab = _GetTabImpl(projectedTab);
+            const auto root = tab ? tab->GetRootPane() : nullptr;
+            if (!root)
+            {
+                continue;
+            }
+            const auto pane = root->WalkTree([&](const auto& candidate) -> std::shared_ptr<Pane> {
+                const auto control = candidate->GetTerminalControl();
+                return control && control == term ? candidate : nullptr;
+            });
+            if (!pane)
+            {
+                continue;
+            }
+
+            const auto surfaceSessionId = pane->GetSessionId();
+            const auto runtime = tab->SurfaceRemoteRuntimeFor(surfaceSessionId);
+            if (!runtime || runtime->targetId.empty())
+            {
+                return;
+            }
+
+            // Claim the drop synchronously so TermControl does not paste local
+            // Windows paths into an SSH shell while the verified upload runs.
+            eventArgs.Handled(true);
+            _UploadDroppedFiles(
+                term,
+                eventArgs.Paths(),
+                runtime->targetId,
+                tab->StableId(),
+                winrt::to_hstring(surfaceSessionId));
+            return;
+        }
+    }
+
+    safe_void_coroutine TerminalPage::_UploadDroppedFiles(
+        TermControl term,
+        Windows::Foundation::Collections::IVectorView<hstring> paths,
+        hstring targetId,
+        hstring workspaceId,
+        hstring surfaceId)
+    try
+    {
+        auto strong = get_strong();
+        const auto quote = [](const std::wstring_view value) {
+            std::wstring result;
+            QuoteAndEscapeCommandlineArg(value, result);
+            return result;
+        };
+        const auto shellQuote = [](const std::wstring_view value) {
+            std::wstring result{ L"'" };
+            for (const auto ch : value)
+            {
+                if (ch == L'\'')
+                {
+                    result += L"'\\''";
+                }
+                else
+                {
+                    result.push_back(ch);
+                }
+            }
+            result.push_back(L'\'');
+            return result;
+        };
+
+        std::vector<std::wstring> localPaths;
+        localPaths.reserve(paths.Size());
+        for (const auto& path : paths)
+        {
+            if (!path.empty())
+            {
+                localPaths.emplace_back(path);
+            }
+        }
+        if (localPaths.empty())
+        {
+            co_return;
+        }
+
+        const auto dispatcher = Dispatcher();
+        const auto wtaPath = ::Microsoft::Terminal::WtaProcess::ResolveWtaExePath();
+        std::vector<std::wstring> remotePaths;
+        std::vector<std::wstring> failedPaths;
+        co_await winrt::resume_background();
+        for (const auto& localPath : localPaths)
+        {
+            const auto args =
+                std::wstring{ L"compute transfer upload --target " } + quote(targetId) +
+                L" --source " + quote(localPath) +
+                L" --workspace " + quote(workspaceId) +
+                L" --surface " + quote(surfaceId);
+            const auto output =
+                ::Microsoft::Terminal::WtaProcess::RunWtaCaptureStdout(
+                    wtaPath,
+                    args,
+                    10 * 60 * 1000);
+            Json::Value result;
+            Json::CharReaderBuilder reader;
+            std::string errors;
+            std::istringstream input{ output };
+            if (!output.empty() &&
+                Json::parseFromStream(reader, input, &result, &errors) &&
+                result.get("state", "").asString() == "succeeded" &&
+                !result.get("remote_path", "").asString().empty())
+            {
+                remotePaths.emplace_back(
+                    winrt::to_hstring(result.get("remote_path", "").asString()));
+            }
+            else
+            {
+                failedPaths.emplace_back(localPath);
+            }
+        }
+        co_await wil::resume_foreground(dispatcher);
+
+        if (term && !remotePaths.empty())
+        {
+            std::wstring insertedPaths;
+            for (const auto& remotePath : remotePaths)
+            {
+                if (!insertedPaths.empty())
+                {
+                    insertedPaths.push_back(L' ');
+                }
+                insertedPaths += shellQuote(remotePath);
+            }
+            term.SendInput(insertedPaths);
+        }
+        if (!failedPaths.empty())
+        {
+            _ShowControlNoticeDialog(
+                L"Remote file upload",
+                winrt::hstring{ fmt::format(
+                    L"Uploaded {} of {} files. Failed uploads were not inserted into the terminal.",
+                    remotePaths.size(),
+                    localPaths.size()) });
+        }
+    }
+    CATCH_LOG();
+
     void TerminalPage::_RegisterTerminalEvents(TermControl term)
     {
         term.RaiseNotice({ this, &TerminalPage::_ControlNoticeRaisedHandler });
 
         term.WriteToClipboard({ get_weak(), &TerminalPage::_copyToClipboard });
         term.PasteFromClipboard({ this, &TerminalPage::_PasteFromClipboardHandler });
+        term.StorageItemsDropped({ get_weak(), &TerminalPage::_RemoteStorageItemsDroppedHandler });
 
         term.OpenHyperlink({ this, &TerminalPage::_OpenHyperlinkHandler });
 
@@ -6067,6 +6731,14 @@ namespace winrt::TerminalApp::implementation
                 if (propertyName == L"Title")
                 {
                     page->_UpdateTitle(*tab);
+                    page->_RefreshWorkspaceSidebar(false);
+                }
+                else if (propertyName == L"TabColor")
+                {
+                    // The sidebar accent is a projection of the native Tab
+                    // color. Refresh it immediately when the native picker,
+                    // profile, or active pane changes that value.
+                    page->_RefreshWorkspaceSidebar(false);
                 }
                 else if (propertyName == L"Content")
                 {
@@ -6082,6 +6754,7 @@ namespace winrt::TerminalApp::implementation
 
                         tab->Focus(FocusState::Programmatic);
                     }
+                    page->_RefreshWorkspaceSidebar(false);
                 }
             }
         });
@@ -6378,6 +7051,44 @@ namespace winrt::TerminalApp::implementation
             else
             {
                 ApplicationState::SharedInstance().AppendPersistedWindowLayout(layout);
+            }
+        }
+
+        // Native ApplicationState remains the sole authority for window,
+        // workspace, pane and surface layout. WTA persists only the runtime
+        // identities that must be reconciled after that native layout has
+        // been recreated (remote workspaces, ACP bindings, browser profiles
+        // and the focused surface). This detached, idempotent capture avoids
+        // blocking window shutdown on disk or helper startup.
+        const auto wtaPath = ::Microsoft::Terminal::WtaProcess::ResolveWtaExePath();
+        if (!wtaPath.empty())
+        {
+            const auto quote = [](const std::wstring_view value) {
+                std::wstring result;
+                QuoteAndEscapeCommandlineArg(value, result);
+                return result;
+            };
+            const auto windowId = winrt::to_hstring(_WindowProperties.WindowId());
+            for (const auto& projectedTab : _tabs)
+            {
+                const auto tab = _GetTabImpl(projectedTab);
+                if (!tab || tab->StableId().empty())
+                {
+                    continue;
+                }
+                std::wstring args =
+                    L"compute restore capture --window " + quote(windowId) +
+                    L" --workspace " + quote(tab->StableId());
+                if (const auto pane = tab->GetActivePane())
+                {
+                    const auto sessionId = pane->GetSessionId();
+                    if (sessionId != winrt::guid{})
+                    {
+                        args += L" --focused-surface " +
+                                quote(winrt::to_hstring(sessionId));
+                    }
+                }
+                ::Microsoft::Terminal::WtaProcess::RunWtaDetached(wtaPath, args);
             }
         }
     }
@@ -6763,6 +7474,7 @@ namespace winrt::TerminalApp::implementation
 
             auto profile = tab->GetFocusedProfile();
             _UpdateBackground(profile);
+            _NotifyAgentFocusChanged(tab);
         }
 
         _adjustProcessPriorityThrottled->Run();
@@ -7787,8 +8499,21 @@ namespace winrt::TerminalApp::implementation
     //   Pane for this connection.
     std::shared_ptr<Pane> TerminalPage::_MakeTerminalPane(const NewTerminalArgs& newTerminalArgs,
                                                           const winrt::TerminalApp::Tab& sourceTab,
-                                                          TerminalConnection::ITerminalConnection existingConnection)
+                                                          TerminalConnection::ITerminalConnection existingConnection,
+                                                          const winrt::hstring& trustedWorkspaceCapabilityId)
     {
+        // TerminalPaneContent already has its profile-specific control settings,
+        // but Pane promotes it to SurfaceStackPaneContent. The stack owns
+        // settings-backed chrome (most importantly the per-pane new-surface
+        // profile flyout), so it must receive the current CascadiaSettings on
+        // first construction. Previously this only happened after a settings
+        // reload, leaving SplitButton::Flyout null on a normal app launch.
+        const auto makeConfiguredPane = [this](const IPaneContent& content) {
+            auto pane = std::make_shared<Pane>(content);
+            pane->UpdateSettings(_settings);
+            return pane;
+        };
+
         // First things first - Check for making a pane from content ID.
         if (newTerminalArgs &&
             newTerminalArgs.ContentId() != 0)
@@ -7798,7 +8523,7 @@ namespace winrt::TerminalApp::implementation
             const auto& profile = _settings.GetProfileForArgs(newTerminalArgs);
             const auto control = _AttachControlToContent(newTerminalArgs.ContentId());
             auto paneContent{ winrt::make<TerminalPaneContent>(profile, _terminalSettingsCache, control) };
-            auto resultPane = std::make_shared<Pane>(paneContent);
+            auto resultPane = makeConfiguredPane(paneContent);
 
             // Cross-window agent-pane drag: if the source tab stashed an
             // original StableId for this ContentId, the migrating pane was
@@ -8010,7 +8735,11 @@ namespace winrt::TerminalApp::implementation
         }
         else
         {
-            connection = _CreateConnectionFromSettings(profile, *controlSettings.DefaultSettings(), hasSessionId);
+            connection = _CreateConnectionFromSettings(
+                profile,
+                *controlSettings.DefaultSettings(),
+                hasSessionId,
+                trustedWorkspaceCapabilityId);
         }
 
         TerminalConnection::ITerminalConnection debugConnection{ nullptr };
@@ -8042,14 +8771,14 @@ namespace winrt::TerminalApp::implementation
 
         auto paneContent{ winrt::make<TerminalPaneContent>(profile, _terminalSettingsCache, control) };
 
-        auto resultPane = std::make_shared<Pane>(paneContent);
+        auto resultPane = makeConfiguredPane(paneContent);
 
         if (debugConnection) // this will only be set if global debugging is on and tap is active
         {
             auto newControl = _CreateNewControlAndContent(controlSettings, debugConnection);
             // Split (auto) with the debug tap.
             auto debugContent{ winrt::make<TerminalPaneContent>(profile, _terminalSettingsCache, newControl) };
-            auto debugPane = std::make_shared<Pane>(debugContent);
+            auto debugPane = makeConfiguredPane(debugContent);
 
             // Since we're doing this split directly on the pane (instead of going through Tab,
             // we need to handle the panes 'active' states
@@ -8155,6 +8884,80 @@ namespace winrt::TerminalApp::implementation
 
                 content = *markdownContent;
             }
+        }
+        else if (std::wstring_view{ paneType }.starts_with(L"x-browser:"))
+        {
+            const auto browserRecordId =
+                winrt::hstring{ std::wstring_view{ paneType }.substr(std::wstring_view{ L"x-browser:" }.size()) };
+            Json::Value browser;
+            Json::Value proxy;
+            if (!browserRecordId.empty())
+            {
+                const auto quote = [](const std::wstring_view value) {
+                    std::wstring result;
+                    QuoteAndEscapeCommandlineArg(value, result);
+                    return result;
+                };
+                const auto wtaPath = ::Microsoft::Terminal::WtaProcess::ResolveWtaExePath();
+                // Restored browser content must never reuse stale metadata
+                // blindly. Recover reuses a live, scope-matched proxy or
+                // replaces it before WebView2 receives the contract.
+                const auto browserOutput = ::Microsoft::Terminal::WtaProcess::RunWtaCaptureStdout(
+                    wtaPath,
+                    std::wstring{ L"compute browser recover " } + quote(browserRecordId),
+                    12'000);
+                Json::CharReaderBuilder reader;
+                std::string errors;
+                if (!browserOutput.empty())
+                {
+                    std::istringstream input{ browserOutput };
+                    Json::parseFromStream(reader, input, &browser, &errors);
+                }
+                const auto proxyId =
+                    winrt::to_hstring(browser.get("proxy_id", "").asString());
+                if (!proxyId.empty())
+                {
+                    const auto proxyOutput = ::Microsoft::Terminal::WtaProcess::RunWtaCaptureStdout(
+                        wtaPath,
+                        std::wstring{ L"compute proxy get " } + quote(proxyId),
+                        3'000);
+                    if (!proxyOutput.empty())
+                    {
+                        std::istringstream input{ proxyOutput };
+                        Json::parseFromStream(reader, input, &proxy, &errors);
+                    }
+                }
+            }
+
+            auto surfaceSessionId =
+                winrt::to_hstring(browser.get("surface_id", "").asString());
+            if (surfaceSessionId.empty() &&
+                std::wstring_view{ browserRecordId }.starts_with(L"browser-"))
+            {
+                surfaceSessionId = winrt::hstring{
+                    std::wstring_view{ browserRecordId }.substr(std::wstring_view{ L"browser-" }.size())
+                };
+            }
+            const auto userDataFolder =
+                winrt::to_hstring(browser.get("user_data_folder", "").asString());
+            auto initialUrl =
+                winrt::to_hstring(browser.get("current_url", "").asString());
+            if (initialUrl.empty())
+            {
+                initialUrl = L"https://example.com";
+            }
+            const auto proxyPort = proxy.get("local_port", 0).asUInt();
+            const auto browserContent = winrt::make_self<BrowserPaneContent>();
+            browserContent->Initialize(
+                reinterpret_cast<uint64_t>(_hostingHwnd.value_or(nullptr)),
+                browserRecordId,
+                surfaceSessionId,
+                userDataFolder,
+                proxyPort <= std::numeric_limits<uint16_t>::max() ?
+                    gsl::narrow_cast<uint16_t>(proxyPort) :
+                    0,
+                initialUrl);
+            content = *browserContent;
         }
 
         assert(content);

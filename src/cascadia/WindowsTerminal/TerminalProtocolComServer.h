@@ -13,6 +13,7 @@
 
 #include "ITerminalProtocol.h"
 #include "../inc/BoundedDispatchQueue.h"
+#include "../../inc/TerminalProtocolCapability.h"
 
 // Per-brand CLSIDs — same pattern as CTerminalHandoff. Reused unchanged from the
 // previous WinRT/MBM server, so WT_COM_CLSID discovery on the client is identical.
@@ -53,7 +54,7 @@ TerminalProtocolComServer : public Microsoft::WRL::RuntimeClass<
     STDMETHODIMP GetSessionVariable(GUID sessionId, BSTR name, BSTR* json) override;
     STDMETHODIMP GetSettings(BSTR* json) override;
     STDMETHODIMP CreateTab(unsigned __int64 windowId, BSTR profile, BSTR commandline, BSTR title, BSTR startingDirectory, boolean suppressAppTitle, boolean background, BSTR* json) override;
-    STDMETHODIMP SplitPane(GUID sessionId, BSTR direction, float size, BSTR profile, BSTR commandline, boolean background, BSTR* json) override;
+    STDMETHODIMP SplitPane(GUID sessionId, BSTR direction, float size, BSTR profile, BSTR commandline, BSTR startingDirectory, boolean background, BSTR* json) override;
     STDMETHODIMP ClosePane(GUID sessionId) override;
     STDMETHODIMP SendInput(GUID sessionId, BSTR text) override;
     STDMETHODIMP FocusPane(GUID sessionId) override;
@@ -64,6 +65,7 @@ TerminalProtocolComServer : public Microsoft::WRL::RuntimeClass<
 
     // Static setup — must be called before s_StartListening().
     static void s_setEmperor(WindowEmperor* emperor) noexcept;
+    static void s_setCapabilityToken(std::wstring token);
 
     static HRESULT s_StartListening();
     static HRESULT s_StopListening();
@@ -138,6 +140,25 @@ private:
     static void _dispatchAgentChipTargetToPage(const winrt::hstring& eventJson);
     static void _dispatchRestartAgentStackToPage(const winrt::hstring& eventJson);
     static void _dispatchRestartAgentPaneToPage(const winrt::hstring& eventJson);
+    static void _dispatchNativeChatSnapshotToPage(const winrt::hstring& eventJson);
+    static void _dispatchRemoteRelayEventToPage(const winrt::hstring& eventJson);
+
+    using CapabilityOperation = Microsoft::Terminal::Protocol::Capability::Operation;
+    using CapabilityClaims = Microsoft::Terminal::Protocol::Capability::Claims;
+
+    bool _isAuthenticated() const noexcept;
+    bool _hasOperation(CapabilityOperation operation) const noexcept;
+    bool _isSessionAuthorized(const GUID& sessionId, CapabilityOperation operation) const;
+    bool _isWorkspaceAuthorized(std::wstring_view workspaceId, CapabilityOperation operation) const noexcept;
+    bool _isEventAuthorized(
+        const std::string& eventJson,
+        CapabilityOperation operation) const;
+    std::optional<std::wstring> _workspaceForSession(const GUID& sessionId) const;
+    std::optional<std::pair<std::wstring, uint32_t>> _paneForSession(
+        std::wstring_view sessionId) const;
 
     static WindowEmperor* s_emperor;
+    static std::wstring s_capabilityToken;
+    bool _hostAuthenticated{ false };
+    std::optional<CapabilityClaims> _claims;
 };

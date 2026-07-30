@@ -43,7 +43,7 @@ auth.login_failed_help_default: "  Press Enter to retry, or Esc to go back."  # 
 
 # ── Chat view (src/ui/chat.rs) ──────────────────────────────────────────────
 chat.activity_thinking: "Thinking…"
-chat.welcome_title: "Welcome to Intelligent Terminal!"
+chat.welcome_title: "AI can make mistakes."
 chat.welcome_disclaimer: "Intelligent Terminal uses AI. Check for mistakes."
 # Header label for the AI agent's step-by-step plan section
 chat.plan_header: "Plan:"
@@ -60,7 +60,7 @@ chat.turn_canceled: "(canceled)"
 chat.turn_executed: "→ executed: %{title}"
 
 # ── Input placeholders (src/ui/input.rs) ────────────────────────────────────
-input.placeholder.connected: "Ask anything, / for commands.."  # {Locked="/"}
+input.placeholder.connected: "Ask anything…  (/ commands)"  # {Locked="/"}
 # Input box placeholder while agent connection is being established
 input.placeholder.connecting: "connecting..."
 # Input box placeholder when agent is disconnected

@@ -17,6 +17,33 @@ const WSL_AGENT_PROBE_ATTEMPTS: usize = 3;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Shell prelude shared by WSL detection and launch paths.
+///
+/// Intelligent Terminal can provision a private, versioned Node.js toolchain
+/// without modifying the distro's global packages or shell profiles. The
+/// provisioner atomically maintains `node-current`, which keeps this prelude
+/// free of nested command substitutions and temporary shell variables that
+/// `wsl.exe` would expand before `bash -lc` receives the script.
+pub(crate) fn wsl_portable_node_path_prelude() -> &'static str {
+    "PATH=\"$HOME/.local/share/intelligent-terminal/toolchains/node-current/bin:$PATH\"; \
+     export PATH;"
+}
+
+/// Native executables actually required to launch one WSL ACP agent.
+///
+/// Adapter packages such as codex-acp and claude-agent-acp bundle or resolve
+/// their corresponding agent runtime themselves. Requiring a second bare
+/// `codex`/`claude` executable incorrectly hides an otherwise usable source.
+fn wsl_required_executables(agent_id: &str) -> Vec<&'static str> {
+    let profile = agent_registry::lookup_profile_by_id(agent_id);
+    let adapter_launcher = profile
+        .acp_launch_command
+        .split_whitespace()
+        .next()
+        .filter(|value| !value.is_empty());
+    vec![adapter_launcher.unwrap_or(profile.id)]
+}
+
 // ─── Data types ─────────────────────────────────────────────────────────────
 
 /// Status of a single agent, combining CLI detection and setup hints.
@@ -169,21 +196,19 @@ pub async fn find_wsl_exe(distro: &str, executable: &str) -> Option<String> {
 
 /// Whether a known ACP agent can start inside `distro`.
 pub async fn wsl_agent_available(distro: &str, agent_id: &str) -> bool {
-    if find_wsl_exe(distro, agent_id).await.is_none() {
-        return false;
-    }
-
-    let profile = agent_registry::lookup_profile_by_id(agent_id);
-    if profile.acp_launch_command.starts_with("npx ") {
-        return find_wsl_exe(distro, "npx").await.is_some();
+    for executable in wsl_required_executables(agent_id) {
+        if find_wsl_exe(distro, executable).await.is_none() {
+            return false;
+        }
     }
     true
 }
 
 pub(crate) fn wsl_agent_probe_script(executable: &str) -> String {
     format!(
-        "printf '__WTA_PROBE_BEGIN__\\n'; command -v {} 2>/dev/null; \
+        "{} printf '__WTA_PROBE_BEGIN__\\n'; command -v {} 2>/dev/null; \
          printf '__WTA_PROBE_END__\\n'",
+        wsl_portable_node_path_prelude(),
         crate::coordinator::sh_quote(executable)
     )
 }
@@ -199,8 +224,7 @@ fn is_native_wsl_resolution(resolved: &str) -> bool {
 /// tenant can sign in (mirroring the CLI's own `copilot login --host …`).
 /// Other agents ignore `enterprise_host`.
 pub fn build_login_cmd(agent_id: &str, enterprise_host: Option<&str>) -> String {
-    let exe_path = find_exe(agent_id)
-        .unwrap_or_else(|| agent_id.to_string());
+    let exe_path = find_exe(agent_id).unwrap_or_else(|| agent_id.to_string());
 
     // Agent-specific login subcommand
     let subcommand = match agent_id {
@@ -289,7 +313,10 @@ pub fn save_copilot_enterprise_host(host: &str) {
 /// Install an agent via winget. Streams output lines through `on_line` callback.
 /// On success, refreshes the process PATH so subsequent `find_exe` calls find
 /// the new binary.
-pub async fn install(agent_id: &str, on_line: impl FnMut(String) + Send + 'static) -> Result<(), String> {
+pub async fn install(
+    agent_id: &str,
+    on_line: impl FnMut(String) + Send + 'static,
+) -> Result<(), String> {
     match agent_id {
         "copilot" => install_copilot(on_line).await,
         _ => Err(t!("agent.install.unsupported", agent = agent_id).into_owned()),
@@ -371,15 +398,46 @@ pub async fn check_agent_in_source(
         crate::agent_source::AgentSource::Host => check_agent(agent_id),
         crate::agent_source::AgentSource::Wsl { distro } => {
             let profile = agent_registry::lookup_profile_by_id(agent_id);
-            let cli_path = find_wsl_exe(distro, agent_id).await;
+            let mut cli_path = None;
+            let mut cli_found = true;
+            for executable in wsl_required_executables(agent_id) {
+                match find_wsl_exe(distro, executable).await {
+                    Some(path) => {
+                        cli_path.get_or_insert(path);
+                    }
+                    None => {
+                        cli_found = false;
+                        break;
+                    }
+                }
+            }
             AgentStatus {
                 id: agent_id.to_string(),
                 display_name: format!("{} — {} (WSL)", profile.display_name, distro),
-                cli_found: cli_path.is_some()
-                    && (!profile.acp_launch_command.starts_with("npx ")
-                        || find_wsl_exe(distro, "npx").await.is_some()),
+                cli_found,
                 cli_path,
                 install_hint: profile.install_hint.to_string(),
+                auth_hint: profile.auth_hint.to_string(),
+                auto_installable: false,
+            }
+        }
+        crate::agent_source::AgentSource::Ssh { target_id, .. } => {
+            let profile = agent_registry::lookup_profile_by_id(agent_id);
+            let target = wta::compute::store::ComputeStore::package_default()
+                .and_then(|store| store.get_target(target_id))
+                .ok();
+            let healthy = target.as_ref().is_some_and(|target| {
+                !target.disabled && target.health == wta::compute::model::TargetHealth::Healthy
+            });
+            AgentStatus {
+                id: agent_id.to_string(),
+                display_name: format!("{} — {} (SSH)", profile.display_name, target_id),
+                cli_found: healthy,
+                cli_path: healthy.then(|| format!("compute:{target_id}")),
+                install_hint: format!(
+                    "Bootstrap and verify wta-node, then install {} on target {}",
+                    profile.display_name, target_id
+                ),
                 auth_hint: profile.auth_hint.to_string(),
                 auto_installable: false,
             }
@@ -406,13 +464,14 @@ pub async fn ensure_installed(
 
 /// Install GitHub Copilot via winget with streaming output.
 async fn install_copilot(mut on_line: impl FnMut(String) + Send + 'static) -> Result<(), String> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
     use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     let mut cmd = tokio::process::Command::new("winget");
     cmd.args([
         "install",
-        "--id", "GitHub.Copilot",
+        "--id",
+        "GitHub.Copilot",
         "--exact",
         "--silent",
         "--accept-package-agreements",
@@ -490,29 +549,38 @@ async fn install_copilot(mut on_line: impl FnMut(String) + Send + 'static) -> Re
 fn fresh_path() -> String {
     use std::os::windows::ffi::OsStringExt;
 
-    fn read_reg_path(hkey: windows_sys::Win32::System::Registry::HKEY, subkey: &str) -> Option<String> {
+    fn read_reg_path(
+        hkey: windows_sys::Win32::System::Registry::HKEY,
+        subkey: &str,
+    ) -> Option<String> {
         use windows_sys::Win32::System::Registry::*;
 
         let subkey_wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
         let value_name: Vec<u16> = "Path".encode_utf16().chain(std::iter::once(0)).collect();
 
         let mut hk: HKEY = std::ptr::null_mut();
-        let ret = unsafe {
-            RegOpenKeyExW(hkey, subkey_wide.as_ptr(), 0, KEY_READ, &mut hk)
-        };
-        if ret != 0 { return None; }
+        let ret = unsafe { RegOpenKeyExW(hkey, subkey_wide.as_ptr(), 0, KEY_READ, &mut hk) };
+        if ret != 0 {
+            return None;
+        }
 
         let mut buf_size: u32 = 8192;
         let mut buffer: Vec<u16> = vec![0u16; buf_size as usize / 2];
         let mut kind: u32 = 0;
         let ret = unsafe {
             RegQueryValueExW(
-                hk, value_name.as_ptr(), std::ptr::null(),
-                &mut kind, buffer.as_mut_ptr() as *mut u8, &mut buf_size,
+                hk,
+                value_name.as_ptr(),
+                std::ptr::null(),
+                &mut kind,
+                buffer.as_mut_ptr() as *mut u8,
+                &mut buf_size,
             )
         };
         unsafe { RegCloseKey(hk) };
-        if ret != 0 { return None; }
+        if ret != 0 {
+            return None;
+        }
 
         let len = (buf_size as usize / 2).saturating_sub(1);
         let raw = std::ffi::OsString::from_wide(&buffer[..len]);
@@ -549,18 +617,26 @@ fn expand_env_vars(s: &str) -> Option<String> {
     let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
     let needed = unsafe {
         windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW(
-            wide.as_ptr(), std::ptr::null_mut(), 0,
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            0,
         )
     };
-    if needed == 0 { return Some(s.to_string()); }
+    if needed == 0 {
+        return Some(s.to_string());
+    }
 
     let mut out: Vec<u16> = vec![0u16; needed as usize];
     let written = unsafe {
         windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW(
-            wide.as_ptr(), out.as_mut_ptr(), needed,
+            wide.as_ptr(),
+            out.as_mut_ptr(),
+            needed,
         )
     };
-    if written == 0 { return Some(s.to_string()); }
+    if written == 0 {
+        return Some(s.to_string());
+    }
 
     let len = (written as usize).saturating_sub(1);
     let os_str = std::ffi::OsString::from_wide(&out[..len]);
@@ -570,6 +646,23 @@ fn expand_env_vars(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_backed_wsl_agents_require_only_the_adapter_launcher() {
+        assert_eq!(wsl_required_executables("codex"), vec!["npx"]);
+        assert_eq!(wsl_required_executables("claude"), vec!["npx"]);
+        assert_eq!(wsl_required_executables("copilot"), vec!["copilot"]);
+        assert_eq!(wsl_required_executables("opencode"), vec!["opencode"]);
+    }
+
+    #[test]
+    fn wsl_probe_prepends_the_private_portable_node_toolchain() {
+        let script = wsl_agent_probe_script("npx");
+        assert!(script.contains("$HOME/.local/share/intelligent-terminal/toolchains"));
+        assert!(script.contains("node-current/bin"));
+        assert!(script.contains("PATH=\"$HOME/"));
+        assert!(script.ends_with("printf '__WTA_PROBE_END__\\n'"));
+    }
 
     #[test]
     fn merge_paths_prefers_fresh_and_removes_duplicates_case_insensitively() {
@@ -657,8 +750,14 @@ mod tests {
         // exe path may resolve to a full path on dev machines, so assert on
         // the suffix / substring rather than an exact string.
         let base = build_login_cmd("copilot", None);
-        assert!(base.trim_end().ends_with("login"), "default copilot: {base}");
-        assert!(!base.contains("--host"), "default must not add --host: {base}");
+        assert!(
+            base.trim_end().ends_with("login"),
+            "default copilot: {base}"
+        );
+        assert!(
+            !base.contains("--host"),
+            "default must not add --host: {base}"
+        );
 
         let ghe = build_login_cmd("copilot", Some("mycompany.ghe.com"));
         assert!(
@@ -672,18 +771,27 @@ mod tests {
             ghe2.contains("login --host https://corp.ghe.com"),
             "normalized GHE login: {ghe2}"
         );
-        assert!(!ghe2.contains("https://https://"), "no double scheme: {ghe2}");
+        assert!(
+            !ghe2.contains("https://https://"),
+            "no double scheme: {ghe2}"
+        );
 
         // Plain github.com is the default — no --host.
         let gh = build_login_cmd("copilot", Some("github.com"));
-        assert!(!gh.contains("--host"), "github.com must not add --host: {gh}");
+        assert!(
+            !gh.contains("--host"),
+            "github.com must not add --host: {gh}"
+        );
     }
 
     #[test]
     fn build_login_cmd_non_copilot_ignores_host() {
         // Only Copilot honors an enterprise host; other agents never get one.
         let claude = build_login_cmd("claude", Some("mycompany.ghe.com"));
-        assert!(!claude.contains("--host"), "claude must ignore host: {claude}");
+        assert!(
+            !claude.contains("--host"),
+            "claude must ignore host: {claude}"
+        );
         assert!(claude.contains("login"), "claude login: {claude}");
 
         let codex = build_login_cmd("codex", Some("mycompany.ghe.com"));

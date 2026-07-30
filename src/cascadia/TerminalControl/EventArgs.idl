@@ -154,6 +154,12 @@ namespace Microsoft.Terminal.Control
         String Text { get; };
     }
 
+    runtimeclass StorageItemsDroppedEventArgs
+    {
+        Windows.Foundation.Collections.IVectorView<String> Paths { get; };
+        Boolean Handled;
+    }
+
     runtimeclass SearchMissingCommandEventArgs
     {
         String MissingCommand { get; };

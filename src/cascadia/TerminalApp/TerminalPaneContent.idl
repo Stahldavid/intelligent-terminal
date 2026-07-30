@@ -17,6 +17,36 @@ namespace TerminalApp
         event Windows.Foundation.TypedEventHandler<TerminalPaneContent, Object> RestartTerminalRequested;
     }
 
+    // A pane-local stack of terminal surfaces. The Pane tree continues to
+    // treat this as one IPaneContent, while users can switch among several
+    // live sessions without creating another top-level workspace.
+    [default_interface] runtimeclass SurfaceStackPaneContent : IPaneContent
+    {
+        SurfaceStackPaneContent(IPaneContent initialSurface);
+
+        UInt32 SurfaceCount { get; };
+        UInt32 ActiveSurfaceId { get; };
+        IPaneContent ActiveSurface { get; };
+        UInt32 SurfaceIdAt(UInt32 index);
+        IPaneContent SurfaceAt(UInt32 index);
+
+        UInt32 AddSurface(IPaneContent content);
+        IPaneContent DetachActiveSurface();
+        Boolean ActivateSurface(UInt32 surfaceId);
+        Boolean CloseSurface(UInt32 surfaceId);
+        Boolean CloseOtherSurfaces(UInt32 surfaceId);
+        Boolean MoveSurface(UInt32 surfaceId, Int32 delta);
+
+        event Windows.Foundation.TypedEventHandler<SurfaceStackPaneContent, Object> NewSurfaceRequested;
+        event Windows.Foundation.TypedEventHandler<SurfaceStackPaneContent, Object> ActionRequested;
+        event Windows.Foundation.TypedEventHandler<SurfaceStackPaneContent, Object> SurfaceCollectionChanged;
+
+        String LastSurfaceChangeKind { get; };
+        UInt32 LastChangedSurfaceId { get; };
+        UInt32 LastChangedSurfaceIndex { get; };
+        String LastChangedSurfaceSessionId { get; };
+    }
+
     [default_interface] runtimeclass FilteredTask : Windows.UI.Xaml.Data.INotifyPropertyChanged
     {
         String Input{ get; };

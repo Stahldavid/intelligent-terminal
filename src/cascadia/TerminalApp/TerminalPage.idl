@@ -148,6 +148,9 @@ namespace TerminalApp
         Windows.Foundation.IAsyncOperation<Microsoft.Terminal.Protocol.SessionVariable> GetProtocolSessionVariable(Guid sessionId, String name);
         Windows.Foundation.IAsyncOperation<Boolean> SetProtocolSessionVariable(Guid sessionId, String name, String value);
         Windows.Foundation.IAsyncOperation<Microsoft.Terminal.Protocol.TabCreationResult> CreateProtocolTab(Microsoft.Terminal.Settings.Model.NewTerminalArgs args, Boolean background);
+        Windows.Foundation.IAsyncOperation<Microsoft.Terminal.Protocol.TabCreationResult> CreateProtocolSurface(Guid sessionId, Microsoft.Terminal.Settings.Model.NewTerminalArgs args, Boolean background);
+        Windows.Foundation.IAsyncOperation<Microsoft.Terminal.Protocol.TabCreationResult> CreateProtocolManagedSurface(Guid sessionId, String targetId, String agentId, Boolean background);
+        Windows.Foundation.IAsyncOperation<Microsoft.Terminal.Protocol.TabCreationResult> CreateProtocolBrowserSurface(Guid sessionId, String remoteWorkspaceId, String initialUrl, Boolean background);
         Windows.Foundation.IAsyncOperation<Microsoft.Terminal.Protocol.TabCreationResult> SplitProtocolPane(Guid sessionId, Microsoft.Terminal.Settings.Model.SplitDirection direction, Single size, Microsoft.Terminal.Settings.Model.NewTerminalArgs args, Boolean background);
         Windows.Foundation.IAsyncOperation<Boolean> CloseProtocolPane(Guid sessionId);
         Windows.Foundation.IAsyncOperation<Boolean> SendProtocolInput(Guid sessionId, String text);
@@ -179,6 +182,16 @@ namespace TerminalApp
         // `tab_id` to the matching AgentPaneContent (creating or tearing
         // down the pane on that tab as needed).
         void OnAgentStateChanged(String eventJson);
+
+        // Structured immutable projection of the active WTA conversation.
+        // Routed by workspace_id and rendered by native XAML controls.
+        void OnNativeChatSnapshot(String eventJson);
+
+        // Scoped notification/status/focus event received from a managed
+        // remote wta-node relay. The COM server dispatches this on the page's
+        // UI thread; the page validates workspace/surface identity before
+        // projecting it into native UI state.
+        void OnRemoteRelayEvent(String eventJson);
 
         // Inbound event from WTA carrying
         // {method:"resume_in_new_agent_tab",params:{session_id,cwd}}.

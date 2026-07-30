@@ -10,7 +10,13 @@ AI-native Windows Terminal — agents (Copilot, Claude, Gemini, custom) can unde
   - IDL: `src/cascadia/TerminalProtocol/TerminalProtocol.idl`
   - Server: `src/cascadia/WindowsTerminal/TerminalProtocolComServer.cpp`
 - **WTCLI** — CLI client consuming `IProtocolServer` via `CoCreateInstance(CLSCTX_LOCAL_SERVER)`. Agents shell out to `wtcli list-panes`, `wtcli capture-pane`, etc.
-- **ACP** (Agent Control Protocol) — JSON-RPC 2.0 spoken inside the helper+master architecture. `wta-helper` ↔ `wta-master` over a named pipe; `wta-master` ↔ agent CLI subprocess over stdio. The C++ side no longer participates in ACP directly — agent panes are plain `ConptyConnection`s hosting a `wta-helper` child. See `doc/specs/Multi-window-agent-pane.md`.
+- **ACP** (Agent Client Protocol) — JSON-RPC 2.0 spoken inside the
+  helper+master architecture. `wta-helper` ↔ `wta-master` uses a named pipe;
+  `wta-master` ↔ trusted agent adapters uses stdio. The master owns a lazy pool
+  keyed by the registry-resolved adapter command, so Codex, Claude, Gemini,
+  Copilot, and custom adapters can coexist without a second master. The C++
+  side does not implement ACP directly. See
+  `doc/fork-architecture-and-status.md`.
 
 ## UX
 
@@ -49,38 +55,40 @@ Agent pane: position configurable (`bottom`/`right`/`top`/`left`). Color-coded V
 ```
 WindowEmperor (one WT process, N AppHosts/windows)
   |-- TerminalProtocolComServer (COM, MTA thread, WT_COM_CLSID)
-  |-- SharedWta (singleton) -- spawns --> wta-master ──► agent CLI (ACP/stdio)
-  |                                          ▲
+  |-- SharedWta (singleton) -- spawns --> wta-master ──► adapter pool (ACP/stdio)
+  |                                          ▲              ├─ Codex
+  |                                          │              ├─ Claude
+  |                                          │              └─ other trusted adapters
   |                                          │ ACP/JSON-RPC over named pipe
   +-- AppHost[] → TerminalWindow → TerminalPage
         |-- CommandPalette (? / & prefixes)
-        |-- Per-tab agent pane: ConptyConnection ───► wta-helper (conpty child)
-        |                                            (one helper per tab, pre-warmed)
+        |-- WorkspaceSidebar (projection of native tabs)
+        |-- Pane → SurfaceStackPaneContent → terminal / agent / browser content
+        |-- Per-surface agent pane: ConptyConnection ─► wta-helper
+        |                                              (pre-warmed when eligible)
         +-- Protocol bridge (TerminalPage.Protocol.cpp)
 
 External: Agent → wtcli → COM (IProtocolServer) → TerminalProtocolComServer → WindowEmperor
 ```
 
-**Per-tab + per-window routing.** Each agent pane has its own helper bound
-to an `owner_tab_id` (= WT tab StableId) and a `window_id`. All inbound
-events that mutate per-tab state (`set_agent_state`, `tab_changed`,
-`tab_closed`, `tab_renamed`) carry both ids; helpers filter by `window_id`
-and (for `tab_changed`) by owner-lock in `switch_tab_session`. Outbound
-helper events (`agent_state_changed`, `agent_status`, `autofix_state`,
-`close_agent_pane`) carry `tab_id` so C++ can route via
-`_FindTabByStableId` instead of fanning out across every pane / window.
-See `doc/specs/Multi-window-agent-pane.md` §7.
+**Per-surface + per-workspace + per-window routing.** Each agent pane is bound
+to stable window, native workspace, pane, and surface identity. Focus events
+carry a monotonically increasing generation. WTA rejects foreign and stale
+scope before selecting or mutating a conversation. Legacy tab identity remains
+as a compatibility fallback, but new routing must use the canonical surface
+scope. See `doc/fork-architecture-and-status.md`.
 
-**Helper is pre-warmed per tab.** Every new tab spawns a stashed agent
-pane on creation (`_InitializeTab` → `_AutoCreateHiddenAgentPaneShared`
+**Helper is pre-warmed per eligible workspace/surface.** New native terminal
+content can spawn a stashed agent pane on creation
+(`_InitializeTab` → `_AutoCreateHiddenAgentPaneShared`
 with `autoStash=true`, `--start-stashed`), so the helper is running and
 its ACP session connects in the background from the start — even if the
 user never opens the pane. This is what lets autofix work on a tab the
-user hasn't interacted with. The agent CLI itself is spawned once by
-`wta-master` at startup and shared across all helpers (each helper's
-`initialize` is a cached replay; only `session/new` round-trips to the
-CLI). `--start-stashed` only seeds `pane_open=false`; it does not defer
-the handshake. The pre-warm is skipped when wta is unavailable, GPO
+user hasn't interacted with. `wta-master` lazily starts the selected trusted
+adapter and caches its ACP initialization. Helpers selecting the same adapter
+reuse it; helpers selecting different adapters use separate pooled processes.
+`--start-stashed` only seeds `pane_open=false`; it does not defer the
+handshake. The pre-warm is skipped when WTA is unavailable, GPO
 blocks all agents, or the tab arrived with an agent pane via cross-window
 drag-in (`agentLeavesSeen > 0`). See `TabManagement.cpp:366`.
 

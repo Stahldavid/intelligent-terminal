@@ -1,4 +1,4 @@
-use crate::app::{App, AppMode, View, DEFAULT_TAB_ID};
+use crate::app::{App, AppMode, View};
 use ratatui::prelude::*;
 
 use super::{
@@ -49,7 +49,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // through without going through current_tab_mut() (which would borrow
     // the whole App and conflict with &app.agent_sessions).
     if app.current_tab().current_view == View::Agents {
-        let tab_id = app.tab_id.as_deref().unwrap_or(DEFAULT_TAB_ID).to_string();
+        // The history view belongs to the focused surface, just like chat.
+        // `tab_id` is the containing workspace and can retain a legacy
+        // placeholder snapshot after a focus transition; rendering it here
+        // makes the UI appear stuck on "Loading…" even after the active
+        // surface's `session/list` response has arrived.
+        let tab_id = app.active_tab_key().to_string();
         let activity_frame = app.activity_frame as usize;
         let cli_filter = app.current_cli_filter();
         let origin_filter = app.sessions_origin_filter;
@@ -117,9 +122,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if !transient_visible {
         app.transient_hint = None;
     }
-    let welcome_visible =
-        app.show_welcome_hint && app.state == crate::app::ConnectionState::Connected;
-    let hint_visible = welcome_visible || transient_visible;
+    // First-use safety copy lives in the chat block. Reserve this row only
+    // for actionable transient feedback; permanent shortcut instructions
+    // duplicated the host buttons/tooltips and made every empty pane noisy.
+    let hint_visible = transient_visible;
     let hint_h: u16 = if hint_visible { 1 } else { 0 };
     let rec_hint_h: u16 = if app.current_tab().turn.recommendations().is_some() {
         1
@@ -197,13 +203,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         // with an ellipsis instead so it always reads as a deliberate, if
         // shortened, line rather than a chopped-off fragment (issue #126).
         let hint_width = chunks[4].width as usize;
-        if welcome_visible {
-            let line = Line::from(Span::styled(
-                truncate_to_width(&t!("layout.welcome_hint"), hint_width),
-                Style::default().fg(Color::DarkGray),
-            ));
-            frame.render_widget(line, chunks[4]);
-        } else if let Some((text, _)) = app.transient_hint.as_ref() {
+        if let Some((text, _)) = app.transient_hint.as_ref() {
             let line = Line::from(Span::styled(
                 truncate_to_width(&format!("  {}", text), hint_width),
                 Style::default().fg(Color::DarkGray),

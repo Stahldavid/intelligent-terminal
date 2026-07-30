@@ -1,9 +1,26 @@
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::cwd_util::validate_starting_directory;
 use crate::shell::wt_channel::WtChannel;
+
+mod context;
+mod model;
+mod operations;
+mod planner;
+mod state;
+mod templates;
+
+pub use context::{collect_context, inspect_git};
+pub use model::{PaneNode, PaneSpec, SurfaceSpec, VerifierSpec, WorkspaceManifest, WorktreeSpec};
+pub use operations::{
+    apply_declarative_plan, close_workspace, refresh_workspace_runtime, run_verifier,
+    send_to_workspace_pane, wait_for_workspace_pane, ApplyResult,
+};
+pub use planner::{build_declarative_plan, DeclarativeOperation, DeclarativeWorkspacePlan};
+pub use state::{PaneActivity, RuntimePane, WorkspaceEvent, WorkspaceRuntime, WorkspaceStore};
+pub use templates::render_template;
 
 pub const MAX_WORKSPACE_PANES: usize = 4;
 
@@ -36,7 +53,7 @@ pub enum WorkspaceStep {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitDirection {
     Right,
@@ -44,7 +61,7 @@ pub enum SplitDirection {
 }
 
 impl SplitDirection {
-    fn as_protocol_value(self) -> &'static str {
+    pub fn as_protocol_value(self) -> &'static str {
         match self {
             Self::Right => "right",
             Self::Down => "down",

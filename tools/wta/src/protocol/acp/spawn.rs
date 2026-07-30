@@ -186,9 +186,7 @@ impl AgentSpawn {
     /// Human-readable agent label for error messages. Prefers the npx
     /// adapter package id when present.
     pub fn label(&self) -> &str {
-        self.adapter_package
-            .as_deref()
-            .unwrap_or(&self.raw_program)
+        self.adapter_package.as_deref().unwrap_or(&self.raw_program)
     }
 }
 
@@ -200,18 +198,25 @@ impl AgentSpawn {
 /// project. None preserves the parent's cwd (probe path, where it doesn't
 /// matter).
 pub(crate) fn spawn_agent_process(agent_cmd: &str, cwd: Option<&Path>) -> Result<AgentSpawn> {
-    let parts: Vec<&str> = agent_cmd.split_whitespace().collect();
+    // Use the same Windows command-line parser as the coordinator. Apart from
+    // preserving quoted arguments, this is required for resolved launchers
+    // such as "C:\Program Files\nodejs\npx.cmd": split_whitespace would turn
+    // that into two unrelated tokens before we ever had a chance to classify
+    // it as npx.
+    let parts = crate::coordinator::split_windows_commandline(agent_cmd);
     let raw_program = parts
         .first()
-        .copied()
+        .cloned()
         .ok_or_else(|| anyhow!("empty agent command"))?;
-    let args: Vec<&str> = parts[1..].to_vec();
-    let resolved_program = crate::agent_registry::resolve_bare_agent_name(raw_program);
+    let args = &parts[1..];
+    let resolved_program = crate::agent_registry::resolve_bare_agent_name(&raw_program);
     let needs_cmd = crate::coordinator::needs_shell_launch(&resolved_program);
 
-    let is_npx = resolved_program.eq_ignore_ascii_case("npx")
-        || resolved_program.eq_ignore_ascii_case("npx.cmd")
-        || resolved_program.eq_ignore_ascii_case("npx.exe");
+    // Classification must happen after resolution and by basename. The
+    // registry normally resolves npx to an absolute path, so comparing the
+    // entire string against "npx.cmd" silently selected the short 15-second
+    // initialize timeout on a cold npm cache.
+    let is_npx = is_npx_launcher(&resolved_program) || is_npx_launcher(&raw_program);
     let adapter_package = if is_npx {
         args.iter()
             .find(|a| a.starts_with('@'))
@@ -220,7 +225,11 @@ pub(crate) fn spawn_agent_process(agent_cmd: &str, cwd: Option<&Path>) -> Result
         None
     };
 
-    let program = if needs_cmd { "cmd" } else { resolved_program.as_str() };
+    let program = if needs_cmd {
+        "cmd"
+    } else {
+        resolved_program.as_str()
+    };
     let mut cmd = tokio::process::Command::new(program);
     if needs_cmd {
         cmd.arg("/c").arg(&resolved_program);
@@ -231,6 +240,11 @@ pub(crate) fn spawn_agent_process(agent_cmd: &str, cwd: Option<&Path>) -> Result
     // `claude` shells from sharing runtime, but doesn't apply to an
     // ACP host. Scrub unconditionally; other agents don't care.
     cmd.env_remove("CLAUDECODE");
+    // ACP children must not inherit the terminal host's COM capability.
+    // Terminal tools are executed by the trusted WTA helper, not by handing
+    // an unrestricted host token to the semi-trusted adapter process.
+    cmd.env_remove("WT_COM_CLSID");
+    cmd.env_remove("WT_PROTOCOL_TOKEN");
 
     // Give the agent CLI a PATH rebuilt from the Windows registry. Windows
     // Terminal — and thus this wta-master / wta child — snapshots its
@@ -293,7 +307,7 @@ pub(crate) fn spawn_agent_process(agent_cmd: &str, cwd: Option<&Path>) -> Result
         cmd.current_dir(cwd);
     }
     let child = cmd
-        .args(&args)
+        .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -303,11 +317,20 @@ pub(crate) fn spawn_agent_process(agent_cmd: &str, cwd: Option<&Path>) -> Result
 
     Ok(AgentSpawn {
         child,
-        raw_program: raw_program.to_string(),
+        raw_program,
         resolved_program,
         is_npx,
         adapter_package,
     })
+}
+
+fn is_npx_launcher(program: &str) -> bool {
+    let normalized = program.trim().trim_matches('"').trim_matches('\'');
+    let basename = normalized.rsplit(['\\', '/']).next().unwrap_or(normalized);
+
+    basename.eq_ignore_ascii_case("npx")
+        || basename.eq_ignore_ascii_case("npx.cmd")
+        || basename.eq_ignore_ascii_case("npx.exe")
 }
 
 /// Spawn an ACP agent in the selected per-tab execution source.
@@ -321,7 +344,127 @@ pub(crate) fn spawn_agent_process_for_source(
         crate::agent_source::AgentSource::Wsl { distro } => {
             spawn_wsl_agent_process(agent_cmd, distro)
         }
+        crate::agent_source::AgentSource::Ssh {
+            target_id,
+            remote_session_id,
+        } => spawn_ssh_agent_process(agent_cmd, target_id, remote_session_id.as_deref()),
     }
+}
+
+fn spawn_ssh_agent_process(
+    agent_cmd: &str,
+    target_id: &str,
+    remote_session_id: Option<&str>,
+) -> Result<AgentSpawn> {
+    use wta::compute::model::{ProviderKind, TargetHealth, TrustTier};
+    use wta::compute::store::ComputeStore;
+
+    let store = ComputeStore::package_default()?;
+    let target = store.get_target(target_id)?;
+    if target.disabled {
+        return Err(anyhow!("compute target '{target_id}' is disabled"));
+    }
+    if !matches!(target.provider, ProviderKind::Ssh | ProviderKind::Azure) {
+        return Err(anyhow!("compute target '{target_id}' is not SSH-backed"));
+    }
+    if target.trust_tier == TrustTier::Production {
+        return Err(anyhow!(
+            "production target '{target_id}' cannot host an interactive agent automatically"
+        ));
+    }
+    if target.health != TargetHealth::Healthy {
+        return Err(anyhow!(
+            "compute target '{target_id}' is not healthy (run `wta compute target probe {target_id}`)"
+        ));
+    }
+    let alias = target
+        .endpoint
+        .ssh_alias
+        .as_deref()
+        .ok_or_else(|| anyhow!("compute target '{target_id}' has no SSH alias"))?;
+    wta::compute::ssh::validate_alias(alias)?;
+    if !target.os.eq_ignore_ascii_case("linux") {
+        return Err(anyhow!(
+            "managed remote ACP currently requires a Linux wta-node; target '{target_id}' reports {}",
+            target.os
+        ));
+    }
+
+    let parts = crate::coordinator::split_windows_commandline(agent_cmd);
+    let raw_program = parts
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("empty agent command"))?;
+    let is_npx = ["npx", "npx.cmd", "npx.exe"]
+        .iter()
+        .any(|name| raw_program.eq_ignore_ascii_case(name));
+    let adapter_package = is_npx
+        .then(|| parts.iter().find(|arg| arg.starts_with('@')).cloned())
+        .flatten();
+    let invocation = parts
+        .iter()
+        .map(|part| crate::coordinator::sh_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let remote_session_id = remote_session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            use sha2::{Digest, Sha256};
+            let mut digest = Sha256::new();
+            digest.update(target_id.as_bytes());
+            digest.update(b"\0");
+            digest.update(agent_cmd.as_bytes());
+            format!("adapter-{}", &hex::encode(digest.finalize())[..24])
+        });
+    wta::compute::session::validate_session_id(&remote_session_id)?;
+    // Every interpolated value is shell-quoted and the target alias was
+    // validated against option injection. The remote helper is the
+    // hash-verified artifact installed by `compute node bootstrap`. The
+    // adapter process is owned by the node daemon, so the SSH bridge can
+    // disappear and a later master spawn reattaches to the same runtime.
+    let installation = wta::compute::installation::from_target(&target)?;
+    // `active_path` is validated as a safe home-relative path by the
+    // installation contract. Keep `$HOME` outside shell quoting so it expands.
+    let remote_node = format!("\"$HOME/{}\"", installation.active_path);
+    let remote = format!(
+        "exec {remote_node} acp start --session {} -- {invocation}",
+        crate::coordinator::sh_quote(&remote_session_id)
+    );
+
+    let mut command = tokio::process::Command::new("ssh.exe");
+    command
+        .arg("-T")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=yes")
+        .arg(alias)
+        .arg("--")
+        .arg(remote)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let child = command.spawn().map_err(|error| {
+        anyhow!(
+            "failed to spawn agent '{}' on compute target '{}': {}",
+            agent_cmd,
+            target_id,
+            error
+        )
+    })?;
+    Ok(AgentSpawn {
+        child,
+        raw_program,
+        resolved_program: format!("ssh.exe {alias} wta-node:{remote_session_id}"),
+        is_npx,
+        adapter_package,
+    })
 }
 
 fn spawn_wsl_agent_process(agent_cmd: &str, distro: &str) -> Result<AgentSpawn> {
@@ -355,16 +498,14 @@ fn spawn_wsl_agent_process(agent_cmd: &str, distro: &str) -> Result<AgentSpawn> 
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
 
-    let child = command
-        .spawn()
-        .map_err(|error| {
-            anyhow!(
-                "failed to spawn agent '{}' in WSL distro '{}': {}",
-                agent_cmd,
-                distro,
-                error
-            )
-        })?;
+    let child = command.spawn().map_err(|error| {
+        anyhow!(
+            "failed to spawn agent '{}' in WSL distro '{}': {}",
+            agent_cmd,
+            distro,
+            error
+        )
+    })?;
 
     Ok(AgentSpawn {
         child,
@@ -381,7 +522,10 @@ fn wsl_agent_launch_script(parts: &[String]) -> String {
         .map(|part| crate::coordinator::sh_quote(part))
         .collect::<Vec<_>>()
         .join(" ");
-    let inner = format!("exec 1>&3 3>&-; unset CLAUDECODE; exec {invocation}");
+    let inner = format!(
+        "{} exec 1>&3 3>&-; unset CLAUDECODE WT_COM_CLSID WT_PROTOCOL_TOKEN; exec {invocation}",
+        crate::agent_check::wsl_portable_node_path_prelude()
+    );
     format!(
         "bash -lc {} 3>&1 >/dev/null",
         crate::coordinator::sh_quote(&inner)
@@ -435,10 +579,18 @@ mod tests {
             "--model".to_string(),
             "model; touch /tmp/nope".to_string(),
         ];
-        assert_eq!(
-            wsl_agent_launch_script(&parts),
-            "bash -lc 'exec 1>&3 3>&-; unset CLAUDECODE; exec '\\''copilot'\\'' \
-             '\\''--model'\\'' '\\''model; touch /tmp/nope'\\''' 3>&1 >/dev/null"
+        let script = wsl_agent_launch_script(&parts);
+        assert!(
+            script.contains("$HOME/.local/share/intelligent-terminal/toolchains"),
+            "{script}"
+        );
+        assert!(script.contains("node-current/bin:$PATH"), "{script}");
+        assert!(
+            script.ends_with(
+                "exec '\\''copilot'\\'' '\\''--model'\\'' \
+                 '\\''model; touch /tmp/nope'\\''' 3>&1 >/dev/null"
+            ),
+            "{script}"
         );
     }
 
@@ -496,17 +648,11 @@ mod tests {
         let line = "a".repeat(STARTUP_STDERR_MAX_CHARS_PER_LINE + 1);
         let truncated = truncate_stderr_line(&line);
 
-        assert_eq!(
-            truncated.chars().count(),
-            STARTUP_STDERR_MAX_CHARS_PER_LINE
-        );
+        assert_eq!(truncated.chars().count(), STARTUP_STDERR_MAX_CHARS_PER_LINE);
         assert!(truncated.ends_with("..."));
         assert_eq!(
             truncated,
-            format!(
-                "{}...",
-                "a".repeat(STARTUP_STDERR_MAX_CHARS_PER_LINE - 3)
-            )
+            format!("{}...", "a".repeat(STARTUP_STDERR_MAX_CHARS_PER_LINE - 3))
         );
     }
 
@@ -515,16 +661,10 @@ mod tests {
         let line = "界".repeat(STARTUP_STDERR_MAX_CHARS_PER_LINE + 1);
         let truncated = truncate_stderr_line(&line);
 
-        assert_eq!(
-            truncated.chars().count(),
-            STARTUP_STDERR_MAX_CHARS_PER_LINE
-        );
+        assert_eq!(truncated.chars().count(), STARTUP_STDERR_MAX_CHARS_PER_LINE);
         assert_eq!(
             truncated,
-            format!(
-                "{}...",
-                "界".repeat(STARTUP_STDERR_MAX_CHARS_PER_LINE - 3)
-            )
+            format!("{}...", "界".repeat(STARTUP_STDERR_MAX_CHARS_PER_LINE - 3))
         );
     }
 
@@ -549,5 +689,23 @@ mod tests {
     #[test]
     fn canonicalizes_language_only() {
         assert_eq!(canonicalize_posix_locale("en"), "en.UTF-8");
+    }
+
+    #[test]
+    fn classifies_npx_by_resolved_basename() {
+        assert!(is_npx_launcher("npx"));
+        assert!(is_npx_launcher("npx.cmd"));
+        assert!(is_npx_launcher("NPX.EXE"));
+        assert!(is_npx_launcher(r"C:\Program Files\nodejs\npx.cmd"));
+        assert!(is_npx_launcher(r#""C:\Program Files\nodejs\npx.cmd""#));
+        assert!(is_npx_launcher("/usr/local/bin/npx"));
+    }
+
+    #[test]
+    fn does_not_classify_similar_launcher_names_as_npx() {
+        assert!(!is_npx_launcher("npx-wrapper.cmd"));
+        assert!(!is_npx_launcher(r"C:\tools\my-npx.exe"));
+        assert!(!is_npx_launcher("node.exe"));
+        assert!(!is_npx_launcher(""));
     }
 }

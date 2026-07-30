@@ -39,6 +39,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// Per-helper notification channel capacity. Sized for bursty chunk
@@ -205,8 +206,7 @@ struct MasterStateInner {
     /// lazily on the next helper request. Idle-timeout eviction would save
     /// a background process at the cost of cold-start latency for the next
     /// tab switch; that trade-off favors warm agents for a terminal app.
-    pub(crate) agents:
-        Mutex<HashMap<AgentCmdKey, Arc<tokio::sync::OnceCell<Arc<AgentCli>>>>>,
+    pub(crate) agents: Mutex<HashMap<AgentCmdKey, Arc<tokio::sync::OnceCell<Arc<AgentCli>>>>>,
     /// Fallback agent command line + id for helpers that don't declare
     /// their own in `_meta.wta` (older helper builds, or the rare
     /// manual launch). Comes from the master's own `--agent` / `--agent-id`,
@@ -262,6 +262,14 @@ struct MasterStateInner {
     /// Independent lock from `session_to_helper` so the per-session
     /// routing hot path never contends on it.
     pub(crate) helper_meta: Mutex<HashMap<HelperId, HelperRecoveryMeta>>,
+    /// Agent transport currently selected by each connected helper.
+    ///
+    /// Unlike `helper_meta`, this is populated as soon as ACP initialization
+    /// succeeds, before a session necessarily exists. It lets the transport
+    /// reaper identify every affected surface when a shared local adapter or
+    /// persistent remote session disconnects, and request a focused rewarm
+    /// without disturbing helpers backed by other adapters.
+    pub(crate) helper_agents: Mutex<HashMap<HelperId, AgentCmdKey>>,
     /// Session ids claimed by an *authoritative* producer — a PowerShell agent
     /// hook (arrives via `intellterm.wta/session_hook`) or an ACP agent-pane
     /// session (driven by ACP `session/*`), both of which fully own binding and
@@ -308,8 +316,12 @@ struct MasterStateInner {
     /// negative-cached so a burst of hook/watcher events and the 5s poll share
     /// one round-trip and don't hammer a hung agent. Both the host-history
     /// reconcile and the synthetic-title refresh derive from this one fetch.
-    host_list_cache:
-        Mutex<Option<(std::time::Instant, Option<std::sync::Arc<[acp::schema::v1::SessionInfo]>>)>>,
+    host_list_cache: Mutex<
+        Option<(
+            std::time::Instant,
+            Option<std::sync::Arc<[acp::schema::v1::SessionInfo]>>,
+        )>,
+    >,
     /// Last time a poll-triggered WSL title seed was dispatched. Throttles the
     /// expensive per-distro `wsl.exe` ACP scan so the 5 s `sessions/list` poll
     /// can't turn it into a scan storm while a synthetic WSL delegate row waits
@@ -507,7 +519,10 @@ impl MasterClient {
         resp
     }
 
-    async fn session_notification(&self, args: acp::schema::v1::SessionNotification) -> acp::Result<()> {
+    async fn session_notification(
+        &self,
+        args: acp::schema::v1::SessionNotification,
+    ) -> acp::Result<()> {
         let sid = args.session_id.clone();
         // Discriminator for "what KIND of notification this is" — useful
         // when scrolling logs to see prompt/turn lifecycle without
@@ -889,8 +904,9 @@ impl HelperHandler {
                 helper_id = ?self.helper_id,
                 "helper request arrived before initialize bound an agent — protocol violation"
             );
-            acp::Error::internal_error()
-                .data(serde_json::json!("no agent bound; initialize must come first"))
+            acp::Error::internal_error().data(serde_json::json!(
+                "no agent bound; initialize must come first"
+            ))
         })
     }
 
@@ -964,6 +980,8 @@ impl HelperHandler {
             wta_meta.model.as_deref(),
             wta_meta.agent_source.as_deref(),
             wta_meta.wsl_distro.as_deref(),
+            wta_meta.ssh_target.as_deref(),
+            wta_meta.remote_session_id.as_deref(),
             self.helper_id,
         );
         tracing::info!(
@@ -979,28 +997,28 @@ impl HelperHandler {
             "resolving agent CLI for helper"
         );
 
-        let agent = get_or_spawn_agent(
-            &self.state,
-            &agent_cmd,
-            agent_id.as_deref(),
-            &agent_source,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                target: "master",
-                op = "initialize",
-                helper_id = ?self.helper_id,
-                agent_cmd = %agent_cmd,
-                error = %e,
-                "failed to spawn/resolve agent CLI for helper"
-            );
-            acp::Error::internal_error()
-                .data(serde_json::json!(format!("agent CLI unavailable: {e}")))
-        })?;
+        let agent = get_or_spawn_agent(&self.state, &agent_cmd, agent_id.as_deref(), &agent_source)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    target: "master",
+                    op = "initialize",
+                    helper_id = ?self.helper_id,
+                    agent_cmd = %agent_cmd,
+                    error = %e,
+                    "failed to spawn/resolve agent CLI for helper"
+                );
+                acp::Error::internal_error()
+                    .data(serde_json::json!(format!("agent CLI unavailable: {e}")))
+            })?;
         // `set` is idempotent-by-error; a helper that (incorrectly) sent
         // initialize twice keeps its first binding, which is fine.
         let _ = self.agent.set(Arc::clone(&agent));
+        self.state
+            .helper_agents
+            .lock()
+            .await
+            .insert(self.helper_id, agent.cmd_key.clone());
 
         // Replay the CLI's own initialize response (re-forwarding returns
         // empty `agent_info` on most backends, blanking the agent bar).
@@ -1018,7 +1036,10 @@ impl HelperHandler {
             helper_id = ?self.helper_id,
             "forwarding authenticate"
         );
-        self.resolved_agent("authenticate")?.conn.authenticate(args).await
+        self.resolved_agent("authenticate")?
+            .conn
+            .authenticate(args)
+            .await
     }
 
     async fn new_session(
@@ -1074,10 +1095,8 @@ impl HelperHandler {
         // ordering matches the doc on `MasterStateInner::registry`:
         // `session_to_helper` is no longer held here, so the upsert
         // can't deadlock against `drop_sessions_for_helper`.
-        let mut info = crate::session_registry::SessionInfo::new(
-            resp.session_id.clone(),
-            cwd_for_registry,
-        );
+        let mut info =
+            crate::session_registry::SessionInfo::new(resp.session_id.clone(), cwd_for_registry);
         info.pane_session_id = wta_meta.pane_session_id;
         // Stamp the row as a Live agent-pane session. Without this, the
         // row lands in master's registry with status=cli_source=origin=None,
@@ -1306,7 +1325,10 @@ impl HelperHandler {
         &self,
         args: acp::schema::v1::SetSessionModeRequest,
     ) -> acp::Result<acp::schema::v1::SetSessionModeResponse> {
-        self.resolved_agent("set_session_mode")?.conn.set_session_mode(args).await
+        self.resolved_agent("set_session_mode")?
+            .conn
+            .set_session_mode(args)
+            .await
     }
 
     // Forward config-option changes (incl. model selection) — the
@@ -1326,7 +1348,10 @@ impl HelperHandler {
             session_id = ?args.session_id,
             "forwarding set_session_config_option"
         );
-        self.resolved_agent("set_session_config_option")?.conn.set_session_config_option(args).await
+        self.resolved_agent("set_session_config_option")?
+            .conn
+            .set_session_config_option(args)
+            .await
     }
 
     /// Answer `session/list` from our own registry (NOT by proxying the
@@ -1467,7 +1492,10 @@ impl HelperHandler {
     /// ACP-1.0 leading-`_` normalization lives in one place and the match below
     /// is exhaustive (a new method is a compile error until it is handled,
     /// instead of silently falling through to the agent CLI).
-    async fn ext_method(&self, args: acp::schema::v1::ExtRequest) -> acp::Result<acp::schema::v1::ExtResponse> {
+    async fn ext_method(
+        &self,
+        args: acp::schema::v1::ExtRequest,
+    ) -> acp::Result<acp::schema::v1::ExtResponse> {
         use crate::session_registry::WtaExtRequest as Req;
         tracing::debug!(
             target: "master",
@@ -1483,9 +1511,16 @@ impl HelperHandler {
             Req::SessionBornBound(ev, wsl_distro) => {
                 handle_session_born_bound(&self.state, ev, wsl_distro).await
             }
-            Req::SessionResumeDispatched(p) => handle_session_resume_dispatched(&self.state, &p).await,
+            Req::SessionResumeDispatched(p) => {
+                handle_session_resume_dispatched(&self.state, &p).await
+            }
             Req::SessionFocus(p) => handle_session_focus(&self.state, &p).await,
-            Req::ForwardToAgent(raw) => self.resolved_agent("ext_method")?.conn.ext_method(raw).await,
+            Req::ForwardToAgent(raw) => {
+                self.resolved_agent("ext_method")?
+                    .conn
+                    .ext_method(raw)
+                    .await
+            }
             Req::Malformed { method, error } => {
                 tracing::warn!(
                     target: "master",
@@ -1563,7 +1598,6 @@ pub async fn run_master_mode(cli: Cli, pipe_name: String) -> Result<()> {
     }
     result
 }
-
 
 struct MasterPipeDiscoveryGuard {
     path: Option<PathBuf>,
@@ -1870,6 +1904,7 @@ async fn run_master_loop(cli: Cli, pipe_name: String) -> Result<()> {
                 .unwrap_or_else(|| crate::agent_registry::resolve_agent_id_from_cmd(&cli.agent)),
         ),
         helper_meta: Mutex::new(HashMap::new()),
+        helper_agents: Mutex::new(HashMap::new()),
         hook_owned: Mutex::new(HashSet::new()),
         born_bound: Mutex::new(HashSet::new()),
         orphaned_sessions: Mutex::new(HashMap::new()),
@@ -2106,12 +2141,10 @@ fn resolve_agent_selection(
     requested_model: Option<&str>,
     requested_source: Option<&str>,
     requested_wsl_distro: Option<&str>,
+    requested_ssh_target: Option<&str>,
+    requested_remote_session: Option<&str>,
     helper_id: HelperId,
-) -> (
-    String,
-    Option<String>,
-    crate::agent_source::AgentSource,
-) {
+) -> (String, Option<String>, crate::agent_source::AgentSource) {
     let requested = requested_id
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -2128,13 +2161,13 @@ fn resolve_agent_selection(
         let allowed = allowed_ids.map_or(true, |set| set.contains(id));
 
         if known && allowed {
-            let model = requested_model
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
+            let model = requested_model.map(str::trim).filter(|s| !s.is_empty());
             let cmd = crate::agent_registry::build_acp_command(id, model);
             let source = crate::agent_source::AgentSource::from_wire(
                 requested_source,
                 requested_wsl_distro,
+                requested_ssh_target,
+                requested_remote_session,
             );
             return (cmd, Some(id.to_string()), source);
         }
@@ -2185,10 +2218,93 @@ async fn get_or_spawn_agent(
     // cleanly (no lingering dead slot, no leaked subprocess).
     let agent = cell
         .get_or_try_init(|| async {
-            spawn_one_agent(state, &key, agent_cmd, agent_id, source).await
+            let retry_delays = agent_startup_retry_delays(source);
+            let mut first_error = None;
+            for attempt in 0..=retry_delays.len() {
+                match spawn_one_agent(state, &key, agent_cmd, agent_id, source).await {
+                    Ok(agent) => return Ok(agent),
+                    Err(error)
+                        if is_transient_agent_startup_error(&error)
+                            && attempt < retry_delays.len() =>
+                    {
+                        if first_error.is_none() {
+                            first_error = Some(format!("{error:#}"));
+                        }
+                        let delay = retry_delays[attempt];
+                        tracing::warn!(
+                            target: "master",
+                            agent = %key,
+                            error = %error,
+                            retry = attempt + 1,
+                            delay_ms = delay.as_millis(),
+                            "transient agent startup failure; retrying with backoff"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(error) => {
+                        if let Some(first_error) = first_error {
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "agent startup exhausted automatic retries; first failure: \
+                                     {first_error}"
+                                )
+                            });
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            unreachable!("agent startup loop always returns")
         })
         .await?;
     Ok(Arc::clone(agent))
+}
+
+fn agent_startup_retry_delays(
+    source: &crate::agent_source::AgentSource,
+) -> Vec<std::time::Duration> {
+    use std::time::Duration;
+    match source {
+        // Remote runtimes may need time for OpenSSH reconnect, daemon
+        // bootstrap and the persistent ACP session to become attachable.
+        crate::agent_source::AgentSource::Ssh { .. } => [3, 6, 12, 24]
+            .into_iter()
+            .map(Duration::from_secs)
+            .collect(),
+        _ => vec![Duration::from_millis(750)],
+    }
+}
+
+fn is_transient_agent_startup_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    if [
+        "authentication",
+        "auth required",
+        "not recognized",
+        "not found",
+        "no such file",
+        "unknown agent",
+        "access is denied",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+    {
+        return false;
+    }
+    [
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection refused",
+        "temporarily unavailable",
+        "broken pipe",
+        "pipe has been ended",
+        "econnreset",
+        "eai_again",
+        "network",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 /// Spawn one agent CLI subprocess, wire master as its ACP client, run
@@ -2341,9 +2457,11 @@ async fn spawn_one_agent(
     // no longer talk to this CLI, so the agent is dropped from the pool.
     // On the init-failure path that removes the empty `OnceCell` entry so
     // the next helper retries cleanly instead of reusing a dead slot.
+    let initialized = Arc::new(AtomicBool::new(false));
     {
         let state = Arc::clone(state);
         let key = key.clone();
+        let initialized = Arc::clone(&initialized);
         tokio::task::spawn_local(async move {
             match handle_io.await {
                 Ok(()) => tracing::info!(
@@ -2358,7 +2476,12 @@ async fn spawn_one_agent(
                     "agent CLI ACP I/O loop ended with error — removing from pool"
                 ),
             }
-            reap_agent(&state, &key).await;
+            // Before initialize succeeds the OnceCell deliberately stays in
+            // the pool uninitialized so the bounded retry above can reuse the
+            // same synchronization slot without racing a map removal.
+            if initialized.load(Ordering::Acquire) {
+                reap_agent(&state, &key).await;
+            }
         });
     }
 
@@ -2378,13 +2501,10 @@ async fn spawn_one_agent(
         conn.initialize(
             acp::schema::v1::InitializeRequest::new(acp::schema::ProtocolVersion::V1)
                 .client_capabilities(
-                    acp::schema::v1::ClientCapabilities::new().terminal(true),
+                    crate::protocol::acp::client::intelligent_terminal_client_capabilities(),
                 )
                 .client_info(
-                    acp::schema::v1::Implementation::new(
-                        "wta-master",
-                        env!("CARGO_PKG_VERSION"),
-                    )
+                    acp::schema::v1::Implementation::new("wta-master", env!("CARGO_PKG_VERSION"))
                         .title("Windows Terminal Agent (master)"),
                 ),
         ),
@@ -2394,6 +2514,7 @@ async fn spawn_one_agent(
     let init_resp = match init_outcome {
         Ok(Ok(resp)) => {
             stderr_log.mark_initialized();
+            initialized.store(true, Ordering::Release);
             resp
         }
         Ok(Err(e)) => {
@@ -2493,6 +2614,32 @@ async fn reap_agent(state: &Arc<MasterStateInner>, key: &AgentCmdKey) {
             agent = %key,
             "dead agent removed from pool; next pane for this agent will respawn it"
         );
+
+        // A remote adapter is owned by wta-node rather than by this local
+        // transport. Rewarm every surface bound to the dead SSH transport so
+        // each helper reconnects to its stable remote session id. Local
+        // adapters retain the existing helper-disconnect recovery path.
+        if key.starts_with("ssh:") {
+            let affected_helpers: Vec<HelperId> = {
+                let helpers = state.helper_agents.lock().await;
+                helpers
+                    .iter()
+                    .filter_map(|(helper_id, helper_key)| (helper_key == key).then_some(*helper_id))
+                    .collect()
+            };
+            let recoveries: Vec<HelperRecoveryMeta> = {
+                let meta = state.helper_meta.lock().await;
+                affected_helpers
+                    .iter()
+                    .filter_map(|helper_id| meta.get(helper_id).cloned())
+                    .collect()
+            };
+            for recovery in recoveries {
+                if let Some(tab_id) = recovery.owner_tab_id {
+                    emit_restart_agent_pane(&tab_id, recovery.last_session_id.as_ref());
+                }
+            }
+        }
     }
 }
 
@@ -2550,25 +2697,71 @@ async fn serve_helper(
     let builder = acp::Agent
         .builder()
         .name("wta-master-helper")
-        .on_receive_request({ let h = handler.clone(); move |req: acp::schema::v1::ClientRequest, responder, _cx| { let h = h.clone(); async move {
-            use acp::schema::v1::{ClientRequest as Q, AgentResponse as R};
-            match req {
-                Q::InitializeRequest(a) => conn::respond_enum(responder, h.initialize(a).await.map(R::InitializeResponse)),
-                Q::AuthenticateRequest(a) => conn::respond_enum(responder, h.authenticate(a).await.map(R::AuthenticateResponse)),
-                Q::NewSessionRequest(a) => conn::respond_enum(responder, h.new_session(a).await.map(R::NewSessionResponse)),
-                Q::LoadSessionRequest(a) => conn::respond_enum(responder, h.load_session(a).await.map(R::LoadSessionResponse)),
-                Q::SetSessionModeRequest(a) => conn::respond_enum(responder, h.set_session_mode(a).await.map(R::SetSessionModeResponse)),
-                Q::SetSessionConfigOptionRequest(a) => conn::respond_enum(responder, h.set_session_config_option(a).await.map(R::SetSessionConfigOptionResponse)),
-                Q::ListSessionsRequest(a) => conn::respond_enum(responder, h.list_sessions(a).await.map(R::ListSessionsResponse)),
-                Q::PromptRequest(a) => h.prompt(a, responder).await,
-                Q::ExtMethodRequest(a) => conn::respond_enum(responder, h.ext_method(a).await.map(R::ExtMethodResponse)),
-                _ => responder.respond_with_error(acp::Error::method_not_found()),
-            }
-        } } }, acp::on_receive_request!())
-        .on_receive_notification({ let h = handler.clone(); move |notif: acp::schema::v1::ClientNotification, _cx| { let h = h.clone(); async move {
-            if let acp::schema::v1::ClientNotification::CancelNotification(n) = notif { let _ = h.cancel(n).await; }
-            Ok(())
-        } } }, acp::on_receive_notification!());
+        .on_receive_request(
+            {
+                let h = handler.clone();
+                move |req: acp::schema::v1::ClientRequest, responder, _cx| {
+                    let h = h.clone();
+                    async move {
+                        use acp::schema::v1::{AgentResponse as R, ClientRequest as Q};
+                        match req {
+                            Q::InitializeRequest(a) => conn::respond_enum(
+                                responder,
+                                h.initialize(a).await.map(R::InitializeResponse),
+                            ),
+                            Q::AuthenticateRequest(a) => conn::respond_enum(
+                                responder,
+                                h.authenticate(a).await.map(R::AuthenticateResponse),
+                            ),
+                            Q::NewSessionRequest(a) => conn::respond_enum(
+                                responder,
+                                h.new_session(a).await.map(R::NewSessionResponse),
+                            ),
+                            Q::LoadSessionRequest(a) => conn::respond_enum(
+                                responder,
+                                h.load_session(a).await.map(R::LoadSessionResponse),
+                            ),
+                            Q::SetSessionModeRequest(a) => conn::respond_enum(
+                                responder,
+                                h.set_session_mode(a).await.map(R::SetSessionModeResponse),
+                            ),
+                            Q::SetSessionConfigOptionRequest(a) => conn::respond_enum(
+                                responder,
+                                h.set_session_config_option(a)
+                                    .await
+                                    .map(R::SetSessionConfigOptionResponse),
+                            ),
+                            Q::ListSessionsRequest(a) => conn::respond_enum(
+                                responder,
+                                h.list_sessions(a).await.map(R::ListSessionsResponse),
+                            ),
+                            Q::PromptRequest(a) => h.prompt(a, responder).await,
+                            Q::ExtMethodRequest(a) => conn::respond_enum(
+                                responder,
+                                h.ext_method(a).await.map(R::ExtMethodResponse),
+                            ),
+                            _ => responder.respond_with_error(acp::Error::method_not_found()),
+                        }
+                    }
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let h = handler.clone();
+                move |notif: acp::schema::v1::ClientNotification, _cx| {
+                    let h = h.clone();
+                    async move {
+                        if let acp::schema::v1::ClientNotification::CancelNotification(n) = notif {
+                            let _ = h.cancel(n).await;
+                        }
+                        Ok(())
+                    }
+                }
+            },
+            acp::on_receive_notification!(),
+        );
 
     let (agent_side_conn, handle_io) =
         conn::spawn_agent(builder, conn::byte_streams(outgoing, incoming));
@@ -2699,6 +2892,7 @@ async fn serve_helper(
         let mut meta = state.helper_meta.lock().await;
         meta.remove(&helper_id)
     };
+    state.helper_agents.lock().await.remove(&helper_id);
     if let Some(recovery) = recovery {
         if let Some(tab_id) = recovery.owner_tab_id {
             emit_restart_agent_pane(&tab_id, recovery.last_session_id.as_ref());
@@ -2822,7 +3016,9 @@ pub(crate) async fn broadcast_ext_to_helpers(
 /// "no sessions" — the reconcile skips it so a transient error can't wipe the
 /// view. 2s TTL so the 5s poll, the title refresh, and a burst of hook events
 /// share one round-trip.
-async fn host_session_list_raw(state: &MasterStateInner) -> Option<std::sync::Arc<[acp::schema::v1::SessionInfo]>> {
+async fn host_session_list_raw(
+    state: &MasterStateInner,
+) -> Option<std::sync::Arc<[acp::schema::v1::SessionInfo]>> {
     let Some(init) = state.cached_init_resp.get() else {
         return None;
     };
@@ -2955,8 +3151,10 @@ async fn sync_host_history(state: &MasterStateInner) -> Option<(bool, usize)> {
     // Snapshot once; compute existing ids for the add pass and reconcile the
     // terminal Class-B host rows in the same pass.
     let snapshot = state.registry.snapshot().await;
-    let existing: std::collections::HashSet<String> =
-        snapshot.iter().map(|s| s.session_id.0.to_string()).collect();
+    let existing: std::collections::HashSet<String> = snapshot
+        .iter()
+        .map(|s| s.session_id.0.to_string())
+        .collect();
 
     let mut changed = false;
 
@@ -3157,9 +3355,7 @@ fn wsl_title_seed_warranted(
 /// [`wsl_title_seed_warranted`] to tell a synthetic row the host CLI knows about
 /// apart from an in-distro (WSL) one it can never title. Empty when the host
 /// agent can't list / isn't connected.
-async fn host_session_id_set(
-    state: &MasterStateInner,
-) -> std::collections::HashSet<String> {
+async fn host_session_id_set(state: &MasterStateInner) -> std::collections::HashSet<String> {
     host_session_list_raw(state)
         .await
         .map(|rows| rows.iter().map(|r| r.session_id.to_string()).collect())
@@ -3246,7 +3442,10 @@ async fn handle_sessions_list(
     }
 
     let mut sessions = state.registry.snapshot().await;
-    if sessions.iter().any(crate::session_registry::title_is_synthetic) {
+    if sessions
+        .iter()
+        .any(crate::session_registry::title_is_synthetic)
+    {
         let titles = host_titles_via_acp(state).await;
         // Re-snapshot only when a title actually changed; the common steady-state
         // (no synthetic rows, or nothing to upgrade) reuses the first snapshot.
@@ -3368,7 +3567,9 @@ async fn handle_session_hook(
         .await;
     }
 
-    Ok(crate::session_registry::build_session_hook_response(applied))
+    Ok(crate::session_registry::build_session_hook_response(
+        applied,
+    ))
 }
 
 /// Handle a #266 *born-bound* registration (delegate `?<prompt>` / resume).
@@ -3419,10 +3620,7 @@ async fn handle_session_born_bound(
 ///      without touching the pane binding; or
 ///   3. anything else (a user-typed CLI, or a machine-wide copilot/claude in
 ///      VS Code / another terminal) → drop — we can't bind it to an IT pane.
-async fn apply_watcher_event(
-    state: &MasterStateInner,
-    emitted: crate::session_watcher::Emitted,
-) {
+async fn apply_watcher_event(state: &MasterStateInner, emitted: crate::session_watcher::Emitted) {
     let sid = acp::schema::v1::SessionId::new(emitted.key.clone());
 
     // Hybrid dedup — the watcher is a *fallback*. Coordinate with authoritative
@@ -3483,10 +3681,7 @@ async fn apply_watcher_event(
 /// the publish-from-helper path works for them today; this subscriber
 /// makes the behavior uniform across CLIs and resilient to helper
 /// teardown order.
-async fn handle_master_wt_event(
-    state: &MasterStateInner,
-    event_json: serde_json::Value,
-) {
+async fn handle_master_wt_event(state: &MasterStateInner, event_json: serde_json::Value) {
     let method = event_json
         .get("method")
         .and_then(|v| v.as_str())
@@ -3511,10 +3706,7 @@ async fn handle_master_wt_event(
     if pane_id.is_empty() {
         return;
     }
-    let pane_state = params
-        .get("state")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let pane_state = params.get("state").and_then(|v| v.as_str()).unwrap_or("");
     let event = match pane_state {
         "closed" => crate::agent_sessions::SessionEvent::PaneClosed {
             pane_session_id: pane_id.clone(),
@@ -3860,6 +4052,42 @@ async fn handle_session_focus(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_retry_classifier_is_bounded_to_transient_failures() {
+        assert!(is_transient_agent_startup_error(&anyhow!(
+            "ACP initialize timed out after 60s"
+        )));
+        assert!(is_transient_agent_startup_error(&anyhow!(
+            "connection reset by peer"
+        )));
+        assert!(!is_transient_agent_startup_error(&anyhow!(
+            "authentication required"
+        )));
+        assert!(!is_transient_agent_startup_error(&anyhow!(
+            "program not found"
+        )));
+    }
+
+    #[test]
+    fn remote_startup_uses_bounded_exponential_backoff() {
+        let remote = crate::agent_source::AgentSource::Ssh {
+            target_id: "devbox".to_string(),
+            remote_session_id: Some("surface-a".to_string()),
+        };
+        let delays = agent_startup_retry_delays(&remote);
+        assert_eq!(
+            delays,
+            [3, 6, 12, 24]
+                .into_iter()
+                .map(std::time::Duration::from_secs)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            agent_startup_retry_delays(&crate::agent_source::AgentSource::Host),
+            vec![std::time::Duration::from_millis(750)]
+        );
+    }
     use acp::schema::v1::{ContentChunk, SessionId, SessionNotification, SessionUpdate};
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -3871,7 +4099,9 @@ mod tests {
             &self,
             _args: acp::schema::v1::InitializeRequest,
         ) -> acp::Result<acp::schema::v1::InitializeResponse> {
-            Ok(acp::schema::v1::InitializeResponse::new(acp::schema::ProtocolVersion::V1))
+            Ok(acp::schema::v1::InitializeResponse::new(
+                acp::schema::ProtocolVersion::V1,
+            ))
         }
         async fn authenticate(
             &self,
@@ -3916,6 +4146,8 @@ mod tests {
             model,
             None,
             None,
+            None,
+            None,
             HelperId(1),
         );
         (command, agent_id)
@@ -3940,6 +4172,8 @@ mod tests {
             None,
             Some("wsl"),
             Some("Ubuntu"),
+            None,
+            None,
             HelperId(1),
         );
         assert_eq!(command, "copilot --acp --stdio");
@@ -3998,8 +4232,17 @@ mod tests {
         for profile in crate::agent_registry::KNOWN_AGENTS {
             let (cmd, id) = resolve(None, Some(profile.id), None);
             let expected = crate::agent_registry::build_acp_command(profile.id, None);
-            assert_eq!(cmd, expected, "agent {} must be honored, not fall back", profile.id);
-            assert_eq!(id.as_deref(), Some(profile.id), "id stamp for {}", profile.id);
+            assert_eq!(
+                cmd, expected,
+                "agent {} must be honored, not fall back",
+                profile.id
+            );
+            assert_eq!(
+                id.as_deref(),
+                Some(profile.id),
+                "id stamp for {}",
+                profile.id
+            );
         }
     }
 
@@ -4019,7 +4262,11 @@ mod tests {
     fn allowed_ids_absent_is_no_policy_present_but_empty_is_block_all() {
         // The flag being *absent* (clap yields `[]`) is the only "no host
         // policy" case → `None` → accept any known id.
-        assert_eq!(normalize_allowed_agent_ids(&[]), None, "no argv ⇒ no policy");
+        assert_eq!(
+            normalize_allowed_agent_ids(&[]),
+            None,
+            "no argv ⇒ no policy"
+        );
 
         // The flag being *present* but filtering down to nothing is honored
         // fail-closed → `Some({})` → block every helper-selected id (all tabs
@@ -4054,11 +4301,9 @@ mod tests {
         .expect("non-empty allowlist");
         assert_eq!(set, allow_set(&["gemini", "copilot"]));
         // Unknown ids mixed with a real id: only the real id survives.
-        let mixed = normalize_allowed_agent_ids(&[
-            "custom:myapp".to_string(),
-            "claude".to_string(),
-        ])
-        .expect("one real id survives");
+        let mixed =
+            normalize_allowed_agent_ids(&["custom:myapp".to_string(), "claude".to_string()])
+                .expect("one real id survives");
         assert_eq!(mixed, allow_set(&["claude"]));
 
         // End-to-end through resolve_agent_selection:
@@ -4174,6 +4419,7 @@ mod tests {
             agent_conn: OnceLock::new(),
             cli_source: Some(crate::agent_sessions::CliSource::Copilot),
             helper_meta: Mutex::new(HashMap::new()),
+            helper_agents: Mutex::new(HashMap::new()),
             hook_owned: Mutex::new(HashSet::new()),
             born_bound: Mutex::new(HashSet::new()),
             orphaned_sessions: Mutex::new(HashMap::new()),
@@ -4192,24 +4438,48 @@ mod tests {
         let agent_builder = acp::Agent
             .builder()
             .name("pending-agent")
-            .on_receive_request({ let m = mock.clone(); move |req: acp::schema::v1::ClientRequest, responder, _cx| { let m = m.clone(); async move {
-                use acp::schema::v1::{ClientRequest as Q, AgentResponse as R};
-                match req {
-                    Q::InitializeRequest(a) => conn::respond_enum(responder, m.initialize(a).await.map(R::InitializeResponse)),
-                    Q::AuthenticateRequest(a) => conn::respond_enum(responder, m.authenticate(a).await.map(R::AuthenticateResponse)),
-                    Q::NewSessionRequest(a) => conn::respond_enum(responder, m.new_session(a).await.map(R::NewSessionResponse)),
-                    _ => responder.respond_with_error(acp::Error::method_not_found()),
-                }
-            } } }, acp::on_receive_request!());
-        let (_agent_conn, agent_io) =
-            conn::spawn_agent(agent_builder, conn::byte_streams(agent_write.compat_write(), agent_read.compat()));
-        tokio::task::spawn_local(async move { let _ = agent_io.await; });
+            .on_receive_request(
+                {
+                    let m = mock.clone();
+                    move |req: acp::schema::v1::ClientRequest, responder, _cx| {
+                        let m = m.clone();
+                        async move {
+                            use acp::schema::v1::{AgentResponse as R, ClientRequest as Q};
+                            match req {
+                                Q::InitializeRequest(a) => conn::respond_enum(
+                                    responder,
+                                    m.initialize(a).await.map(R::InitializeResponse),
+                                ),
+                                Q::AuthenticateRequest(a) => conn::respond_enum(
+                                    responder,
+                                    m.authenticate(a).await.map(R::AuthenticateResponse),
+                                ),
+                                Q::NewSessionRequest(a) => conn::respond_enum(
+                                    responder,
+                                    m.new_session(a).await.map(R::NewSessionResponse),
+                                ),
+                                _ => responder.respond_with_error(acp::Error::method_not_found()),
+                            }
+                        }
+                    }
+                },
+                acp::on_receive_request!(),
+            );
+        let (_agent_conn, agent_io) = conn::spawn_agent(
+            agent_builder,
+            conn::byte_streams(agent_write.compat_write(), agent_read.compat()),
+        );
+        tokio::task::spawn_local(async move {
+            let _ = agent_io.await;
+        });
 
         let (client_conn, client_io) = conn::spawn_client(
             acp::Client.builder().name("noop-client"),
             conn::byte_streams(client_write.compat_write(), client_read.compat()),
         );
-        tokio::task::spawn_local(async move { let _ = client_io.await; });
+        tokio::task::spawn_local(async move {
+            let _ = client_io.await;
+        });
 
         client_conn
     }
@@ -4283,9 +4553,8 @@ mod tests {
     #[tokio::test]
     async fn request_permission_for_orphaned_session_returns_cancelled_not_error() {
         use acp::schema::v1::{
-            PermissionOption, PermissionOptionId, PermissionOptionKind,
-            RequestPermissionOutcome, RequestPermissionRequest, ToolCallId, ToolCallUpdate,
-            ToolCallUpdateFields,
+            PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
+            RequestPermissionRequest, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
         };
         let state = make_state();
         let client = MasterClient {
@@ -4438,8 +4707,9 @@ mod tests {
                                         });
                                         Ok(())
                                     }
-                                    _ => responder
-                                        .respond_with_error(acp::Error::method_not_found()),
+                                    _ => {
+                                        responder.respond_with_error(acp::Error::method_not_found())
+                                    }
                                 }
                             },
                             acp::on_receive_request!(),
@@ -4478,9 +4748,8 @@ mod tests {
                                                     ),
                                                 )
                                             }
-                                            _ => responder.respond_with_error(
-                                                acp::Error::method_not_found(),
-                                            ),
+                                            _ => responder
+                                                .respond_with_error(acp::Error::method_not_found()),
                                         }
                                     }
                                 }
@@ -4532,9 +4801,8 @@ mod tests {
                                             ClientRequest::PromptRequest(a) => {
                                                 h.prompt(a, responder).await
                                             }
-                                            _ => responder.respond_with_error(
-                                                acp::Error::method_not_found(),
-                                            ),
+                                            _ => responder
+                                                .respond_with_error(acp::Error::method_not_found()),
                                         }
                                     }
                                 }
@@ -4586,8 +4854,9 @@ mod tests {
                                             )),
                                         )
                                     }
-                                    _ => responder
-                                        .respond_with_error(acp::Error::method_not_found()),
+                                    _ => {
+                                        responder.respond_with_error(acp::Error::method_not_found())
+                                    }
                                 }
                             },
                             acp::on_receive_request!(),
@@ -5182,16 +5451,16 @@ mod tests {
         let client = MasterClient {
             state: Arc::clone(&state),
         };
-        let req =
-            acp::schema::v1::CreateTerminalRequest::new(SessionId::new("nobody-home"), "echo".to_string());
+        let req = acp::schema::v1::CreateTerminalRequest::new(
+            SessionId::new("nobody-home"),
+            "echo".to_string(),
+        );
         let err = client
             .create_terminal(req)
             .await
             .expect_err("create_terminal on unknown session must fail");
         assert_eq!(err.code, acp::ErrorCode::InternalError);
     }
-
-
 
     #[tokio::test]
     async fn sessions_list_handler_returns_registry_snapshot_payload() {
@@ -5205,11 +5474,14 @@ mod tests {
         row.last_activity_at_ms = Some(42);
         state.registry.upsert(row.clone()).await;
 
-        let resp = handle_sessions_list(&state, &session_registry::SessionsListParams { rescan: false })
-            .await
-            .expect("sessions/list succeeds");
-        let parsed = session_registry::parse_sessions_list_response(&resp.0)
-            .expect("response parses");
+        let resp = handle_sessions_list(
+            &state,
+            &session_registry::SessionsListParams { rescan: false },
+        )
+        .await
+        .expect("sessions/list succeeds");
+        let parsed =
+            session_registry::parse_sessions_list_response(&resp.0).expect("response parses");
 
         assert_eq!(parsed.sessions, vec![row]);
     }
@@ -5225,14 +5497,20 @@ mod tests {
         let sid = SessionId::new("removed-a");
         {
             let mut map = state.session_to_helper.lock().await;
-            map.insert(sid.clone(), HelperRoute {
-                helper_id: HelperId(1),
-                notif_tx,
-                forwarder: None,
-                consecutive_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            });
+            map.insert(
+                sid.clone(),
+                HelperRoute {
+                    helper_id: HelperId(1),
+                    notif_tx,
+                    forwarder: None,
+                    consecutive_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                },
+            );
         }
-        state.registry.upsert(SessionInfo::new(sid, PathBuf::from("C:\\repo"))).await;
+        state
+            .registry
+            .upsert(SessionInfo::new(sid, PathBuf::from("C:\\repo")))
+            .await;
         {
             let mut subs = state.helper_ext_subscribers.lock().await;
             subs.insert(HelperId(2), ext_tx);
@@ -5344,11 +5622,15 @@ mod tests {
         assert!(mock.calls().is_empty());
     }
 
-    fn session_resume_params_for(sid: &acp::schema::v1::SessionId) -> crate::session_registry::SessionResumeDispatchedParams {
+    fn session_resume_params_for(
+        sid: &acp::schema::v1::SessionId,
+    ) -> crate::session_registry::SessionResumeDispatchedParams {
         crate::session_registry::SessionResumeDispatchedParams { sid: sid.clone() }
     }
 
-    fn session_focus_params_for(sid: &acp::schema::v1::SessionId) -> crate::session_registry::SessionFocusParams {
+    fn session_focus_params_for(
+        sid: &acp::schema::v1::SessionId,
+    ) -> crate::session_registry::SessionFocusParams {
         crate::session_registry::SessionFocusParams { sid: sid.clone() }
     }
 
@@ -5420,6 +5702,7 @@ mod tests {
             agent_conn: OnceLock::new(),
             cli_source: Some(crate::agent_sessions::CliSource::Copilot),
             helper_meta: Mutex::new(HashMap::new()),
+            helper_agents: Mutex::new(HashMap::new()),
             hook_owned: Mutex::new(HashSet::new()),
             born_bound: Mutex::new(HashSet::new()),
             orphaned_sessions: Mutex::new(HashMap::new()),
@@ -5429,8 +5712,12 @@ mod tests {
         })
     }
 
-    fn focus_params_for(sid: &acp::schema::v1::SessionId) -> crate::session_registry::FocusSessionParams {
-        crate::session_registry::FocusSessionParams { session_id: sid.clone() }
+    fn focus_params_for(
+        sid: &acp::schema::v1::SessionId,
+    ) -> crate::session_registry::FocusSessionParams {
+        crate::session_registry::FocusSessionParams {
+            session_id: sid.clone(),
+        }
     }
 
     /// Happy path: sid in registry with pane_session_id, WtChannel present.
@@ -5557,7 +5844,11 @@ mod tests {
     async fn session_hook_broadcasts_sessions_changed_after_valid_payload() {
         let state = make_state();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        state.helper_ext_subscribers.lock().await.insert(HelperId(7), tx);
+        state
+            .helper_ext_subscribers
+            .lock()
+            .await
+            .insert(HelperId(7), tx);
 
         // Use SessionStarted because it unconditionally upserts a row,
         // so the reducer returns true and the broadcast fires. PaneClosed
@@ -5622,7 +5913,10 @@ mod tests {
         let titles = HashMap::from([
             ("sid-empty".to_string(), "Empty Real Title".to_string()),
             ("sid-base".to_string(), "Basename Real Title".to_string()),
-            ("sid-placeholder".to_string(), "OpenCode Real Title".to_string()),
+            (
+                "sid-placeholder".to_string(),
+                "OpenCode Real Title".to_string(),
+            ),
             ("sid-real".to_string(), "Should Not Overwrite".to_string()),
         ]);
 
@@ -5773,35 +6067,53 @@ mod tests {
         // and its id is NOT in the host session/list → warrants a WSL scan.
         let wsl_row = live_synthetic_pane_row("wsl-sid");
         let no_host: HashSet<String> = HashSet::new();
-        assert!(wsl_title_seed_warranted(std::slice::from_ref(&wsl_row), &no_host));
+        assert!(wsl_title_seed_warranted(
+            std::slice::from_ref(&wsl_row),
+            &no_host
+        ));
 
         // Same row, but the host CLI lists it (a host delegate not yet titled) →
         // the host title refresh owns it, no WSL scan.
         let host_ids: HashSet<String> = ["wsl-sid".to_string()].into_iter().collect();
-        assert!(!wsl_title_seed_warranted(std::slice::from_ref(&wsl_row), &host_ids));
+        assert!(!wsl_title_seed_warranted(
+            std::slice::from_ref(&wsl_row),
+            &host_ids
+        ));
 
         // A Host-located row with the same live/synthetic/pane-bound shape must
         // NOT warrant a scan, even when the host list is empty (temporarily
         // unavailable) — only in-distro rows can be titled by a WSL scan.
         let mut host_row = live_synthetic_pane_row("host-sid");
         host_row.location = SessionLocation::Host;
-        assert!(!wsl_title_seed_warranted(std::slice::from_ref(&host_row), &no_host));
+        assert!(!wsl_title_seed_warranted(
+            std::slice::from_ref(&host_row),
+            &no_host
+        ));
 
         // A non-synthetic row never warrants a scan.
         let mut titled = live_synthetic_pane_row("titled-sid");
         titled.title = Some("Real Title".to_string());
-        assert!(!wsl_title_seed_warranted(std::slice::from_ref(&titled), &no_host));
+        assert!(!wsl_title_seed_warranted(
+            std::slice::from_ref(&titled),
+            &no_host
+        ));
 
         // Historical / ended synthetic rows are excluded so an untitled old row
         // can't drive perpetual scans.
         let mut ended = live_synthetic_pane_row("ended-sid");
         ended.status = Some(AgentStatus::Ended);
-        assert!(!wsl_title_seed_warranted(std::slice::from_ref(&ended), &no_host));
+        assert!(!wsl_title_seed_warranted(
+            std::slice::from_ref(&ended),
+            &no_host
+        ));
 
         // A synthetic live row with no pane binding (not born-bound) is excluded.
         let mut unbound = live_synthetic_pane_row("unbound-sid");
         unbound.pane_session_id = None;
-        assert!(!wsl_title_seed_warranted(std::slice::from_ref(&unbound), &no_host));
+        assert!(!wsl_title_seed_warranted(
+            std::slice::from_ref(&unbound),
+            &no_host
+        ));
     }
 
     #[tokio::test]
@@ -5847,12 +6159,21 @@ mod tests {
         );
         // Same known cli → refreshable.
         row.cli_source = Some(CliSource::Copilot);
-        assert!(row_refreshable_by_connected_agent(&row, Some(&CliSource::Copilot)));
+        assert!(row_refreshable_by_connected_agent(
+            &row,
+            Some(&CliSource::Copilot)
+        ));
         // Different known cli → skipped (the connected agent can't enumerate it).
-        assert!(!row_refreshable_by_connected_agent(&row, Some(&CliSource::Claude)));
+        assert!(!row_refreshable_by_connected_agent(
+            &row,
+            Some(&CliSource::Claude)
+        ));
         // Unknown cli on either side → attempt (never skip).
         row.cli_source = None;
-        assert!(row_refreshable_by_connected_agent(&row, Some(&CliSource::Copilot)));
+        assert!(row_refreshable_by_connected_agent(
+            &row,
+            Some(&CliSource::Copilot)
+        ));
         row.cli_source = Some(CliSource::Copilot);
         assert!(row_refreshable_by_connected_agent(&row, None));
     }
@@ -5885,7 +6206,9 @@ mod tests {
         assert!(!is_stale_host_history_row(&pane, &listed));
         // WSL row → host can't authoritatively list distro sessions.
         let mut wsl = mk("gone");
-        wsl.location = SessionLocation::Wsl { distro: "Ubuntu".to_string() };
+        wsl.location = SessionLocation::Wsl {
+            distro: "Ubuntu".to_string(),
+        };
         assert!(!is_stale_host_history_row(&wsl, &listed));
     }
 
@@ -6026,7 +6349,9 @@ mod tests {
 
         let row = state
             .registry
-            .lookup(&acp::schema::v1::SessionId::new("sid-agent-pane".to_string()))
+            .lookup(&acp::schema::v1::SessionId::new(
+                "sid-agent-pane".to_string(),
+            ))
             .await
             .unwrap();
         // Still Idle — the watcher's ToolStarting (Working) was dropped.
@@ -6121,7 +6446,9 @@ mod tests {
         let sid = acp::schema::v1::SessionId::new("bb-wsl-loc".to_string());
         assert_eq!(
             state.registry.lookup(&sid).await.unwrap().location,
-            crate::agent_sessions::SessionLocation::Wsl { distro: "Ubuntu".to_string() },
+            crate::agent_sessions::SessionLocation::Wsl {
+                distro: "Ubuntu".to_string()
+            },
             "WSL born-bound row must be stamped Wsl {{ distro }}"
         );
         // Still binding-only, like any born-bound row.
@@ -6158,8 +6485,10 @@ mod tests {
         let state = make_state();
         let sid = acp::schema::v1::SessionId::new("bb-activity".to_string());
 
-        let mut info =
-            crate::session_registry::SessionInfo::new(sid.clone(), std::path::PathBuf::from("C:\\repo"));
+        let mut info = crate::session_registry::SessionInfo::new(
+            sid.clone(),
+            std::path::PathBuf::from("C:\\repo"),
+        );
         info.cli_source = Some(crate::agent_sessions::CliSource::Claude);
         info.origin = Some(crate::agent_sessions::SessionOrigin::Unknown);
         info.status = Some(crate::agent_sessions::AgentStatus::Idle);
@@ -6260,5 +6589,4 @@ mod tests {
         );
         assert!(!state.hook_owned.lock().await.contains(&sid));
     }
-
 }

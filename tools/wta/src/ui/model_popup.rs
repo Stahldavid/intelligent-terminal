@@ -47,10 +47,15 @@ pub fn render_popup(frame: &mut Frame, state: ModelPopupState<'_>, input_area: R
         .iter()
         .map(|m| {
             let is_current = state.current_id == Some(m.id.as_str());
-            let marker = if is_current { CURRENT_MARKER } else { CURRENT_PAD };
-            let mut spans = vec![
-                Span::styled(format!(" {}{}", marker, m.name), theme::INPUT_TEXT),
-            ];
+            let marker = if is_current {
+                CURRENT_MARKER
+            } else {
+                CURRENT_PAD
+            };
+            let mut spans = vec![Span::styled(
+                format!(" {}{}", marker, m.name),
+                theme::INPUT_TEXT,
+            )];
             // Show the raw id when it differs from the display name, plus the
             // optional one-line description, both dimmed.
             if m.id != m.name {

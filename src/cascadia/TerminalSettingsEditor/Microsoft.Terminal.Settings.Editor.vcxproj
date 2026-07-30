@@ -181,6 +181,16 @@
       <DependentUpon>SettingContainer.idl</DependentUpon>
     </ClInclude>
     <ClInclude Include="Utils.h" />
+    <ClInclude Include="ResourceDictionaries.h">
+      <DependentUpon>ResourceDictionaries.idl</DependentUpon>
+      <SubType>Code</SubType>
+    </ClInclude>
+    <ClInclude Include="CommonResourcesDictionary.h">
+      <DependentUpon>ResourceDictionaries.idl</DependentUpon>
+    </ClInclude>
+    <ClInclude Include="SettingContainerStyleDictionary.h">
+      <DependentUpon>ResourceDictionaries.idl</DependentUpon>
+    </ClInclude>
     <ClInclude Include="PreviewConnection.h" />
     <ClInclude Include="$(GeneratedFilesDir)GeneratedSettingsIndex.g.h" />
     <ClInclude Include="../fzf/fzf.h" />
@@ -260,7 +270,7 @@
       <SubType>Designer</SubType>
     </Page>
     <Page Include="SettingContainerStyle.xaml">
-      <Type>DefaultStyle</Type>
+      <SubType>Designer</SubType>
     </Page>
   </ItemGroup>
   <!-- ========================= Cpp Files ======================== -->
@@ -403,6 +413,10 @@
       <DependentUpon>SettingContainer.idl</DependentUpon>
     </ClCompile>
     <ClCompile Include="Utils.cpp" />
+    <ClCompile Include="ResourceDictionaries.cpp">
+      <DependentUpon>ResourceDictionaries.idl</DependentUpon>
+      <SubType>Code</SubType>
+    </ClCompile>
     <ClCompile Include="PreviewConnection.cpp">
       <DependentUpon>PreviewConnection.h</DependentUpon>
     </ClCompile>
@@ -516,6 +530,7 @@
     <Midl Include="SettingContainer.idl">
       <SubType>Code</SubType>
     </Midl>
+    <Midl Include="ResourceDictionaries.idl" />
   </ItemGroup>
   <!-- ========================= Misc Files ======================== -->
   <ItemGroup>

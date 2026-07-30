@@ -776,11 +776,11 @@ In this context, "agent" refers to an AI agent (e.g. Copilot, Claude, Gemini), n
     <comment>{Locked="{0}"}{0} is the window ID number. Shown in the workspace flyout for windows that have no name assigned.</comment>
   </data>
   <data name="DeleteWorkspaceMenuItem" xml:space="preserve">
-    <value>Delete workspace?</value>
+    <value>Delete saved layout?</value>
     <comment>Menu item text shown in the right-click context menu on a saved workspace</comment>
   </data>
   <data name="OpenWorkspaceMenuItem" xml:space="preserve">
-    <value>Open workspace</value>
+    <value>Open saved layout</value>
     <comment>Menu item text for opening a saved workspace</comment>
   </data>
   <data name="ConfirmDeleteWorkspaceTitle" xml:space="preserve">
@@ -788,7 +788,7 @@ In this context, "agent" refers to an AI agent (e.g. Copilot, Claude, Gemini), n
     <comment>{Locked="{0}"}{0} is the workspace name. Shown as the title of a confirmation dialog when the user tries to delete a saved workspace.</comment>
   </data>
   <data name="ConfirmDeleteWorkspaceBody" xml:space="preserve">
-    <value>Are you sure you want to delete "{0}"? Sessions associated with this workspace will also be deleted.</value>
+    <value>Are you sure you want to delete the saved layout "{0}"? Its associated sessions will also be deleted.</value>
     <comment>{Locked="{0}"}{0} is the workspace name. Body text of the confirmation dialog shown when the user tries to delete a saved workspace.</comment>
   </data>
   <data name="ConfirmDeleteWorkspaceDelete" xml:space="preserve">
@@ -859,7 +859,7 @@ In this context, "agent" refers to an AI agent (e.g. Copilot, Claude, Gemini), n
     <value>This Terminal window is running as administrator</value>
   </data>
   <data name="WorkspaceDropdown.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
-    <value>Workspaces</value>
+    <value>Windows and saved layouts</value>
   </data>
   <data name="CommandPalette_MatchesAvailable" xml:space="preserve">
     <value>Suggestions found: {0}</value>
@@ -1321,4 +1321,69 @@ In this context, "agent" refers to an AI agent (e.g. Copilot, Claude, Gemini), n
     <value>Terminal Protocol</value>
     <comment>Title for the teaching tip that displays Terminal Protocol connection information. {Locked="Terminal Protocol"}</comment>
   </data>
+  <data name="WorkspaceColorChoose" xml:space="preserve"><value>Change workspace color</value></data>
+  <data name="RenameWorkspaceText" xml:space="preserve"><value>Rename workspace</value></data>
+  <data name="DuplicateWorkspaceText" xml:space="preserve"><value>Duplicate workspace</value></data>
+  <data name="SplitActivePaneText" xml:space="preserve"><value>Split active pane</value></data>
+  <data name="MoveWorkspaceToNewWindowText" xml:space="preserve"><value>Move workspace to new window</value></data>
+  <data name="WorkspaceMoveUp" xml:space="preserve"><value>Move up</value></data>
+  <data name="WorkspaceMoveDown" xml:space="preserve"><value>Move down</value></data>
+  <data name="WorkspaceMoveSubMenu" xml:space="preserve"><value>Move workspace</value></data>
+  <data name="WorkspaceCloseBelow" xml:space="preserve"><value>Close workspaces below</value></data>
+  <data name="WorkspaceCloseOther" xml:space="preserve"><value>Close other workspaces</value></data>
+  <data name="WorkspaceClose" xml:space="preserve"><value>Close workspace</value></data>
+  <data name="ActiveSessionSubMenu" xml:space="preserve"><value>Active session</value></data>
+  <data name="WorkspaceSidebarTitle.Text" xml:space="preserve"><value>Workspaces</value></data>
+  <data name="WorkspaceSidebarSearchButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Find a workspace</value></data>
+  <data name="WorkspaceSidebarSearchButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Find a workspace</value></data>
+  <data name="WorkspaceSidebarNewButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>New workspace</value></data>
+  <data name="WorkspaceSidebarNewButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>New workspace</value></data>
+  <data name="WorkspaceSidebarAttentionButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Attention center</value></data>
+  <data name="WorkspaceSidebarAttentionButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Open attention center</value></data>
+  <data name="WorkspaceSidebarFleetButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Agents and teams</value></data>
+  <data name="WorkspaceSidebarFleetButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Open agents and teams</value></data>
+  <data name="WorkspaceFleetTitle" xml:space="preserve"><value>Agents and teams</value></data>
+  <data name="WorkspaceFleetDescription" xml:space="preserve"><value>Select an agent to focus its terminal. Team coordination lives here; chat always follows the terminal you focus.</value></data>
+  <data name="WorkspaceFleetEmpty" xml:space="preserve"><value>No declarative agent terminals are active. Create or compose a workspace to start a native agent layout.</value></data>
+  <data name="WorkspaceSidebarCollapseButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Collapse workspace sidebar (Ctrl+Shift+B)</value></data>
+  <data name="WorkspaceSidebarSearch.PlaceholderText" xml:space="preserve"><value>Find a workspace</value></data>
+  <data name="WorkspaceSidebarSearch.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Find a workspace</value></data>
+  <data name="WorkspaceSidebarRecentButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Show recently closed workspaces</value></data>
+  <data name="WorkspaceSidebarRecentLabel.Text" xml:space="preserve"><value>Recently closed</value></data>
+  <data name="WorkspaceSidebarGitButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Git status and diff</value></data>
+  <data name="WorkspaceSidebarGitButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Open workspace Git view</value></data>
+  <data name="WorkspaceSidebarDoctorButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Workspace diagnostics</value></data>
+  <data name="WorkspaceSidebarDoctorButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Run workspace diagnostics</value></data>
+  <data name="WorkspaceSidebarRefreshButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Refresh workspace metadata</value></data>
+  <data name="WorkspaceSidebarRevealButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Show workspace sidebar (Ctrl+Shift+B)</value></data>
+  <data name="SurfaceNewTabToolTip" xml:space="preserve"><value>New terminal tab in this pane (Ctrl+Alt+T)</value></data>
+  <data name="SurfaceNewTabWithProfileHelpText" xml:space="preserve"><value>Press the main button to duplicate the current terminal. Open the menu to choose another profile (Ctrl+Alt+Shift+T).</value></data>
+  <data name="SurfaceNewWithProfileHeader" xml:space="preserve"><value>NEW SURFACE · CHOOSE PROFILE</value></data>
+  <data name="SurfaceNoProfilesAvailable" xml:space="preserve"><value>No terminal profiles are available</value></data>
+  <data name="SurfaceMoveLeft" xml:space="preserve"><value>Move tab left</value></data>
+  <data name="SurfaceMoveRight" xml:space="preserve"><value>Move tab right</value></data>
+  <data name="SurfaceCloseOther" xml:space="preserve"><value>Close other tabs in pane</value></data>
+  <data name="SurfaceClose" xml:space="preserve"><value>Close terminal tab</value></data>
+  <data name="AgentFollowingContextPrefix" xml:space="preserve"><value>Following</value></data>
+  <data name="AgentActiveContextAutomationName" xml:space="preserve"><value>Active agent context: {0}</value></data>
+  <data name="NativeChatRetryButton.Content" xml:space="preserve"><value>Try again</value></data>
+  <data name="NativeChatRetryButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Retry agent connection</value></data>
+  <data name="NativePermissionTitle.Text" xml:space="preserve"><value>Permission required</value></data>
+  <data name="NativeChatComposer.PlaceholderText" xml:space="preserve"><value>Send a message to the agent</value></data>
+  <data name="NativeChatComposer.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Agent message</value></data>
+  <data name="NativeChatCancelButton.Content" xml:space="preserve"><value>Cancel</value></data>
+  <data name="NativeChatCancelButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Cancel current agent turn</value></data>
+  <data name="NativeChatSendButton.Content" xml:space="preserve"><value>Send</value></data>
+  <data name="NativeChatSendButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Send agent message</value></data>
+  <data name="NativeChatPlanLabel" xml:space="preserve"><value>Plan</value></data>
+  <data name="NativeChatYouLabel" xml:space="preserve"><value>You</value></data>
+  <data name="NativeChatAgentLabel" xml:space="preserve"><value>Agent</value></data>
+  <data name="NativeChatCompletedTurnLabel" xml:space="preserve"><value>Completed turn</value></data>
+  <data name="NativeChatErrorLabel" xml:space="preserve"><value>Error</value></data>
+  <data name="NativeChatStatusConnectionLabel" xml:space="preserve"><value>Connection</value></data>
+  <data name="NativeChatStatusAgentLabel" xml:space="preserve"><value>Agent</value></data>
+  <data name="NativeChatStatusModelLabel" xml:space="preserve"><value>Model</value></data>
+  <data name="NativeChatStatusSessionLabel" xml:space="preserve"><value>Session</value></data>
+  <data name="NativeChatStatusCwdLabel" xml:space="preserve"><value>CWD</value></data>
+  <data name="NativeChatStatusPermissionsLabel" xml:space="preserve"><value>Permissions</value></data>
 </root>

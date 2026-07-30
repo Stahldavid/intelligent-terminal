@@ -1,5 +1,12 @@
 # ACP 1.0 conductor migration — abstracting the master/helper plane onto the standard proxy/conductor model
 
+> **Historical migration proposal.** The current checkout uses
+> `agent-client-protocol` 1.2.0 and retains its helper/master boundary with a
+> lazy trusted-adapter pool. Version numbers and the proposed migration steps
+> below describe the earlier 0.10 → 1.0 decision. See
+> [`../fork-architecture-and-status.md`](../fork-architecture-and-status.md)
+> for the current model.
+
 ## Abstract
 
 WTA's agent plane is a hand-rolled ACP multiplexer: `wta-master` owns one

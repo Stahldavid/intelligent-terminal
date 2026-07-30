@@ -55,6 +55,8 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             .join(", ");
         let title = t!("input.image_attachments", items = items).into_owned();
         block = block.title(Span::styled(title, theme::INPUT_TEXT));
+    } else if let Some(summary) = app.active_session_summary() {
+        block = block.title(Span::styled(summary, theme::DIM));
     }
     let text_width = area
         .width
@@ -129,8 +131,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
                     push_caret_spans(&mut spans, line, viewport.cursor_col, ghost_suffix);
                     Line::from(spans)
                 } else {
-                    let mut spans =
-                        vec![prefix, Span::styled(line.clone(), theme::INPUT_TEXT)];
+                    let mut spans = vec![prefix, Span::styled(line.clone(), theme::INPUT_TEXT)];
                     if i == viewport.cursor_row {
                         if let Some(suffix) = ghost_suffix {
                             spans.push(Span::styled(suffix.to_string(), theme::DIM));

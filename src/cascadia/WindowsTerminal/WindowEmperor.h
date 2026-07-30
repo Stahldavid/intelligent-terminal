@@ -101,6 +101,7 @@ private:
 
     // Protocol server for AI CLI integration
     std::wstring _comClsid; // Stringified CLSID for WT_COM_CLSID env var
+    std::wstring _protocolCapabilityToken;
     void _initializeProtocolServer();
     std::vector<winrt::Microsoft::Terminal::Settings::Model::GlobalSummonArgs> _hotkeys;
     NOTIFYICONDATA _notificationIcon{};

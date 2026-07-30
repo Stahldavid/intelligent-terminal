@@ -40,6 +40,8 @@ namespace Microsoft::Terminal::Protocol::Parsing
         AgentChipTarget,      // Direct to TerminalPage, no broadcast — "draw the Agent chip on this pane (or hide override)"
         RestartAgentStack,    // Direct to TerminalPage, no broadcast — `/restart` from any agent pane TUI
         RestartAgentPane,     // Direct to TerminalPage, no broadcast — master detected helper death; re-warm a fresh helper for this tab
+        NativeChatSnapshot,   // Direct to TerminalPage — structured chat body for native XAML
+        RemoteRelayEvent,     // Direct to TerminalPage — scoped remote notification/status/focus
         Broadcast,            // Normalize envelope + broadcast to all subscribers
         Invalid               // Failed validation
     };
@@ -104,6 +106,25 @@ namespace Microsoft::Terminal::Protocol::Parsing
             if (method == "restart_agent_pane")
             {
                 return SendEventRoute::RestartAgentPane;
+            }
+            if (method == "native_chat_snapshot")
+            {
+                return SendEventRoute::NativeChatSnapshot;
+            }
+            if (method == "remote_relay_event")
+            {
+                const auto& params = outEvt["params"];
+                if (!params.isObject() ||
+                    !params.isMember("workspace_id") ||
+                    !params["workspace_id"].isString() ||
+                    !params.isMember("kind") ||
+                    !params["kind"].isString() ||
+                    !params.isMember("payload") ||
+                    !params["payload"].isObject())
+                {
+                    return SendEventRoute::Invalid;
+                }
+                return SendEventRoute::RemoteRelayEvent;
             }
         }
 

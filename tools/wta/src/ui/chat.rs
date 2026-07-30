@@ -8,7 +8,9 @@ use crate::theme;
 use crate::ui::shimmer;
 use crate::ui_trace;
 
-fn activity_label() -> String { t!("chat.activity_thinking").into_owned() }
+fn activity_label() -> String {
+    t!("chat.activity_thinking").into_owned()
+}
 
 const MAX_RENDER_LINE_CHARS: usize = 4096;
 
@@ -38,8 +40,16 @@ pub fn estimated_block_height(app: &App, area_width: u16) -> u16 {
         0
     };
 
-    let messages: usize = tab.messages.iter().map(|m| message_height(m, wrap_width)).sum();
-    let turns: usize = tab.completed_turns.iter().map(|t| turn_height(t, wrap_width)).sum();
+    let messages: usize = tab
+        .messages
+        .iter()
+        .map(|m| message_height(m, wrap_width))
+        .sum();
+    let turns: usize = tab
+        .completed_turns
+        .iter()
+        .map(|t| turn_height(t, wrap_width))
+        .sum();
     let pending = pending_text
         .as_deref()
         .map(|text| {
@@ -52,15 +62,15 @@ pub fn estimated_block_height(app: &App, area_width: u16) -> u16 {
     // it off the top of the visible chat block. Always a single row —
     // terminal min-width guarantees the localized title fits without
     // wrapping.
-    let welcome = if app.show_welcome_hint
-        && app.state == crate::app::ConnectionState::Connected
-    {
+    let welcome = if app.show_welcome_hint && app.state == crate::app::ConnectionState::Connected {
         1
     } else {
         0
     };
 
-    (activity + messages + turns + pending + welcome).max(1).min(u16::MAX as usize) as u16
+    (activity + messages + turns + pending + welcome)
+        .max(1)
+        .min(u16::MAX as usize) as u16
 }
 
 fn wrap_count(text: &str, width: usize) -> usize {
@@ -68,7 +78,11 @@ fn wrap_count(text: &str, width: usize) -> usize {
     text.split('\n')
         .map(|line| {
             let chars = line.chars().count();
-            if chars == 0 { 1 } else { chars.div_ceil(w) }
+            if chars == 0 {
+                1
+            } else {
+                chars.div_ceil(w)
+            }
         })
         .sum::<usize>()
         .max(1)
@@ -121,8 +135,16 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let activity_line = build_activity_line(app);
     let (chat_area, activity_area) = match (&activity_line, area.height) {
         (Some(_), h) if h > 0 => (
-            Rect { height: h - 1, ..area },
-            Some(Rect { x: area.x, y: area.y + h - 1, width: area.width, height: 1 }),
+            Rect {
+                height: h - 1,
+                ..area
+            },
+            Some(Rect {
+                x: area.x,
+                y: area.y + h - 1,
+                width: area.width,
+                height: 1,
+            }),
         ),
         _ => (area, None),
     };
@@ -144,7 +166,12 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 
     for (idx, msg) in app.current_tab().messages.iter().enumerate().rev() {
         let is_last_message = idx + 1 == app.current_tab().messages.len();
-        let mut message_lines = build_message_lines(msg, is_last_message, app.current_tab().turn.is_streaming(), wrap_width);
+        let mut message_lines = build_message_lines(
+            msg,
+            is_last_message,
+            app.current_tab().turn.is_streaming(),
+            wrap_width,
+        );
         reversed_lines.extend(message_lines.drain(..).rev());
         if reversed_lines.len() >= requested_lines {
             truncated = true;
@@ -157,7 +184,8 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         let pane_focused = app.pane_focused;
         for (idx, turn) in app.current_tab().completed_turns.iter().enumerate().rev() {
             let is_selected = selected_idx == Some(idx);
-            let mut turn_lines = build_completed_turn_lines(turn, is_selected, pane_focused, wrap_width);
+            let mut turn_lines =
+                build_completed_turn_lines(turn, is_selected, pane_focused, wrap_width);
             reversed_lines.extend(turn_lines.drain(..).rev());
             if reversed_lines.len() >= requested_lines {
                 truncated = true;
@@ -167,25 +195,25 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // First-run welcome: shown once until user sends first message
-    if app.show_welcome_hint
-        && app.state == crate::app::ConnectionState::Connected
-    {
-        let mut welcome_lines = vec![
-            Line::from(vec![
-                Span::styled("● ", Style::new().fg(Color::Reset).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    t!("chat.welcome_title").into_owned(),
-                    Style::new().fg(Color::Reset).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-        ];
+    if app.show_welcome_hint && app.state == crate::app::ConnectionState::Connected {
+        let mut welcome_lines = vec![Line::from(vec![
+            Span::styled(
+                "● ",
+                Style::new().fg(Color::Reset).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                t!("chat.welcome_title").into_owned(),
+                Style::new().fg(Color::Reset).add_modifier(Modifier::BOLD),
+            ),
+        ])];
         reversed_lines.extend(welcome_lines.drain(..).rev());
     }
 
     let lines: Vec<Line> = reversed_lines.into_iter().rev().collect();
 
     let total_lines = lines.len();
-    let scroll = total_lines.saturating_sub(visible_height.saturating_add(app.current_tab().chat_scroll.offset));
+    let scroll = total_lines
+        .saturating_sub(visible_height.saturating_add(app.current_tab().chat_scroll.offset));
 
     let paragraph = Paragraph::new(lines)
         .block(inner)
@@ -213,7 +241,11 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         format!(
             "messages={} pending_chars={} requested_lines={} visible_height={} area={}x{}",
             app.current_tab().messages.len(),
-            app.current_tab().turn.buffer().map(|b| b.chars().count()).unwrap_or(0),
+            app.current_tab()
+                .turn
+                .buffer()
+                .map(|b| b.chars().count())
+                .unwrap_or(0),
             requested_lines,
             visible_height,
             area.width,
@@ -304,7 +336,10 @@ fn build_activity_line(app: &App) -> Option<Line<'static>> {
     // turn spinner because no turn can be in flight before we're connected.
     if matches!(app.state, crate::app::ConnectionState::Connecting(_)) {
         let label = t!("connection.connecting_activity").into_owned();
-        return Some(Line::from(shimmer::shimmer_spans(&label, app.activity_frame as usize)));
+        return Some(Line::from(shimmer::shimmer_spans(
+            &label,
+            app.activity_frame as usize,
+        )));
     }
     let tab = app.current_tab();
     if tab.turn.spinner_label().is_none() {
@@ -390,17 +425,14 @@ pub(crate) fn extract_json_string_field(text: &str, field: &str) -> Option<Strin
                         // frame re-runs over the now-complete buffer.
                         0xD800..=0xDBFF => {
                             let mut lookahead = chars.clone();
-                            if lookahead.next() == Some('\\')
-                                && lookahead.next() == Some('u')
-                            {
+                            if lookahead.next() == Some('\\') && lookahead.next() == Some('u') {
                                 let lo_hex: String = lookahead.by_ref().take(4).collect();
                                 if lo_hex.len() == 4 {
                                     if let Some(lo @ 0xDC00..=0xDFFF) =
                                         u32::from_str_radix(&lo_hex, 16).ok()
                                     {
-                                        let scalar = 0x1_0000
-                                            + ((code - 0xD800) << 10)
-                                            + (lo - 0xDC00);
+                                        let scalar =
+                                            0x1_0000 + ((code - 0xD800) << 10) + (lo - 0xDC00);
                                         if let Some(ch) = char::from_u32(scalar) {
                                             out.push(ch);
                                         }
@@ -544,7 +576,10 @@ fn build_message_lines<'a>(
             )));
         }
         ChatMessage::Plan(entries) => {
-            lines.push(Line::from(Span::styled(t!("chat.plan_header").into_owned(), theme::PLAN_STYLE)));
+            lines.push(Line::from(Span::styled(
+                t!("chat.plan_header").into_owned(),
+                theme::PLAN_STYLE,
+            )));
             for entry in entries {
                 let marker = match entry.status {
                     PlanEntryStatus::Completed => t!("chat.plan_marker_completed").into_owned(),
@@ -676,8 +711,7 @@ mod tests {
     #[test]
     fn json_field_basic_value() {
         assert_eq!(
-            extract_json_string_field(r#"{"explanation":"hello"}"#, "explanation")
-                .as_deref(),
+            extract_json_string_field(r#"{"explanation":"hello"}"#, "explanation").as_deref(),
             Some("hello")
         );
     }
@@ -705,8 +739,7 @@ mod tests {
     #[test]
     fn json_field_tolerates_whitespace_around_colon() {
         assert_eq!(
-            extract_json_string_field("{ \"explanation\" : \"v\" }", "explanation")
-                .as_deref(),
+            extract_json_string_field("{ \"explanation\" : \"v\" }", "explanation").as_deref(),
             Some("v")
         );
     }
@@ -715,8 +748,7 @@ mod tests {
     fn json_field_returns_partial_when_unterminated() {
         // Streaming: the closing quote hasn't arrived yet — show what we have.
         assert_eq!(
-            extract_json_string_field(r#"{"explanation":"hello world"#, "explanation")
-                .as_deref(),
+            extract_json_string_field(r#"{"explanation":"hello world"#, "explanation").as_deref(),
             Some("hello world")
         );
     }
@@ -884,8 +916,9 @@ mod tests {
         // must round-trip below the threshold.
         let under: String = std::iter::repeat('é').take(MAX_RENDER_LINE_CHARS).collect();
         assert!(matches!(truncate_render_text(&under), Cow::Borrowed(_)));
-        let over: String =
-            std::iter::repeat('é').take(MAX_RENDER_LINE_CHARS + 10).collect();
+        let over: String = std::iter::repeat('é')
+            .take(MAX_RENDER_LINE_CHARS + 10)
+            .collect();
         let _ = truncate_render_text(&over).into_owned(); // must not panic
     }
 
@@ -896,7 +929,13 @@ mod tests {
         // Models often prefix prose with \n / \n\n; the dot must land on the
         // first content row, not burn on an empty line.
         let mut lines = Vec::new();
-        push_dot_prefixed_lines(&mut lines, "\n\nHello", 40, theme::DOT_AGENT, theme::AGENT_TEXT);
+        push_dot_prefixed_lines(
+            &mut lines,
+            "\n\nHello",
+            40,
+            theme::DOT_AGENT,
+            theme::AGENT_TEXT,
+        );
         assert_eq!(lines.len(), 1, "leading blanks must be dropped");
         assert_eq!(line_text(&lines[0]), "● Hello");
     }
@@ -904,9 +943,18 @@ mod tests {
     #[test]
     fn dot_prefix_preserves_paragraph_break_and_indents_continuation() {
         let mut lines = Vec::new();
-        push_dot_prefixed_lines(&mut lines, "A\n\nB", 40, theme::DOT_AGENT, theme::AGENT_TEXT);
+        push_dot_prefixed_lines(
+            &mut lines,
+            "A\n\nB",
+            40,
+            theme::DOT_AGENT,
+            theme::AGENT_TEXT,
+        );
         let texts: Vec<String> = lines.iter().map(line_text).collect();
-        assert_eq!(texts, vec!["● A".to_string(), String::new(), "  B".to_string()]);
+        assert_eq!(
+            texts,
+            vec!["● A".to_string(), String::new(), "  B".to_string()]
+        );
     }
 
     #[test]
@@ -921,7 +969,10 @@ mod tests {
             theme::AGENT_TEXT,
         );
         assert!(lines.len() >= 2, "long paragraph must wrap");
-        assert!(line_text(&lines[0]).starts_with("● "), "first row gets the dot");
+        assert!(
+            line_text(&lines[0]).starts_with("● "),
+            "first row gets the dot"
+        );
         assert!(
             line_text(&lines[1]).starts_with("  "),
             "continuation rows get a 2-cell hanging indent"

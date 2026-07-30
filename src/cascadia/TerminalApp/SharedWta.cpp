@@ -85,14 +85,11 @@ namespace winrt::TerminalApp::implementation
 
         std::lock_guard lock{ _mtx };
 
-        // Degraded latch: the master died unexpectedly and hasn't been
-        // recovered via /restart yet. Open the pane WITHOUT respawning master,
-        // so it comes up in the disconnected state (the caller passes
-        // `--assume-master-down` to the helper). The user then recovers the
-        // whole stack with /restart from that disconnected pane — no silent
-        // respawn, and no hunting for another pane. `_masterPipeName` is still
-        // the stable name from the spawn that just died, so the helper inherits
-        // it (and ignores it under the flag).
+        // When the bounded supervisor exhausts its crash-loop budget, open the
+        // pane without respawning master. It comes up disconnected (the caller
+        // passes `--assume-master-down`) and offers the explicit `/restart`
+        // recovery path. During ordinary one-off crashes `_OnProcessExited`
+        // has already restored the master on the stable rendezvous pipe.
         if (!_process.is_valid() && !_degraded)
         {
             if (!_SpawnLocked(wtaPath, extraArgs))
@@ -121,6 +118,8 @@ namespace winrt::TerminalApp::implementation
             // future cold open spawns a fresh master normally — there are
             // no orphaned helpers left to keep consistent with.
             _degraded = false;
+            _crashWindowStart.reset();
+            _crashRestartsInWindow = 0;
         }
     }
 
@@ -135,6 +134,8 @@ namespace winrt::TerminalApp::implementation
         // already invalid, so without this the reopen's AcquirePane would
         // stay refused and `/restart` would be a no-op.
         _degraded = false;
+        _crashWindowStart.reset();
+        _crashRestartsInWindow = 0;
 
         // Nothing running → nothing to restart. Caller's surrounding
         // teardown+reopen path will trigger the usual lazy `AcquirePane`
@@ -204,6 +205,8 @@ namespace winrt::TerminalApp::implementation
         // Settings-change respawn is also an explicit recovery point —
         // clear the degraded latch so the rebuilt stack spawns normally.
         _degraded = false;
+        _crashWindowStart.reset();
+        _crashRestartsInWindow = 0;
 
         // Nothing live to replace (e.g. settings changed while no pane
         // was open in any window). The next AcquirePane will _SpawnLocked
@@ -508,17 +511,42 @@ namespace winrt::TerminalApp::implementation
             _waitHandle = nullptr;
         }
         _pid = 0;
-        // Latch "degraded": the master vanished out from under live panes
-        // (refs are still held by the zombie panes — this is the
-        // unexpected-death case, not a clean teardown, which resets
-        // `_process` first and bails at the validity check above).
-        // `AcquirePane` will now refuse to silently respawn so every
-        // orphaned pane stays consistently in the "connection lost —
-        // run /restart" state until the user recovers via `/restart`
-        // (or the last pane releases).
-        if (_refCount > 0)
+        if (_refCount == 0)
+        {
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        constexpr auto crashWindow = std::chrono::seconds{ 30 };
+        constexpr size_t maxAutomaticRestarts = 3;
+        if (!_crashWindowStart || now - *_crashWindowStart > crashWindow)
+        {
+            _crashWindowStart = now;
+            _crashRestartsInWindow = 0;
+        }
+
+        if (_crashRestartsInWindow >= maxAutomaticRestarts || _cachedWtaPath.empty())
         {
             _degraded = true;
+            _agentPaneLog("wta-master automatic recovery stopped (crash-loop budget exhausted); use /restart");
+            return;
+        }
+
+        ++_crashRestartsInWindow;
+        // Copy before spawning: _SpawnLocked refreshes the cache on success,
+        // so passing a span into the vector it mutates would be unsafe.
+        const auto wtaPath = _cachedWtaPath;
+        const auto extraArgs = _cachedExtraArgs;
+        _agentPaneLog("wta-master automatic recovery attempt=" + std::to_string(_crashRestartsInWindow));
+        if (_SpawnLocked(wtaPath, extraArgs))
+        {
+            _degraded = false;
+            _agentPaneLog("wta-master automatic recovery succeeded pid=" + std::to_string(_pid));
+        }
+        else
+        {
+            _degraded = true;
+            _agentPaneLog("wta-master automatic recovery spawn failed; use /restart");
         }
     }
 }

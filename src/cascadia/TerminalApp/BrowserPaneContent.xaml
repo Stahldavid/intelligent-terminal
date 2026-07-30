@@ -1,0 +1,65 @@
+<!-- Copyright (c) Microsoft Corporation. Licensed under the MIT license. -->
+<UserControl x:Class="TerminalApp.BrowserPaneContent"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Grid x:Name="Root" Background="#0C0C0C">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="36" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <Grid Grid.Row="0" Padding="4" Background="#191919">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <Button x:Name="BackButton"
+                    Grid.Column="0"
+                    Width="30"
+                    Margin="0,0,3,0"
+                    Content="&#xE72B;"
+                    FontFamily="Segoe Fluent Icons"
+                    AutomationProperties.Name="Back" />
+            <Button x:Name="ForwardButton"
+                    Grid.Column="1"
+                    Width="30"
+                    Margin="0,0,4,0"
+                    Content="&#xE72A;"
+                    FontFamily="Segoe Fluent Icons"
+                    AutomationProperties.Name="Forward" />
+            <TextBox x:Name="AddressBar"
+                     Grid.Column="2"
+                     Margin="0"
+                     Padding="8,3"
+                     VerticalContentAlignment="Center"
+                     PlaceholderText="https://"
+                     AutomationProperties.Name="Address" />
+            <Button x:Name="ReloadButton"
+                    Grid.Column="3"
+                    Width="32"
+                    Margin="4,0,0,0"
+                    Content="&#xE72C;"
+                    FontFamily="Segoe Fluent Icons"
+                    AutomationProperties.Name="Reload" />
+        </Grid>
+        <Grid x:Name="BrowserHost"
+              Grid.Row="1"
+              Background="#0C0C0C">
+            <StackPanel x:Name="StatusPanel"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Spacing="8">
+                <ProgressRing x:Name="LoadingIndicator"
+                              Width="28"
+                              Height="28"
+                              IsActive="True" />
+                <TextBlock x:Name="StatusText"
+                           MaxWidth="520"
+                           Text="Preparing isolated browser surface…"
+                           TextAlignment="Center"
+                           TextWrapping="Wrap" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</UserControl>

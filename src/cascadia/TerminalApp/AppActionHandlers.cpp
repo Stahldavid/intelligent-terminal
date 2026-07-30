@@ -110,7 +110,7 @@ namespace winrt::TerminalApp::implementation
     {
         if (_previouslyClosedPanesAndTabs.size() > 0)
         {
-            const auto restoreActions = _previouslyClosedPanesAndTabs.back();
+            const auto restoreActions = _previouslyClosedPanesAndTabs.back().actions;
             for (const auto& action : restoreActions)
             {
                 _actionDispatch->DoAction(action);

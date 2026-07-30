@@ -40,7 +40,7 @@ auth.login_failed_help_default: "  Press Enter to retry, or Esc to go back."  # 
 # ── Chat view (src/ui/chat.rs) ──────────────────────────────────────────────
 chat.activity_thinking: "Thinking…"
 # {Locked="Intelligent Terminal"} - product name, do not translate
-chat.welcome_title: "Welcome to Intelligent Terminal!"
+chat.welcome_title: "AI can make mistakes."
 chat.welcome_disclaimer: "Intelligent Terminal uses AI. Check for mistakes."
 chat.plan_header: "Plan:"
 chat.plan_marker_completed: "[x]"  # {Locked}
@@ -51,7 +51,7 @@ chat.turn_canceled: "(cancelled)"
 chat.turn_executed: "→ executed: %{title}"
 
 # ── Input placeholders (src/ui/input.rs) ────────────────────────────────────
-input.placeholder.connected: "Ask anything, / for commands.."  # {Locked="/"}
+input.placeholder.connected: "Ask anything…  (/ commands)"  # {Locked="/"}
 input.placeholder.connecting: "connecting..."
 input.placeholder.disconnected: "disconnected"
 input.image_attachments: "📎 Images: %{items}"  # {Locked="📎","%{items}"}

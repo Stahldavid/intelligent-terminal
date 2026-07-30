@@ -20,9 +20,10 @@
 // `AcquirePane` on creation and `ReleasePane` when it closes. The
 // first acquire spawns the master; the last release terminates it
 // via the Job Object. master crashes are detected via
-// RegisterWaitForSingleObject; state clears so the next acquire
-// respawns cleanly, reusing the same pipe name so previously-spawned
-// helpers can reconnect.
+// RegisterWaitForSingleObject. While panes are live, a bounded supervisor
+// immediately respawns the master on the same rendezvous pipe so helpers can
+// reconnect without user intervention. Repeated crash loops fail closed into
+// the degraded state and remain recoverable through /restart.
 
 #include <atomic>
 #include <chrono>
@@ -119,17 +120,8 @@ namespace winrt::TerminalApp::implementation
         /// pane releases.
         bool IsRunning() const noexcept;
 
-        /// Whether the master died *unexpectedly* (crash/OOM/external
-        /// kill) while agent panes were still live, and has not yet
-        /// been recovered via `/restart`. While this latch is set,
-        /// `AcquirePane` refuses to silently respawn the master — so a
-        /// new tab / pane toggle does NOT bring up a lone fresh master
-        /// that the orphaned helpers can't see (split-brain). Instead
-        /// every agent pane stays uniformly in the "connection lost —
-        /// run /restart" state until the user explicitly recovers the
-        /// whole stack. Cleared by `Restart()` (the `/restart` path) or
-        /// once the last orphaned pane releases. See
-        /// `doc/specs/Multi-window-agent-pane.md`.
+        /// Whether automatic recovery exhausted its bounded restart budget.
+        /// Cleared by `Restart()` or once the final pane releases.
         bool IsDegraded() const noexcept;
 
         /// Native handle of the running master process, valid only
@@ -211,17 +203,16 @@ namespace winrt::TerminalApp::implementation
         // poisoned master). Keyed on the last restart, only restart-after-
         // restart (the true fan-out duplicate) is suppressed.
         std::optional<std::chrono::steady_clock::time_point> _lastRestartRequest;
-        // "Degraded" latch: set when the master dies UNEXPECTEDLY
-        // (crash/OOM/external kill, observed by the wait callback) while
-        // panes still hold refs. While set, `AcquirePane` refuses to
-        // lazily respawn the master, so the dead state stays consistent
-        // across every agent pane (all show "connection lost — /restart")
-        // instead of a new pane silently getting a lone fresh master the
-        // orphaned helpers can never reconnect to. Cleared by `Restart()`
-        // (the `/restart` recovery) and when the last pane releases (so a
-        // subsequent cold open spawns normally). Distinct from
-        // `!_process.is_valid()`, which is also true on a clean cold start
-        // or after the last release — those MUST still spawn.
+        // "Degraded" latch: set only after automatic crash recovery is no
+        // longer safe (the restart budget was exhausted or respawn failed).
+        // While set, `AcquirePane` refuses to create a split-brain master and
+        // panes expose the explicit `/restart` recovery path. Cleared by
+        // `Restart()` and when the last pane releases.
         bool _degraded{ false };
+        // Crash-loop protection for automatic master recovery. Three
+        // unexpected exits inside 30 seconds stop automatic respawns and
+        // surface the explicit /restart recovery path.
+        std::optional<std::chrono::steady_clock::time_point> _crashWindowStart;
+        size_t _crashRestartsInWindow{ 0 };
     };
 }

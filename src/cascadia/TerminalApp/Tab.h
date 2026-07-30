@@ -36,6 +36,17 @@ namespace winrt::TerminalApp::implementation
         void AttachPane(std::shared_ptr<Pane> pane);
 
         void AttachColorPicker(winrt::TerminalApp::ColorPickupFlyout& colorPicker);
+        // Context-menu actions such as rename and color need a visible anchor.
+        // The native horizontal TabViewItem remains the default; the workspace
+        // sidebar supplies its card while that header is collapsed.
+        void SetContextMenuTarget(const winrt::Windows::UI::Xaml::FrameworkElement& target);
+        // Each navigation surface must own a distinct MenuFlyout visual tree.
+        // This factory keeps the commands and their state rules canonical while
+        // allowing the native tab header and workspace card to use independent
+        // presenters and anchors.
+        winrt::Windows::UI::Xaml::Controls::MenuFlyout CreateContextMenuForTarget(
+            const winrt::Windows::UI::Xaml::FrameworkElement& target,
+            bool workspacePresentation = false);
 
         std::pair<std::shared_ptr<Pane>, std::shared_ptr<Pane>> SplitPane(winrt::Microsoft::Terminal::Settings::Model::SplitDirection splitType,
                                                                           const float splitSize,
@@ -164,6 +175,63 @@ namespace winrt::TerminalApp::implementation
             _agentWslDistroOverride = {};
         }
 
+        struct SurfaceAgentRuntime
+        {
+            winrt::hstring agentId;
+            winrt::hstring model;
+            winrt::hstring source;
+            winrt::hstring wslDistro;
+            winrt::hstring sshTarget;
+            winrt::hstring remoteSessionId;
+        };
+        void SetSurfaceAgentRuntime(const winrt::guid& sessionId,
+                                    const SurfaceAgentRuntime& runtime)
+        {
+            _surfaceAgentRuntimes[winrt::to_string(winrt::to_hstring(sessionId))] = runtime;
+        }
+        std::optional<SurfaceAgentRuntime> SurfaceAgentRuntimeFor(
+            const winrt::guid& sessionId) const
+        {
+            const auto key = winrt::to_string(winrt::to_hstring(sessionId));
+            if (const auto found = _surfaceAgentRuntimes.find(key);
+                found != _surfaceAgentRuntimes.end())
+            {
+                return found->second;
+            }
+            return std::nullopt;
+        }
+        void ClearSurfaceAgentRuntime(const winrt::guid& sessionId)
+        {
+            _surfaceAgentRuntimes.erase(winrt::to_string(winrt::to_hstring(sessionId)));
+        }
+        struct SurfaceRemoteRuntime
+        {
+            winrt::hstring targetId;
+            winrt::hstring remoteSessionId;
+        };
+        void SetSurfaceRemoteRuntime(const winrt::guid& sessionId,
+                                     const SurfaceRemoteRuntime& runtime)
+        {
+            _surfaceRemoteRuntimes[winrt::to_string(winrt::to_hstring(sessionId))] = runtime;
+        }
+        std::optional<SurfaceRemoteRuntime> SurfaceRemoteRuntimeFor(
+            const winrt::guid& sessionId) const
+        {
+            const auto key = winrt::to_string(winrt::to_hstring(sessionId));
+            if (const auto found = _surfaceRemoteRuntimes.find(key);
+                found != _surfaceRemoteRuntimes.end())
+            {
+                return found->second;
+            }
+            return std::nullopt;
+        }
+        void ClearSurfaceRemoteRuntime(const winrt::guid& sessionId)
+        {
+            _surfaceRemoteRuntimes.erase(winrt::to_string(winrt::to_hstring(sessionId)));
+        }
+        const std::wstring& ActiveAgentRuntimeKey() const noexcept { return _activeAgentRuntimeKey; }
+        void ActiveAgentRuntimeKey(std::wstring value) { _activeAgentRuntimeKey = std::move(value); }
+
         // Stable per-tab identifier (GUID string). Survives tab reordering
         // and is unique across the window's lifetime, unlike the index in
         // _tabs which is reused when tabs close. Used as the tab_id for
@@ -199,6 +267,18 @@ namespace winrt::TerminalApp::implementation
         til::event<winrt::delegate<>> TabRaiseVisualBell;
         til::event<winrt::delegate<winrt::hstring /*title*/, winrt::hstring /*body*/, winrt::TerminalApp::IPaneContent /*content*/>> TabToastNotificationRequested;
         til::typed_event<IInspectable, IInspectable> TaskbarProgressChanged;
+        using newSurfaceRequestedArgs = winrt::delegate<
+            std::shared_ptr<Pane>,
+            winrt::Microsoft::Terminal::Settings::Model::INewContentArgs>;
+        til::event<newSurfaceRequestedArgs> NewSurfaceRequested;
+        using surfaceActionRequestedArgs = winrt::delegate<
+            std::shared_ptr<Pane>,
+            winrt::Microsoft::Terminal::Settings::Model::ActionAndArgs>;
+        til::event<surfaceActionRequestedArgs> SurfaceActionRequested;
+        using surfaceCollectionChangedArgs = winrt::delegate<
+            std::shared_ptr<Pane>,
+            winrt::Windows::Foundation::Collections::ValueSet>;
+        til::event<surfaceCollectionChangedArgs> SurfaceCollectionChanged;
 
         // The TabViewIndex is the index this Tab object resides in TerminalPage's _tabs vector.
         WINRT_PROPERTY(uint32_t, TabViewIndex, 0);
@@ -217,17 +297,6 @@ namespace winrt::TerminalApp::implementation
         static constexpr double HeaderRenameBoxWidthTitleLength{ std::numeric_limits<double>::infinity() };
 
         winrt::Windows::UI::Xaml::FocusState _focusState{ winrt::Windows::UI::Xaml::FocusState::Unfocused };
-        winrt::Windows::UI::Xaml::Controls::MenuFlyoutItem _duplicateTabMenuItem{};
-        winrt::Windows::UI::Xaml::Controls::MenuFlyoutItem _splitTabMenuItem{};
-        winrt::Windows::UI::Xaml::Controls::MenuFlyoutItem _moveToNewWindowMenuItem{};
-        winrt::Windows::UI::Xaml::Controls::MenuFlyoutItem _moveRightMenuItem{};
-        winrt::Windows::UI::Xaml::Controls::MenuFlyoutItem _moveLeftMenuItem{};
-        winrt::Windows::UI::Xaml::Controls::MenuFlyoutItem _exportTabMenuItem{};
-        winrt::Windows::UI::Xaml::Controls::MenuFlyoutItem _findMenuItem{};
-        winrt::Windows::UI::Xaml::Controls::MenuFlyoutItem _restartConnectionMenuItem{};
-        winrt::Windows::UI::Xaml::Controls::MenuFlyoutItem _closeOtherTabsMenuItem{};
-        winrt::Windows::UI::Xaml::Controls::MenuFlyoutItem _closeTabsAfterMenuItem{};
-        winrt::Windows::UI::Xaml::Controls::MenuFlyoutItem _closePaneMenuItem{};
         winrt::TerminalApp::ShortcutActionDispatch _dispatch;
         Microsoft::Terminal::Settings::Model::IActionMapView _actionMap{ nullptr };
         winrt::hstring _keyChord{};
@@ -255,6 +324,9 @@ namespace winrt::TerminalApp::implementation
         winrt::hstring _agentCustomCommandOverride{};
         winrt::hstring _agentSourceOverride{};
         winrt::hstring _agentWslDistroOverride{};
+        std::unordered_map<std::string, SurfaceAgentRuntime> _surfaceAgentRuntimes;
+        std::unordered_map<std::string, SurfaceRemoteRuntime> _surfaceRemoteRuntimes;
+        std::wstring _activeAgentRuntimeKey;
         std::optional<winrt::guid> _agentSourceProfileGuid;
 
         winrt::Microsoft::Terminal::Settings::Model::IconStyle _lastIconStyle;
@@ -267,6 +339,10 @@ namespace winrt::TerminalApp::implementation
         winrt::event_token _colorSelectedToken;
         winrt::event_token _colorClearedToken;
         winrt::event_token _pickerClosedToken;
+        winrt::weak_ref<winrt::Windows::UI::Xaml::FrameworkElement> _contextMenuTarget;
+        winrt::Windows::UI::Xaml::Controls::Flyout _contextRenameFlyout{ nullptr };
+        winrt::Windows::UI::Xaml::Controls::TextBox _contextRenameTextBox{ nullptr };
+        bool _contextRenameActive{ false };
 
         struct ContentEventTokens
         {
@@ -285,6 +361,7 @@ namespace winrt::TerminalApp::implementation
             winrt::Microsoft::Terminal::Control::TermControl::StringSent_revoker StringSent;
 
             winrt::TerminalApp::TerminalPaneContent::RestartTerminalRequested_revoker RestartTerminalRequested;
+            winrt::TerminalApp::SurfaceStackPaneContent::SurfaceCollectionChanged_revoker SurfaceCollectionChanged;
         };
         std::unordered_map<uint32_t, ContentEventTokens> _contentEvents;
 
@@ -311,6 +388,7 @@ namespace winrt::TerminalApp::implementation
         void _UpdateHeaderControlMaxWidth();
 
         void _CreateContextMenu();
+        void _ShowContextRenameFlyout(const winrt::Windows::UI::Xaml::FrameworkElement& target);
         winrt::hstring _CreateToolTipTitle();
 
         void _DetachEventHandlersFromContent(const uint32_t paneId);
@@ -318,7 +396,6 @@ namespace winrt::TerminalApp::implementation
         void _AttachEventHandlersToPane(std::shared_ptr<Pane> pane);
 
         void _UpdateActivePane(std::shared_ptr<Pane> pane);
-        void _UpdateMenuItemStates();
         void _UpdateAgentChipVisibility();
 
         winrt::hstring _GetActiveTitle() const;
@@ -334,9 +411,6 @@ namespace winrt::TerminalApp::implementation
 
         void _MakeTabViewItem();
 
-        void _AppendMoveMenuItems(winrt::Windows::UI::Xaml::Controls::MenuFlyout flyout);
-        winrt::Windows::UI::Xaml::Controls::MenuFlyoutSubItem _AppendCloseMenuItems(winrt::Windows::UI::Xaml::Controls::MenuFlyout flyout);
-        void _EnableMenuItems();
         void _UpdateSwitchToTabKeyChord();
         void _UpdateToolTip();
 

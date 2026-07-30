@@ -19,6 +19,7 @@
 #include "KeySentEventArgs.g.h"
 #include "CharSentEventArgs.g.h"
 #include "StringSentEventArgs.g.h"
+#include "StorageItemsDroppedEventArgs.g.h"
 #include "SearchMissingCommandEventArgs.g.h"
 #include "ShowNotificationEventArgs.g.h"
 #include "WindowSizeChangedEventArgs.g.h"
@@ -240,6 +241,22 @@ namespace winrt::Microsoft::Terminal::Control::implementation
             _Text(text) {}
 
         WINRT_PROPERTY(winrt::hstring, Text);
+    };
+
+    struct StorageItemsDroppedEventArgs : public StorageItemsDroppedEventArgsT<StorageItemsDroppedEventArgs>
+    {
+    public:
+        StorageItemsDroppedEventArgs(
+            const winrt::Windows::Foundation::Collections::IVectorView<winrt::hstring>& paths) :
+            _Paths(paths)
+        {
+        }
+
+        WINRT_PROPERTY(
+            winrt::Windows::Foundation::Collections::IVectorView<winrt::hstring>,
+            Paths,
+            nullptr);
+        WINRT_PROPERTY(bool, Handled, false);
     };
 
     struct SearchMissingCommandEventArgs : public SearchMissingCommandEventArgsT<SearchMissingCommandEventArgs>

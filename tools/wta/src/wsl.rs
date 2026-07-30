@@ -21,6 +21,13 @@ pub(crate) fn running_distros() -> Vec<String> {
     list_distros(&["-l", "--running", "-q"])
 }
 
+/// Enumerate installed distros without starting them. Compute target discovery
+/// needs the inventory, while session discovery intentionally remains limited
+/// to [`running_distros`] to avoid booting a VM as a side effect.
+pub(crate) fn installed_distros() -> Vec<String> {
+    list_distros(&["-l", "-q"])
+}
+
 /// Run `wsl.exe <args>` and parse its UTF-16LE distro-name list. Empty on
 /// any failure (no WSL, timeout).
 fn list_distros(args: &[&str]) -> Vec<String> {

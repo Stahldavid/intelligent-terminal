@@ -1,6 +1,6 @@
 [package]
 name = "wta"
-version = "0.1.0"
+version = "0.9.4"
 edition = "2021"
 description = "Windows Terminal Agent — ACP TUI client / MCP tool server"
 build = "build.rs"
@@ -9,13 +9,19 @@ build = "build.rs"
 name = "wta"
 path = "src/main.rs"
 
+[[bin]]
+name = "wta-node"
+path = "src/bin/wta-node.rs"
+
 [dependencies]
 agent-client-protocol = { version = "1.2.0" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 async-trait = "0.1"
 anyhow = "1"
+base64 = "0.22"
 serde_json = "1"
+serde_yaml = "0.9"
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
@@ -30,9 +36,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_Packaging_Appx",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_Environment",
+    "Win32_System_JobObjects",
     "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_Threading",
@@ -58,3 +66,30 @@ sys-locale = "0.3"
 # (issue #287). Already in the lockfile as a transitive dep of clap, so
 # promoting it to a direct dep does not change the resolved graph.
 strsim = "0.11"
+# Content-addressed snapshots, helper verification and artifact manifests.
+# Both crates are already present in the resolved graph, so this promotes
+# them to direct dependencies without introducing a second hashing stack.
+sha2 = "0.10"
+hex = "0.4"
+# Linux remote PTY ownership, process groups and resize. `nix` is already in
+# the resolved graph; promoting it to a direct dependency keeps OS primitives
+# behind the portable wta-node boundary.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["process", "signal", "term"] }
+
+# WTA is a large single binary. The default release partitioning made rustc
+# peak near 5 GiB on the Windows developer build, which can starve the
+# Terminal it is supposed to package. More codegen units retain release
+# optimization while bounding per-unit optimizer memory and improving local
+# build responsiveness.
+[profile.release]
+codegen-units = 64
+incremental = true
+
+# Most runtime work is I/O-bound (ACP, COM and terminal rendering). Keeping
+# dependencies at the normal release level while skipping optimization only
+# for the monolithic WTA crate avoids the Windows optimizer's multi-gigabyte
+# memory spike. This is still the stripped, static-CRT release profile; CPU
+# heavy dependencies such as image encoding remain optimized.
+[profile.release.package.wta]
+opt-level = 0

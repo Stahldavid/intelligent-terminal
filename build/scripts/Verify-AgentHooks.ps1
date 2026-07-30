@@ -370,22 +370,25 @@ function Invoke-HooksSmokeTest {
 # ── Main ─────────────────────────────────────────────────────────────
 
 # Check mode with -StatusJson takes a fast path and never resolves wta.
-$wtaPath = $null
+# PowerShell variable names are case-insensitive, so assigning to `$wtaPath`
+# would clear the `-WtaPath` parameter before it can be passed to
+# Resolve-WtaPath. Keep the resolved executable in a distinct variable.
+$resolvedWtaPath = $null
 if (-not ($Mode -eq 'Check' -and $StatusJson)) {
-    $wtaPath = Resolve-WtaPath -Override $WtaPath
-    Write-Host "wta: $wtaPath" -ForegroundColor DarkGray
+    $resolvedWtaPath = Resolve-WtaPath -Override $WtaPath
+    Write-Host "wta: $resolvedWtaPath" -ForegroundColor DarkGray
 }
 
 switch ($Mode) {
     'Install' {
-        Invoke-HooksInstall -WtaPath $wtaPath
+        Invoke-HooksInstall -WtaPath $resolvedWtaPath
     }
     'Uninstall' {
-        Invoke-HooksUninstall -WtaPath $wtaPath -Cli $CliFilter
+        Invoke-HooksUninstall -WtaPath $resolvedWtaPath -Cli $CliFilter
     }
 }
 
-$report = Get-AgentHooksStatus -WtaPath $wtaPath -Json $StatusJson
+$report = Get-AgentHooksStatus -WtaPath $resolvedWtaPath -Json $StatusJson
 Format-AgentHooksTable -Report $report -Title "wt-agent-hooks status (mode=$Mode)"
 
 if ($SmokeTest) {

@@ -10,6 +10,7 @@
 #include "CTerminalHandoff.h"
 #include "../../types/inc/utils.hpp"
 #include "../inc/IntelligentTerminalPaths.h"
+#include "../../inc/TerminalProtocolCapability.h"
 
 #include "ConptyConnection.g.cpp"
 
@@ -69,14 +70,49 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
             // in other terminals that launch the same shell.
             environment.as_map().insert_or_assign(L"INTELLIGENT_TERMINAL", L"1");
 
-            // Protocol server credentials — read from the Terminal process env
-            // (set by WindowEmperor::_initializeProtocolServer). These must be
-            // injected here because regenerate() builds _initialEnv from the
-            // registry, not the process environment block.
+            // Protocol server capability — derive a short-lived, scoped token
+            // from the host secret instead of copying the host-wide bearer into
+            // every ConPTY. Ordinary terminals receive a surface-only token.
+            // A WTA helper receives workspace scope only when TerminalPage
+            // supplied the private, in-process trustedWorkspaceCapabilityId
+            // setting while creating that exact connection. Command-line text
+            // is never treated as proof of privilege. The grant is cleared
+            // immediately after token derivation so it cannot be reused by a
+            // subsequent launch. The WTA master itself is launched directly by
+            // the host and retains the host capability; ACP adapter children
+            // scrub it.
             {
-                wchar_t buf[512];
+                wchar_t buf[2048]{};
                 if (GetEnvironmentVariableW(L"WT_COM_CLSID", buf, ARRAYSIZE(buf)))
                     environment.as_map().insert_or_assign(L"WT_COM_CLSID", buf);
+                if (GetEnvironmentVariableW(L"WT_PROTOCOL_TOKEN", buf, ARRAYSIZE(buf)))
+                {
+                    namespace Capability = ::Microsoft::Terminal::Protocol::Capability;
+                    const auto session = Utils::GuidToPlainString(_sessionId);
+                    const auto trustedWorkspace = std::exchange(_trustedWorkspaceCapabilityId, {});
+                    const auto token = !trustedWorkspace.empty() ?
+                                           Capability::Mint(
+                                               buf,
+                                               Capability::Scope::Workspace,
+                                               trustedWorkspace,
+                                               session,
+                                               Capability::WorkspaceOperations) :
+                                           Capability::Mint(
+                                               buf,
+                                               Capability::Scope::Surface,
+                                               {},
+                                               session,
+                                               Capability::SurfaceOperations);
+                    if (token)
+                    {
+                        environment.as_map().insert_or_assign(L"WT_PROTOCOL_TOKEN", *token);
+                    }
+                    else
+                    {
+                        // Fail closed: never fall back to the host secret.
+                        environment.as_map().erase(L"WT_PROTOCOL_TOKEN");
+                    }
+                }
             }
 
             // Hand the WTA log directory to the agent CLIs' PowerShell hooks
@@ -123,6 +159,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
                 L"WT_SESSION",
                 L"WT_PROFILE_ID",
                 L"WT_COM_CLSID",
+                L"WT_PROTOCOL_TOKEN",
                 L"INTELLIGENT_TERMINAL",
             };
             // Misdiagnosis in MSVC 14.44.35207. No pointer arithmetic in sight.
@@ -294,6 +331,10 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
             _sessionId = unbox_prop_or<winrt::guid>(settings, L"sessionId", _sessionId);
             _environment = settings.TryLookup(L"environment").try_as<Windows::Foundation::Collections::ValueSet>();
             _profileGuid = unbox_prop_or<winrt::guid>(settings, L"profileGuid", _profileGuid);
+            _trustedWorkspaceCapabilityId = unbox_prop_or<winrt::hstring>(
+                settings,
+                L"trustedWorkspaceCapabilityId",
+                _trustedWorkspaceCapabilityId);
 
             _flags = 0;
 

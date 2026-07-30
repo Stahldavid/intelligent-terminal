@@ -7,12 +7,14 @@
 
 #include <algorithm>
 #include <cwctype>
+#include <sstream>
 #include <winrt/Windows.UI.Xaml.Media.h>
 
 using namespace winrt::Windows::UI;
 using namespace winrt::Windows::UI::Xaml;
 using namespace winrt::Windows::UI::Xaml::Controls;
 using namespace winrt::Windows::UI::Xaml::Media;
+using namespace winrt::Windows::UI::Xaml::Input;
 using namespace winrt::Microsoft::Terminal::Control;
 using namespace winrt::Microsoft::Terminal::Settings::Model;
 
@@ -183,6 +185,398 @@ namespace winrt::TerminalApp::implementation
         StateChanged.raise(*this, nullptr);
     }
 
+    void AgentPaneContent::UpdateFocusContext(const winrt::hstring& workspace,
+                                               const winrt::hstring& pane,
+                                               const winrt::hstring& surface,
+                                               const winrt::hstring& profile,
+                                               const winrt::hstring& cwd)
+    {
+        std::wstring breadcrumb;
+        const auto append = [&breadcrumb](const winrt::hstring& value) {
+            if (value.empty())
+            {
+                return;
+            }
+            if (!breadcrumb.empty())
+            {
+                breadcrumb += L"  \u203A  ";
+            }
+            breadcrumb += value;
+        };
+        append(workspace);
+        append(pane);
+        append(surface);
+        append(profile);
+        if (!cwd.empty())
+        {
+            append(cwd);
+        }
+        std::wstring visibleContext{ RS_(L"AgentFollowingContextPrefix") };
+        visibleContext += L": ";
+        if (!profile.empty())
+        {
+            visibleContext += profile;
+        }
+        else if (!workspace.empty())
+        {
+            visibleContext += workspace;
+        }
+        if (!cwd.empty())
+        {
+            if (!profile.empty() || !workspace.empty())
+            {
+                visibleContext += L"  \u00B7  ";
+            }
+            visibleContext += cwd;
+        }
+        AgentContextText().Text(winrt::hstring{ visibleContext });
+        winrt::Windows::UI::Xaml::Automation::AutomationProperties::SetName(
+            AgentContextText(),
+            winrt::hstring{ RS_fmt(L"AgentActiveContextAutomationName", breadcrumb) });
+    }
+
+    void AgentPaneContent::_raiseNativeChatAction(
+        const std::string_view action,
+        const Json::Value& additional)
+    {
+        if (_nativeWorkspaceId.empty() || _nativeScopeKey.empty())
+        {
+            return;
+        }
+        Json::Value params{ Json::objectValue };
+        params["action"] = std::string{ action };
+        params["workspace_id"] = winrt::to_string(_nativeWorkspaceId);
+        params["scope_key"] = winrt::to_string(_nativeScopeKey);
+        if (additional.isObject())
+        {
+            for (const auto& name : additional.getMemberNames())
+            {
+                params[name] = additional[name];
+            }
+        }
+        Json::StreamWriterBuilder writer;
+        writer["indentation"] = "";
+        NativeChatAction.raise(
+            *this,
+            winrt::to_hstring(Json::writeString(writer, params)));
+    }
+
+    void AgentPaneContent::_NativeChatSendClicked(
+        const winrt::Windows::Foundation::IInspectable&,
+        const winrt::Windows::UI::Xaml::RoutedEventArgs&)
+    {
+        _submitNativeChatComposer();
+    }
+
+    void AgentPaneContent::_submitNativeChatComposer()
+    {
+        if (!_nativeCanSubmit)
+        {
+            return;
+        }
+        const auto text = NativeChatComposer().Text();
+        if (text.empty())
+        {
+            return;
+        }
+        Json::Value additional{ Json::objectValue };
+        additional["text"] = winrt::to_string(text);
+        _raiseNativeChatAction("submit", additional);
+        NativeChatComposer().Text(L"");
+    }
+
+    void AgentPaneContent::_NativeChatCancelClicked(
+        const winrt::Windows::Foundation::IInspectable&,
+        const winrt::Windows::UI::Xaml::RoutedEventArgs&)
+    {
+        _raiseNativeChatAction("cancel");
+    }
+
+    void AgentPaneContent::_NativeChatRetryClicked(
+        const winrt::Windows::Foundation::IInspectable&,
+        const winrt::Windows::UI::Xaml::RoutedEventArgs&)
+    {
+        _raiseNativeChatAction("retry");
+    }
+
+    void AgentPaneContent::_NativeChatComposerKeyDown(
+        const winrt::Windows::Foundation::IInspectable&,
+        const winrt::Windows::UI::Xaml::Input::KeyRoutedEventArgs& args)
+    {
+        if (args.Key() != winrt::Windows::System::VirtualKey::Enter)
+        {
+            return;
+        }
+        const auto coreWindow = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
+        const auto shift = coreWindow ?
+                               coreWindow.GetKeyState(winrt::Windows::System::VirtualKey::Shift) :
+                               winrt::Windows::UI::Core::CoreVirtualKeyStates::None;
+        if (WI_IsFlagSet(shift, winrt::Windows::UI::Core::CoreVirtualKeyStates::Down))
+        {
+            return;
+        }
+        args.Handled(true);
+        _submitNativeChatComposer();
+    }
+
+    void AgentPaneContent::_renderNativeChatMessage(const Json::Value& message)
+    {
+        if (!message.isObject())
+        {
+            return;
+        }
+        const auto kind = message["kind"].asString();
+        auto card = Border{};
+        card.Padding(Thickness{ 10, 8, 10, 8 });
+        card.CornerRadius(winrt::Windows::UI::Xaml::CornerRadius{ 6.0 });
+        card.MaxWidth(760);
+        card.HorizontalAlignment(kind == "user" ? HorizontalAlignment::Right :
+                                                  HorizontalAlignment::Stretch);
+
+        const auto brush = [](const Color color) {
+            return SolidColorBrush{ color };
+        };
+        if (kind == "user")
+        {
+            card.Background(brush(ColorHelper::FromArgb(110, 0, 120, 212)));
+        }
+        else if (kind == "error")
+        {
+            card.Background(brush(ColorHelper::FromArgb(70, 232, 17, 35)));
+        }
+        else if (kind == "tool")
+        {
+            card.Background(brush(ColorHelper::FromArgb(38, 255, 185, 0)));
+        }
+        else if (kind == "disclaimer" || kind == "system" || kind == "event")
+        {
+            card.Background(brush(ColorHelper::FromArgb(24, 255, 255, 255)));
+        }
+        else
+        {
+            card.Background(brush(ColorHelper::FromArgb(14, 255, 255, 255)));
+        }
+
+        if (kind == "plan" && message["entries"].isArray())
+        {
+            auto panel = StackPanel{};
+            panel.Spacing(4);
+            auto heading = TextBlock{};
+            heading.Text(RS_(L"NativeChatPlanLabel"));
+            heading.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            panel.Children().Append(heading);
+            for (const auto& entry : message["entries"])
+            {
+                const auto status = entry["status"].asString();
+                const auto marker = status == "completed" ? L"\u2713 " :
+                                    status == "in_progress" ? L"\u25CF " :
+                                                              L"\u25CB ";
+                auto line = TextBlock{};
+                std::wstring lineText{ marker };
+                lineText += winrt::to_hstring(entry["content"].asString());
+                line.Text(lineText);
+                line.TextWrapping(TextWrapping::WrapWholeWords);
+                line.IsTextSelectionEnabled(true);
+                panel.Children().Append(line);
+            }
+            card.Child(panel);
+        }
+        else
+        {
+            auto panel = StackPanel{};
+            panel.Spacing(3);
+            if (kind == "tool")
+            {
+                auto title = TextBlock{};
+                title.Text(winrt::to_hstring(message["title"].asString()));
+                title.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+                title.TextWrapping(TextWrapping::WrapWholeWords);
+                panel.Children().Append(title);
+                auto status = TextBlock{};
+                status.Text(winrt::to_hstring(message["status"].asString()));
+                status.Opacity(0.7);
+                panel.Children().Append(status);
+            }
+            else
+            {
+                auto label = TextBlock{};
+                if (kind == "user")
+                {
+                    label.Text(RS_(L"NativeChatYouLabel"));
+                }
+                else if (kind == "agent")
+                {
+                    label.Text(_agentName.empty() ? RS_(L"NativeChatAgentLabel") : _agentName);
+                }
+                else if (kind == "turn")
+                {
+                    label.Text(RS_(L"NativeChatCompletedTurnLabel"));
+                }
+                else if (kind == "error")
+                {
+                    label.Text(RS_(L"NativeChatErrorLabel"));
+                }
+                if (!label.Text().empty())
+                {
+                    label.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+                    label.FontSize(11);
+                    label.Opacity(0.78);
+                    panel.Children().Append(label);
+                }
+                auto body = TextBlock{};
+                body.Text(winrt::to_hstring(message["text"].asString()));
+                body.TextWrapping(TextWrapping::WrapWholeWords);
+                body.IsTextSelectionEnabled(true);
+                panel.Children().Append(body);
+                if (message.isMember("trailing_marker") && message["trailing_marker"].isString())
+                {
+                    auto marker = TextBlock{};
+                    marker.Text(winrt::to_hstring(message["trailing_marker"].asString()));
+                    marker.Opacity(0.65);
+                    marker.FontStyle(winrt::Windows::UI::Text::FontStyle::Italic);
+                    panel.Children().Append(marker);
+                }
+            }
+            card.Child(panel);
+        }
+        NativeChatMessages().Children().Append(card);
+    }
+
+    void AgentPaneContent::ApplyNativeChatSnapshot(const winrt::hstring& eventJson)
+    {
+        Json::Value event;
+        Json::CharReaderBuilder reader;
+        std::string errors;
+        std::istringstream stream{ winrt::to_string(eventJson) };
+        if (!Json::parseFromStream(reader, stream, &event, &errors))
+        {
+            return;
+        }
+        const auto& params = event["params"];
+        if (!params.isObject() || params["protocol_version"].asUInt() != 1)
+        {
+            return;
+        }
+        const auto sequence = params["sequence"].asUInt64();
+        if (sequence == 0 || sequence <= _nativeSnapshotSequence)
+        {
+            return;
+        }
+        _nativeSnapshotSequence = sequence;
+        _nativeWorkspaceId = winrt::to_hstring(params["workspace_id"].asString());
+        _nativeScopeKey = winrt::to_hstring(params["scope_key"].asString());
+
+        const auto nativeChat = params["view"].asString() == "chat" &&
+                                params["mode"].asString() == "chat";
+        NativeChatRoot().Visibility(nativeChat ? Visibility::Visible : Visibility::Collapsed);
+        InnerContent().Visibility(nativeChat ? Visibility::Collapsed : Visibility::Visible);
+        if (!nativeChat)
+        {
+            return;
+        }
+
+        const auto connection = params["connection"].asString();
+        const auto agent = params["agent"].asString();
+        const auto model = params["model"].asString();
+        const auto session = params["session_id"].asString();
+        const auto cwd = params["cwd"].asString();
+        const auto permissionProfile = params["permission_profile"].asString();
+        std::wstring status;
+        const auto appendStatus = [&status](const std::string_view label, const std::string& value) {
+            if (value.empty())
+            {
+                return;
+            }
+            if (!status.empty())
+            {
+                status += L"  \u00B7  ";
+            }
+            status += winrt::to_hstring(label);
+            status += L": ";
+            status += winrt::to_hstring(value);
+        };
+        appendStatus(winrt::to_string(RS_(L"NativeChatStatusConnectionLabel")), connection);
+        appendStatus(winrt::to_string(RS_(L"NativeChatStatusAgentLabel")), agent);
+        appendStatus(winrt::to_string(RS_(L"NativeChatStatusModelLabel")), model);
+        appendStatus(winrt::to_string(RS_(L"NativeChatStatusSessionLabel")), session);
+        appendStatus(winrt::to_string(RS_(L"NativeChatStatusCwdLabel")), cwd);
+        appendStatus(winrt::to_string(RS_(L"NativeChatStatusPermissionsLabel")), permissionProfile);
+        NativeChatStatusText().Text(winrt::hstring{ status });
+
+        _nativeCanSubmit = params["can_submit"].asBool();
+        const auto busy = params["busy"].asBool();
+        NativeChatComposer().IsEnabled(_nativeCanSubmit);
+        NativeChatSendButton().IsEnabled(_nativeCanSubmit);
+        NativeChatCancelButton().Visibility(busy ? Visibility::Visible : Visibility::Collapsed);
+        NativeChatRetryButton().Visibility(
+            connection == "failed" || connection == "disconnected" ?
+                Visibility::Visible :
+                Visibility::Collapsed);
+
+        NativeChatMessages().Children().Clear();
+        if (params["messages"].isArray())
+        {
+            for (const auto& message : params["messages"])
+            {
+                _renderNativeChatMessage(message);
+            }
+        }
+        if (params["active_tools"].isArray())
+        {
+            for (const auto& tool : params["active_tools"])
+            {
+                Json::Value message{ Json::objectValue };
+                message["kind"] = "tool";
+                message["title"] = tool["title"];
+                message["status"] = tool["status"];
+                _renderNativeChatMessage(message);
+            }
+        }
+        if (params["streaming"].isString() && !params["streaming"].asString().empty())
+        {
+            Json::Value streaming{ Json::objectValue };
+            streaming["kind"] = "agent";
+            streaming["text"] = params["streaming"];
+            _renderNativeChatMessage(streaming);
+        }
+
+        NativePermissionButtons().Children().Clear();
+        const auto& permission = params["permission"];
+        const auto hasPermission = permission.isObject() &&
+                                   permission["options"].isArray() &&
+                                   !permission["options"].empty();
+        NativePermissionCard().Visibility(
+            hasPermission ? Visibility::Visible : Visibility::Collapsed);
+        if (hasPermission)
+        {
+            NativePermissionDescription().Text(
+                winrt::to_hstring(permission["description"].asString()));
+            for (const auto& option : permission["options"])
+            {
+                auto button = Button{};
+                button.Content(box_value(winrt::to_hstring(option["name"].asString())));
+                const auto optionId = option["id"].asString();
+                const auto weakThis = get_weak();
+                button.Click([weakThis, optionId](auto&&, auto&&) {
+                    if (const auto self = weakThis.get())
+                    {
+                        Json::Value additional{ Json::objectValue };
+                        additional["option_id"] = optionId;
+                        self->_raiseNativeChatAction("permission", additional);
+                    }
+                });
+                NativePermissionButtons().Children().Append(button);
+            }
+        }
+
+        NativeChatScroll().ChangeView(
+            nullptr,
+            box_value(NativeChatScroll().ScrollableHeight())
+                .as<winrt::Windows::Foundation::IReference<double>>(),
+            nullptr,
+            true);
+    }
+
     // Apply the supplied colors to the agent-pane top bar (#348). The vector
     // logo paths bind to the label's foreground, so both take the same tint.
     // The 1px bottom hairline uses the foreground color at ~15% alpha, so it
@@ -293,15 +687,15 @@ namespace winrt::TerminalApp::implementation
 
     winrt::Windows::Foundation::Size AgentPaneContent::MinimumSize()
     {
-        // Reserve 36px (top bar) on top of the inner control's minimum.
+        // Reserve 52px (scope + context header) on top of the inner control's minimum.
         // The bottom bar is window-level chrome now, so it isn't part of
         // this pane's minimum size.
         if (const auto& impl = winrt::get_self<implementation::TerminalPaneContent>(_inner))
         {
             const auto inner = impl->MinimumSize();
-            return { inner.Width, inner.Height + 36.0f };
+            return { inner.Width, inner.Height + 52.0f };
         }
-        return { 1, 36.0f };
+        return { 1, 52.0f };
     }
 
     void AgentPaneContent::Focus(winrt::Windows::UI::Xaml::FocusState reason)
@@ -403,8 +797,8 @@ namespace winrt::TerminalApp::implementation
             // 36px we steal off the top before delegating, then add it back.
             if (direction == TerminalApp::PaneSnapDirection::Height)
             {
-                const auto adjusted = std::max(0.0f, sizeToSnap - 36.0f);
-                return impl->SnapDownToGrid(direction, adjusted) + 36.0f;
+                const auto adjusted = std::max(0.0f, sizeToSnap - 52.0f);
+                return impl->SnapDownToGrid(direction, adjusted) + 52.0f;
             }
             return impl->SnapDownToGrid(direction, sizeToSnap);
         }

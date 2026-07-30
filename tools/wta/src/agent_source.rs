@@ -19,23 +19,49 @@ pub enum AgentSource {
     Wsl {
         distro: String,
     },
+    /// Managed remote runtime selected by canonical compute-target id. The
+    /// master resolves this id through ComputeStore and never accepts an SSH
+    /// alias or command line directly from a helper.
+    Ssh {
+        target_id: String,
+        /// Stable wta-node runtime identity. Including it in AgentSource
+        /// makes the master pool isolate managed surfaces on the same host.
+        remote_session_id: Option<String>,
+    },
 }
 
 impl AgentSource {
     pub const HOST_KIND: &'static str = "host";
     pub const WSL_KIND: &'static str = "wsl";
+    pub const SSH_KIND: &'static str = "ssh";
 
     /// Parse the source fields carried on the helper command line or `_meta.wta`.
     ///
     /// Invalid/incomplete values fail closed to `Host`; callers log malformed
     /// WSL requests before using this compatibility fallback.
-    pub fn from_wire(kind: Option<&str>, distro: Option<&str>) -> Self {
+    pub fn from_wire(
+        kind: Option<&str>,
+        distro: Option<&str>,
+        ssh_target: Option<&str>,
+        remote_session_id: Option<&str>,
+    ) -> Self {
         match kind.map(str::trim) {
             Some(kind) if kind.eq_ignore_ascii_case(Self::WSL_KIND) => distro
                 .map(str::trim)
                 .filter(|distro| !distro.is_empty())
                 .map(|distro| Self::Wsl {
                     distro: distro.to_string(),
+                })
+                .unwrap_or(Self::Host),
+            Some(kind) if kind.eq_ignore_ascii_case(Self::SSH_KIND) => ssh_target
+                .map(str::trim)
+                .filter(|target| !target.is_empty())
+                .map(|target_id| Self::Ssh {
+                    target_id: target_id.to_string(),
+                    remote_session_id: remote_session_id
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
                 })
                 .unwrap_or(Self::Host),
             _ => Self::Host,
@@ -46,6 +72,7 @@ impl AgentSource {
         match self {
             Self::Host => Self::HOST_KIND,
             Self::Wsl { .. } => Self::WSL_KIND,
+            Self::Ssh { .. } => Self::SSH_KIND,
         }
     }
 
@@ -53,6 +80,23 @@ impl AgentSource {
         match self {
             Self::Host => None,
             Self::Wsl { distro } => Some(distro),
+            Self::Ssh { .. } => None,
+        }
+    }
+
+    pub fn ssh_target(&self) -> Option<&str> {
+        match self {
+            Self::Ssh { target_id, .. } => Some(target_id),
+            _ => None,
+        }
+    }
+
+    pub fn remote_session_id(&self) -> Option<&str> {
+        match self {
+            Self::Ssh {
+                remote_session_id, ..
+            } => remote_session_id.as_deref(),
+            _ => None,
         }
     }
 
@@ -60,6 +104,7 @@ impl AgentSource {
         match self {
             Self::Host => "Windows".to_string(),
             Self::Wsl { distro } => distro.clone(),
+            Self::Ssh { target_id, .. } => format!("SSH {target_id}"),
         }
     }
 
@@ -69,6 +114,10 @@ impl AgentSource {
             Self::Wsl { distro } => crate::agent_sessions::SessionLocation::Wsl {
                 distro: distro.clone(),
             },
+            // SessionLocation predates compute targets. Keep remote sessions
+            // non-WSL until the public session schema gains a Remote variant;
+            // SurfaceBinding remains the authoritative location.
+            Self::Ssh { .. } => crate::agent_sessions::SessionLocation::Host,
         }
     }
 }
@@ -78,6 +127,16 @@ impl fmt::Display for AgentSource {
         match self {
             Self::Host => f.write_str(Self::HOST_KIND),
             Self::Wsl { distro } => write!(f, "{}:{distro}", Self::WSL_KIND),
+            Self::Ssh {
+                target_id,
+                remote_session_id,
+            } => {
+                write!(f, "{}:{target_id}", Self::SSH_KIND)?;
+                if let Some(session_id) = remote_session_id {
+                    write!(f, ":{session_id}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -186,18 +245,25 @@ mod tests {
     #[test]
     fn wire_source_requires_a_nonempty_wsl_distro() {
         assert_eq!(
-            AgentSource::from_wire(Some("wsl"), Some("Ubuntu")),
+            AgentSource::from_wire(Some("wsl"), Some("Ubuntu"), None, None),
             AgentSource::Wsl {
                 distro: "Ubuntu".to_string()
             }
         );
         assert_eq!(
-            AgentSource::from_wire(Some("wsl"), Some(" ")),
+            AgentSource::from_wire(Some("wsl"), Some(" "), None, None),
             AgentSource::Host
         );
         assert_eq!(
-            AgentSource::from_wire(Some("unknown"), Some("Ubuntu")),
+            AgentSource::from_wire(Some("unknown"), Some("Ubuntu"), None, None),
             AgentSource::Host
+        );
+        assert_eq!(
+            AgentSource::from_wire(Some("ssh"), None, Some("devbox"), Some("surface-42"),),
+            AgentSource::Ssh {
+                target_id: "devbox".to_string(),
+                remote_session_id: Some("surface-42".to_string()),
+            }
         );
     }
 

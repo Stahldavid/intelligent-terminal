@@ -10,6 +10,7 @@
   <summary><strong>Table of Contents</strong></summary>
 
 - [What is Intelligent Terminal?](#what-is-intelligent-terminal)
+- [About this fork](#about-this-fork)
 - [Installing and running Intelligent Terminal](#installing-and-running-intelligent-terminal)
   - [Microsoft Store](#microsoft-store-recommended)
   - [WinGet](#winget)
@@ -45,6 +46,23 @@ Intelligent Terminal works with any [Agent Client Protocol (ACP)-compatible](htt
 Intelligent Terminal takes all the features you love in Windows Terminal such as:  tabs, profiles, themes, settings, shells, and keyboard shortcuts, which all work the way you expect.
 
 Read the [announcement blog post](https://devblogs.microsoft.com/commandline/announcing-intelligent-terminal-version-0-1/) for more details.
+
+---
+
+## About this fork
+
+This branch extends the original Intelligent Terminal with a native workspace
+sidebar, pane-local surfaces, contextual ACP chat, agent teams, and a
+capability-scoped remote compute runtime. It preserves Windows Terminal tabs,
+panes, profiles, settings, and context actions as the canonical model instead
+of duplicating them.
+
+The remote and browser features are under active development. Source capability
+and deterministic tests do not by themselves establish release readiness or
+full cmux SSH parity. Read
+[Fork architecture and current status](./doc/fork-architecture-and-status.md)
+for the implemented hierarchy, trust boundaries, observed evidence, and open
+release gates. See [FORK.md](./FORK.md) for branch and upstream policy.
 
 ---
 

@@ -53,6 +53,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
 
         void UpdateControlSettings(Control::IControlSettings settings);
         void UpdateControlSettings(Control::IControlSettings settings, Control::IControlAppearance unfocusedAppearance);
+        void SetTrimLeftPadding(bool trim);
         IControlSettings Settings() const;
 
         void KeyBindings(const Control::IKeyBindings& bindings) { _keyBindings = bindings; }
@@ -217,6 +218,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         til::typed_event<IInspectable, Control::KeySentEventArgs> KeySent;
         til::typed_event<IInspectable, Control::CharSentEventArgs> CharSent;
         til::typed_event<IInspectable, Control::StringSentEventArgs> StringSent;
+        til::typed_event<IInspectable, Control::StorageItemsDroppedEventArgs> StorageItemsDropped;
         til::typed_event<IInspectable, Control::SearchMissingCommandEventArgs> SearchMissingCommand;
         til::typed_event<IInspectable, winrt::hstring> VtSequenceReceived;
         til::typed_event<IInspectable, Control::WindowSizeChangedEventArgs> WindowSizeChanged;
@@ -287,6 +289,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         bool _closing{ false };
         bool _focused{ false };
         bool _initializedTerminal{ false };
+        bool _trimLeftPadding{ false };
         bool _quickFixButtonCollapsible{ false };
         bool _quickFixesAvailable{ false };
         til::CoordType _quickFixBufferPos{};

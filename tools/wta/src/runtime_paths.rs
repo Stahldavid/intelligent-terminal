@@ -50,10 +50,24 @@ pub fn intelligent_terminal_local_root() -> Option<PathBuf> {
 /// (the `package_subdir` is ignored, since there is no package store to
 /// nest under).
 fn resolve_root(package_subdir: &[&str]) -> Option<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        let state = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".local").join("state"))
+            })?;
+        let _ = package_subdir;
+        return Some(state.join("intelligent-terminal"));
+    }
+
+    #[cfg(windows)]
     let local = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("APPDATA"))
         .map(PathBuf::from)?;
 
+    #[cfg(windows)]
     match current_package_family_name() {
         Some(family) => {
             let mut path = local.join("Packages").join(family);
@@ -71,7 +85,8 @@ fn resolve_root(package_subdir: &[&str]) -> Option<PathBuf> {
 /// `Microsoft.IntelligentTerminal_8wekyb3d8bbwe` for the store family), or
 /// `None` when the process has no package identity (unpackaged) or the OS
 /// call fails for any other reason.
-pub(crate) fn current_package_family_name() -> Option<std::ffi::OsString> {
+#[cfg(windows)]
+pub fn current_package_family_name() -> Option<std::ffi::OsString> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
     use windows_sys::Win32::Storage::Packaging::Appx::GetCurrentPackageFamilyName;
@@ -98,6 +113,11 @@ pub(crate) fn current_package_family_name() -> Option<std::ffi::OsString> {
         return None;
     }
     Some(std::ffi::OsString::from_wide(&buf[..end]))
+}
+
+#[cfg(not(windows))]
+pub fn current_package_family_name() -> Option<std::ffi::OsString> {
+    None
 }
 
 pub fn runtime_prompt_root() -> Option<PathBuf> {
@@ -138,6 +158,12 @@ pub fn master_pipe_file_path() -> Option<PathBuf> {
 ///
 /// Returns `None` when neither `%LOCALAPPDATA%` nor `%APPDATA%` is set or
 /// no candidate `state.json` exists on disk.
+#[cfg(not(windows))]
+pub fn wt_state_json_path() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(windows)]
 pub fn wt_state_json_path() -> Option<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("APPDATA"))
@@ -196,18 +222,24 @@ mod tests {
 
     #[test]
     fn unpackaged_roots_fall_back_to_bare_intelligent_terminal() {
-        // With no package identity (test context), BOTH roots collapse to the
-        // legacy bare `…\IntelligentTerminal` — there is no package store to
-        // nest the LocalState / LocalCache split under. Guard that neither
-        // leaks a package-relative segment, so a regression that always emits
-        // the packaged layout is caught.
+        // On Windows, an unpackaged process uses the legacy bare
+        // `%LOCALAPPDATA%\IntelligentTerminal`. On Unix, package identity does
+        // not apply and both roots use the XDG state path with the canonical
+        // lowercase application directory.
         for root in [
             resolve_root(&["LocalState"]),
             resolve_root(&["LocalCache", "Local"]),
         ] {
             let root = root.expect("LOCALAPPDATA/APPDATA set in CI/dev");
+            #[cfg(windows)]
             assert!(
                 root.ends_with("IntelligentTerminal"),
+                "unexpected root: {}",
+                root.display(),
+            );
+            #[cfg(not(windows))]
+            assert!(
+                root.ends_with("intelligent-terminal"),
                 "unexpected root: {}",
                 root.display(),
             );

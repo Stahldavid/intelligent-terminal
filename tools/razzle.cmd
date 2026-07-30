@@ -25,14 +25,18 @@ nuget restore %OPENCON%\OpenConsole.slnx -Verbosity quiet
 nuget restore %OPENCON%\dep\nuget\packages.config -Verbosity quiet
 
 :FIND_MSBUILD
+rem Honor an explicit MSBUILD override. This is both useful for constrained
+rem build hosts and consistent with the diagnostic below that asks callers to
+rem set MSBUILD when automatic discovery fails.
+if not defined MSBUILD goto :SEARCH_PATH_MSBUILD
+if exist "%MSBUILD%" goto :FOUND_ENV_MSBUILD
+echo Ignoring invalid MSBUILD override: "%MSBUILD%"
 set MSBUILD=
 
+:SEARCH_PATH_MSBUILD
 rem GH#1313: If msbuild is already on the path, we don't need to look for it.
 for %%X in (msbuild.exe) do (set MSBUILD=%%~$PATH:X)
-if defined MSBUILD (
-    echo Using MSBuild at %MSBUILD% which was already on the path.
-    goto :FOUND_MSBUILD
-)
+if defined MSBUILD goto :FOUND_PATH_MSBUILD
 
 rem Find vswhere
 rem from https://github.com/microsoft/vs-setup-samples/blob/master/tools/vswhere.cmd
@@ -49,14 +53,25 @@ if not defined VSWHERE (
 
 rem Add path to MSBuild Binaries
 rem
-rem We accept the latest prerelease of VS in the 17.x or 18.x range. The -version
-rem range [17.0,19.0) picks up both VS 2022 (17.x) and VS 18 (including previews)
-rem but not a still-newer major whose toolset may be incompatible. VS 18 uses our
-rem v145 PlatformToolset (see src\common.build.pre.props); older VS versions default
-rem to v143.
+rem Prefer VS 18 because the repository's vcpkg overlay triplets require the
+rem v145 toolset. The loose ResourceDictionary runtime classes prevent the
+rem former SDK 26100 WMC9999 null-ClassFullName failure. Fall back to VS 2022
+rem only when VS 18 is unavailable; callers can still select MSBuild explicitly.
 rem
-for /f "usebackq tokens=*" %%B in (`"%VSWHERE%" -latest -prerelease -products * -requires Microsoft.Component.MSBuild -version "[17.0,19.0)" -find MSBuild\**\Bin\MSBuild.exe 2^>nul`) do (
+rem Keep each range outside the FOR command so its closing parenthesis cannot
+rem terminate the block during cmd's first parse. `call` is also required:
+rem FOR /F executes its command through cmd /c, whose quote stripping otherwise
+rem breaks an executable path such as "C:\Program Files\...\vswhere.exe".
+set "VS_VERSION_RANGE=[18.0,19.0)"
+for /f "usebackq tokens=*" %%B in (`call "%VSWHERE%" -latest -prerelease -products * -requires Microsoft.Component.MSBuild -version "%VS_VERSION_RANGE%" -find MSBuild\**\Bin\MSBuild.exe 2^>nul`) do (
     set MSBUILD=%%B
+)
+
+if not defined MSBUILD (
+    set "VS_VERSION_RANGE=[17.0,18.0)"
+    for /f "usebackq tokens=*" %%B in (`call "%VSWHERE%" -latest -prerelease -products * -requires Microsoft.Component.MSBuild -version "%VS_VERSION_RANGE%" -find MSBuild\**\Bin\MSBuild.exe 2^>nul`) do (
+        set MSBUILD=%%B
+    )
 )
 
 if not defined MSBUILD (
@@ -64,21 +79,29 @@ if not defined MSBUILD (
     exit /b 1
 )
 
+:FOUND_ENV_MSBUILD
+echo Using MSBuild at %MSBUILD% from the environment.
+goto :FOUND_MSBUILD
+
+:FOUND_PATH_MSBUILD
+echo Using MSBuild at %MSBUILD% which was already on the path.
+goto :FOUND_MSBUILD
+
 :FOUND_MSBUILD
 
 rem Guard: make sure we actually resolved a real MSBuild.exe. Without this, a
 rem chained command like `razzle && bcz` would run bcz with an empty MSBUILD/
 rem PLATFORM/CONFIGURATION and fail cryptically with '""' is not recognized.
-if not exist "%MSBUILD%" (
-    echo Could not find a usable MSBuild.exe ^(resolved: "%MSBUILD%"^).
-    echo Open a "Developer PowerShell/Command Prompt for VS", or run
-    echo   Import-Module .\tools\OpenConsole.psm1; Set-MsbuildDevEnvironment
-    echo in your shell before razzle, then try again.
-    exit /b 1
-)
+if exist "%MSBUILD%" goto :MSBUILD_READY
+echo Could not find a usable MSBuild.exe ^(resolved: "%MSBUILD%"^).
+echo Open a "Developer PowerShell/Command Prompt for VS", or run
+echo   Import-Module .\tools\OpenConsole.psm1; Set-MsbuildDevEnvironment
+echo in your shell before razzle, then try again.
+exit /b 1
 
+:MSBUILD_READY
 rem Add MSBuild's own directory to PATH, with a proper ; separator.
-for %%F in ("%MSBUILD%") do set "MSBUILD_BIN=%%~dpF"
+set "MSBUILD_BIN=%MSBUILD:MSBuild.exe=%"
 set "PATH=%PATH%;%MSBUILD_BIN%"
 
 if "%PROCESSOR_ARCHITECTURE%" == "AMD64" (

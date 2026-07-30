@@ -38,8 +38,8 @@ import "unknwn.idl";
 ] interface ITerminalProtocol : IUnknown
 {
     // ── Meta ──
-    // Compatibility handshake. COM activation is the trust boundary; this call
-    // does not gate any protocol method.
+    // Per-client capability handshake. All remaining methods fail closed until
+    // this instance authenticates with the token inherited from Terminal.
     HRESULT Authenticate([in] BSTR token, [out, retval] BSTR* resultJson);
     HRESULT GetCapabilities([out, retval] BSTR* json);
 
@@ -67,6 +67,7 @@ import "unknwn.idl";
                       [in] float size,
                       [in] BSTR profile,
                       [in] BSTR commandline,
+                      [in] BSTR startingDirectory,
                       [in] boolean background,
                       [out, retval] BSTR* json);
     HRESULT ClosePane([in] GUID sessionId);

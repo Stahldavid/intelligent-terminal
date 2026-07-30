@@ -4,6 +4,7 @@
 #pragma once
 
 #include <optional>
+#include <json/json.h>
 
 #include "AgentPaneContent.g.h"
 #include "TerminalPaneContent.h"
@@ -65,6 +66,25 @@ namespace winrt::TerminalApp::implementation
         // Update the cached pane-position. Fires StateChanged so the
         // bottom bar can refresh its toggle-icon orientation.
         void SetAgentPanePosition(const winrt::hstring& position);
+        void UpdateFocusContext(const winrt::hstring& workspace,
+                                const winrt::hstring& pane,
+                                const winrt::hstring& surface,
+                                const winrt::hstring& profile,
+                                const winrt::hstring& cwd);
+        void ApplyNativeChatSnapshot(const winrt::hstring& eventJson);
+        til::typed_event<winrt::TerminalApp::AgentPaneContent, winrt::hstring> NativeChatAction;
+        void _NativeChatSendClicked(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::RoutedEventArgs& args);
+        void _NativeChatCancelClicked(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::RoutedEventArgs& args);
+        void _NativeChatRetryClicked(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::RoutedEventArgs& args);
+        void _NativeChatComposerKeyDown(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::Input::KeyRoutedEventArgs& args);
         // --- Cross-window drag rename plumbing ---
         // When a tab is dragged into this window, the source side has stashed
         // the originating tab's StableId keyed by ContentId. The target
@@ -102,6 +122,9 @@ namespace winrt::TerminalApp::implementation
         // capability exists before connect (cold start) or after a
         // failure/disconnect, so the button must not appear at all.
         bool IsAgentConnected() const noexcept { return _agentState == L"connected"; }
+        winrt::hstring GetAgentName() const noexcept { return _agentName; }
+        winrt::hstring GetAgentState() const noexcept { return _agentState; }
+        winrt::hstring GetAgentBackend() const noexcept { return _agentBackend; }
         winrt::hstring GetLastErrorPaneId() const noexcept { return _lastErrorPaneId; }
         winrt::hstring GetFixPreview() const noexcept { return _fixPreview; }
         winrt::hstring GetHotkeyHint() const noexcept { return _hotkeyHint; }
@@ -171,6 +194,14 @@ namespace winrt::TerminalApp::implementation
         // is pending. See SetPendingRenameFromTabId / TakePendingRenameFromTabId.
         winrt::hstring _pendingRenameFromTabId{};
         std::optional<winrt::guid> _pendingAgentSourceProfileGuid;
+        winrt::hstring _nativeWorkspaceId{};
+        winrt::hstring _nativeScopeKey{};
+        uint64_t _nativeSnapshotSequence{ 0 };
+        bool _nativeCanSubmit{ false };
+        void _raiseNativeChatAction(std::string_view action,
+                                    const Json::Value& additional = Json::Value{ Json::objectValue });
+        void _submitNativeChatComposer();
+        void _renderNativeChatMessage(const Json::Value& message);
 
         // Inner content event tokens — forwarded to our own BasicPaneEvents.
         winrt::event_token _innerCloseRequested{};

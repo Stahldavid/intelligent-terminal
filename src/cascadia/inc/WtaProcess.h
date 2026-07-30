@@ -184,6 +184,41 @@ namespace Microsoft::Terminal::WtaProcess
         return captured;
     }
 
+    // Start a short, non-interactive WTA control-plane mutation without
+    // blocking the UI thread. The child owns no inherited handles and may
+    // safely complete after the Terminal window begins shutting down.
+    inline bool RunWtaDetached(const std::wstring& wtaPath,
+                               const std::wstring& argsAfterExe)
+    {
+        if (wtaPath.empty())
+        {
+            return false;
+        }
+        std::wstring commandline = L"\"" + wtaPath + L"\" " + argsAfterExe;
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        startup.dwFlags = STARTF_USESHOWWINDOW;
+        startup.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION process{};
+        if (!CreateProcessW(
+                wtaPath.c_str(),
+                commandline.data(),
+                nullptr,
+                nullptr,
+                FALSE,
+                CREATE_NO_WINDOW,
+                nullptr,
+                nullptr,
+                &startup,
+                &process))
+        {
+            return false;
+        }
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return true;
+    }
+
     // Build an environment block that extends PATH with WinGet Links and npm
     // global directories. Needed after a fresh winget install so newly-installed
     // CLIs are discoverable by child processes. Returns a double-null-terminated

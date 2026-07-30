@@ -1,0 +1,15 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+namespace Microsoft.Terminal.Settings.Editor
+{
+    [default_interface] runtimeclass CommonResourcesDictionary : Windows.UI.Xaml.ResourceDictionary
+    {
+        CommonResourcesDictionary();
+    }
+
+    [default_interface] runtimeclass SettingContainerStyleDictionary : Windows.UI.Xaml.ResourceDictionary
+    {
+        SettingContainerStyleDictionary();
+    }
+}

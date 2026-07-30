@@ -8,6 +8,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$comRegistrationScript = Join-Path $PSScriptRoot 'ComProxyRegistration.ps1'
+if (-not (Test-Path -LiteralPath $comRegistrationScript -PathType Leaf)) {
+    throw "COM registration helper not found: $comRegistrationScript"
+}
+. $comRegistrationScript
+
 function Write-Status {
     param([string]$Message)
 
@@ -36,11 +42,20 @@ Get-Process |
     Where-Object { $_.Path -like "$InstallDir*" } |
     Stop-Process -Force -ErrorAction SilentlyContinue
 
+$comProxy = Join-Path $InstallDir 'OpenConsoleProxy.dll'
+if (Test-Path -LiteralPath $comProxy -PathType Leaf) {
+    Write-Status 'Removing the per-user terminal protocol proxy registration ...'
+    Unregister-PerUserComProxy -ProxyPath $comProxy
+}
+
 if ($RemoveDevMsix) {
-    $devPackage = Get-AppxPackage -Name 'WindowsTerminalDev' -ErrorAction SilentlyContinue
-    if ($devPackage) {
-        Write-Status 'Removing WindowsTerminalDev MSIX package ...'
-        $devPackage | Remove-AppxPackage
+    $devPackages = @(
+        Get-AppxPackage -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -in @('WindowsTerminalDev', 'IntelligentTerminal') }
+    )
+    if ($devPackages.Count -gt 0) {
+        Write-Status 'Removing Intelligent Terminal development MSIX package(s) ...'
+        $devPackages | Remove-AppxPackage
     }
 }
 

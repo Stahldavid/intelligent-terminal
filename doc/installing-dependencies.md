@@ -91,7 +91,7 @@ new `winget.exe` is picked up on `PATH`, then verify with
 distributed as npm packages. Intelligent Terminal also launches Claude and
 Codex through `npx` wrappers
 (`npx -y @agentclientprotocol/claude-agent-acp` and
-`npx -y @agentclientprotocol/codex-acp@1.1.0`), which require a working Node.js +
+`npx -y @agentclientprotocol/codex-acp@1.1.7`), which require a working Node.js +
 `npm` + `npx` toolchain on `PATH`. You can skip this section if you only
 plan to use GitHub Copilot CLI.
 
@@ -120,6 +120,38 @@ when it detects that Node.js is missing — you only need to run it manually
 if you are setting up a machine outside the FRE flow. After the install
 finishes, close and reopen your terminal so `PATH` picks up `node.exe`,
 `npm.cmd`, and `npx.cmd`.
+
+### Node.js for managed agents inside WSL
+
+A Windows Node.js installation does not provide a native Linux runtime. Do not
+let WSL discover `node.exe` through `/mnt/c`: ACP adapters are Linux processes
+when their surface is bound to a WSL target and must use a Linux Node.js
+binary.
+
+The repository provides a distro-local, reversible provisioner:
+
+```powershell
+.\build\scripts\Install-WtaWslNodeRuntime.ps1 -Distro Ubuntu-22.04
+```
+
+It downloads the pinned official Node.js archive, verifies its SHA-256 before
+extracting it, and installs it under the WSL ext4 filesystem:
+
+```text
+~/.local/share/intelligent-terminal/toolchains/node-v22.23.1-linux-x64
+~/.local/share/intelligent-terminal/toolchains/node-current
+```
+
+The second path is an atomically replaced symlink. WTA prepends only its
+`bin` directory while probing or launching a WSL ACP adapter; it does not edit
+the user's global shell profile and does not replace a distro package.
+
+For the same performance reason, `Build-WtaNodeLinux.ps1` stages Rust sources
+and Cargo output under `~/.cache/intelligent-terminal` inside WSL. Building
+directly from `/mnt/c/...` is intentionally avoided because metadata-heavy
+Cargo operations are substantially slower across the Windows/WSL filesystem
+boundary. Only the final verified ELF artifact is copied back into the
+repository.
 
 ---
 
@@ -266,8 +298,13 @@ Intelligent Terminal launches it through the
 wrapper. The wrapper is fetched on demand at run time with:
 
 ```powershell
-npx -y @agentclientprotocol/codex-acp@1.1.0
+npx -y @agentclientprotocol/codex-acp@1.1.7
 ```
+
+The 1.1.7 pin is also used by the Settings UI and Terminal host. It supports
+current Codex configuration values such as
+`default_tools_approval_mode = "writes"`; do not downgrade the user's valid
+configuration to work around an older adapter.
 
 You do **not** need to install anything for this — the only prerequisite
 is a working Node.js + `npx` (which you already installed in Step 3.3.1).

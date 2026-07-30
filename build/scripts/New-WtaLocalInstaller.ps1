@@ -14,6 +14,8 @@ param(
 
     [switch]$BuildTerminal,
 
+    [switch]$AllowPrebuiltTerminal,
+
     [switch]$SkipWtaBuild,
 
     [string]$WtaExePath
@@ -48,6 +50,90 @@ function Resolve-AbsolutePath {
     }
 
     return [System.IO.Path]::GetFullPath((Join-Path $BasePath $Path))
+}
+
+function Assert-PayloadProtocolManifest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PayloadRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SourceManifestPath
+    )
+
+    $payloadManifestPath = Join-Path $PayloadRoot 'protocol-version.json'
+    if (-not (Test-Path $payloadManifestPath -PathType Leaf)) {
+        throw "Terminal payload has no protocol-version.json. Refusing to combine a legacy or stale MSIX with current agent components."
+    }
+
+    $sourceManifest = Get-Content $SourceManifestPath -Raw | ConvertFrom-Json
+    $payloadManifest = Get-Content $payloadManifestPath -Raw | ConvertFrom-Json
+    foreach ($field in 'protocolVersion', 'componentVersion') {
+        if (-not $payloadManifest.$field -or $payloadManifest.$field -ne $sourceManifest.$field) {
+            throw "Terminal payload $field '$($payloadManifest.$field)' does not match source '$($sourceManifest.$field)'. Rebuild the Terminal package."
+        }
+    }
+
+    foreach ($component in 'WindowsTerminal.exe', 'wtcli.exe') {
+        $componentPath = Join-Path $PayloadRoot $component
+        if (-not (Test-Path $componentPath -PathType Leaf)) {
+            throw "Terminal payload is missing $component. The package must carry its own matching protocol client and server."
+        }
+    }
+
+    return $payloadManifest
+}
+
+function Find-DumpbinPath {
+    $command = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
+    }
+
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path $vswhere -PathType Leaf)) {
+        throw 'Could not find dumpbin.exe or vswhere.exe to verify native payload dependencies.'
+    }
+
+    $installationPath = (& $vswhere -latest -products * -property installationPath).Trim()
+    if (-not $installationPath) {
+        throw 'No Visual Studio installation was found while resolving dumpbin.exe.'
+    }
+
+    $candidate = Get-ChildItem (Join-Path $installationPath 'VC\Tools\MSVC') -Recurse -Filter dumpbin.exe |
+        Where-Object { $_.FullName -match '\\bin\\Hostx64\\x64\\dumpbin\.exe$' } |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+    if (-not $candidate) {
+        throw "Could not find x64 dumpbin.exe under $installationPath."
+    }
+    return $candidate.FullName
+}
+
+function Assert-PayloadNativeRuntime {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PayloadRoot
+    )
+
+    $terminalApp = Join-Path $PayloadRoot 'TerminalApp.dll'
+    if (-not (Test-Path $terminalApp -PathType Leaf)) {
+        throw "Terminal payload is missing $terminalApp."
+    }
+
+    $dumpbin = Find-DumpbinPath
+    $dependencies = (& $dumpbin /nologo /dependents $terminalApp 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "dumpbin failed while verifying native dependencies for $terminalApp.`n$dependencies"
+    }
+
+    if ($dependencies -match '(?im)^\s*WebView2Loader\.dll\s*$') {
+        throw @"
+TerminalApp.dll imports WebView2Loader.dll. Intelligent Terminal requires the
+official WebView2 static-loader mode so the MSIX, portable ZIP and bootstrap
+installer cannot drift into a startup-crashing runtime layout.
+"@
+    }
 }
 
 function Get-RustTarget {
@@ -126,7 +212,10 @@ function Invoke-RustBuild {
     # this script relies on for local builds.
     Push-Location $RepoRoot
     try {
-        & $CargoPath build --manifest-path $ManifestPath --release --target $RustTarget
+        # Bound linker/codegen pressure so packaging remains usable on a
+        # developer workstation while still allowing two independent crates
+        # to make progress.
+        & $CargoPath build --manifest-path $ManifestPath --release --target $RustTarget -j 2
         if ($LASTEXITCODE -ne 0) {
             throw "cargo build failed for $ManifestPath."
         }
@@ -151,6 +240,7 @@ function New-SelfExtractingInstaller {
     $bundleFiles = @(
         'install.cmd',
         'install-local-terminal.ps1',
+        'ComProxyRegistration.ps1',
         'payload.zip'
     )
     $footerMagic = [System.Text.Encoding]::ASCII.GetBytes('WTA-INSTALLER-V1')
@@ -300,10 +390,10 @@ function Get-AppxPackageIdentity {
     }
 
     return [pscustomobject]@{
-        Name = $identityNode.Name
-        Version = $identityNode.Version
-        Publisher = $identityNode.Publisher
-        ProcessorArchitecture = $identityNode.ProcessorArchitecture
+        Name = $identityNode.GetAttribute('Name')
+        Version = $identityNode.GetAttribute('Version')
+        Publisher = $identityNode.GetAttribute('Publisher')
+        ProcessorArchitecture = $identityNode.GetAttribute('ProcessorArchitecture')
     }
 }
 
@@ -322,10 +412,13 @@ function Get-AppxManifestIdentity {
     }
 
     return [pscustomobject]@{
-        Name = $identityNode.Name
-        Version = $identityNode.Version
-        Publisher = $identityNode.Publisher
-        ProcessorArchitecture = $identityNode.ProcessorArchitecture
+        Name = $identityNode.GetAttribute('Name')
+        Version = $identityNode.GetAttribute('Version')
+        Publisher = $identityNode.GetAttribute('Publisher')
+        # The source manifest intentionally omits this attribute; MSBuild
+        # materializes it in the built package. GetAttribute returns an empty
+        # string instead of violating StrictMode on the source XML node.
+        ProcessorArchitecture = $identityNode.GetAttribute('ProcessorArchitecture')
     }
 }
 
@@ -355,23 +448,60 @@ function Build-TerminalPackage {
     $openConsoleModule = Join-Path $RepoRoot 'tools\OpenConsole.psm1'
     $solutionPath = Join-Path $RepoRoot 'OpenConsole.slnx'
     $packagesConfig = Join-Path $RepoRoot 'dep\nuget\packages.config'
+    $packagesDirectory = Join-Path $RepoRoot 'packages'
+    $nugetConfig = Join-Path $RepoRoot 'NuGet.Config'
     $packageProject = Join-Path $RepoRoot 'src\cascadia\CascadiaPackage\CascadiaPackage.wapproj'
 
     Write-Status "Building CascadiaPackage for $PlatformName/$ConfigurationName ..."
 
+    # Enter-VsDevShell initializes Visual Studio's bundled VCPKG_ROOT. Preserve
+    # an explicitly selected standalone tool across that environment import so
+    # CI can use a release that understands the selected VS/toolset.
+    $requestedVcpkgRoot = $env:VCPKG_ROOT
+    $requestedVcpkgDisableMetrics = $env:VCPKG_DISABLE_METRICS
     Import-Module $openConsoleModule -Force
     Set-MsbuildDevEnvironment
+    if (-not [string]::IsNullOrWhiteSpace($requestedVcpkgRoot)) {
+        $env:VCPKG_ROOT = $requestedVcpkgRoot
+    }
+    if (-not [string]::IsNullOrWhiteSpace($requestedVcpkgDisableMetrics)) {
+        $env:VCPKG_DISABLE_METRICS = $requestedVcpkgDisableMetrics
+    }
 
     & "$RepoRoot\dep\nuget\nuget.exe" restore $solutionPath
     if ($LASTEXITCODE -ne 0) {
         throw "NuGet restore failed for $solutionPath."
     }
 
-    & "$RepoRoot\dep\nuget\nuget.exe" restore $packagesConfig
+    & "$RepoRoot\dep\nuget\nuget.exe" restore $packagesConfig `
+        -PackagesDirectory $packagesDirectory `
+        -ConfigFile $nugetConfig `
+        -NonInteractive
     if ($LASTEXITCODE -ne 0) {
         throw "NuGet restore failed for $packagesConfig."
     }
 
+    # Release packages must use the repository's canonical drivers. They
+    # serialize the large C++/WinRT PCH builds, prebuild generated-header and
+    # WinMD producers, and refresh glob-based package inputs. Keeping those
+    # invariants in one place avoids a second, subtly different package graph
+    # in this installer script.
+    $buildDriver = switch ("$PlatformName/$ConfigurationName") {
+        'x64/Release' { Join-Path $RepoRoot '_build_msix_x64.cmd' }
+        'ARM64/Release' { Join-Path $RepoRoot '_build_msix_arm64.cmd' }
+        default { $null }
+    }
+
+    if ($buildDriver) {
+        & "$env:SystemRoot\System32\cmd.exe" /d /c $buildDriver
+        if ($LASTEXITCODE -ne 0) {
+            throw "Terminal package driver failed: $buildDriver."
+        }
+        return
+    }
+
+    # Debug and x86 remain supported for development. Keep their fallback
+    # deterministic and memory-bounded as well.
     & msbuild.exe $packageProject `
         "/p:Platform=$PlatformName" `
         "/p:Configuration=$ConfigurationName" `
@@ -380,7 +510,10 @@ function Build-TerminalPackage {
         '/p:WindowsTerminalBranding=Dev' `
         '/p:GenerateAppxPackageOnBuild=true' `
         '/p:AppxBundle=Never' `
-        /m `
+        '/p:MultiProcessorCompilation=false' `
+        '/p:CL_MPCount=1' `
+        '/m:1' `
+        '/nodeReuse:false' `
         /nologo
     if ($LASTEXITCODE -ne 0) {
         throw "msbuild failed for $packageProject."
@@ -392,16 +525,25 @@ $destinationRoot = Resolve-AbsolutePath -Path $Destination
 $appPackagesRoot = Join-Path $repoRoot 'src\cascadia\CascadiaPackage\AppPackages'
 $unpackagedScript = Join-Path $repoRoot 'build\scripts\New-UnpackagedTerminalDistribution.ps1'
 $installerScript = Join-Path $repoRoot 'installer\install-local-terminal.ps1'
+$uninstallerScript = Join-Path $repoRoot 'installer\uninstall-local-terminal.ps1'
+$comRegistrationScript = Join-Path $repoRoot 'installer\ComProxyRegistration.ps1'
 $installerCmd = Join-Path $repoRoot 'installer\install.cmd'
 $installerBootstrapManifest = Join-Path $repoRoot 'installer\bootstrap\Cargo.toml'
 $plannerPromptTemplate = Join-Path $repoRoot 'tools\wta\prompts\terminal-agent.md'
 $devManifestPath = Join-Path $repoRoot 'src\cascadia\CascadiaPackage\Package-Dev.appxmanifest'
+$protocolManifestPath = Join-Path $repoRoot 'src\cascadia\TerminalProtocol\protocol-version.json'
 
 if (-not (Test-Path $unpackagedScript -PathType Leaf)) {
     throw "Could not find $unpackagedScript."
 }
 if (-not (Test-Path $installerScript -PathType Leaf)) {
     throw "Could not find $installerScript."
+}
+if (-not (Test-Path $uninstallerScript -PathType Leaf)) {
+    throw "Could not find $uninstallerScript."
+}
+if (-not (Test-Path $comRegistrationScript -PathType Leaf)) {
+    throw "Could not find $comRegistrationScript."
 }
 if (-not (Test-Path $installerCmd -PathType Leaf)) {
     throw "Could not find $installerCmd."
@@ -415,12 +557,67 @@ if (-not (Test-Path $plannerPromptTemplate -PathType Leaf)) {
 if (-not (Test-Path $devManifestPath -PathType Leaf)) {
     throw "Could not find $devManifestPath."
 }
+if (-not (Test-Path $protocolManifestPath -PathType Leaf)) {
+    throw "Could not find $protocolManifestPath."
+}
 
 $expectedManifestIdentity = Get-AppxManifestIdentity -ManifestPath $devManifestPath
 
 Ensure-Directory -Path $destinationRoot
 
+$usingExplicitPrebuiltTerminal = -not [string]::IsNullOrWhiteSpace($TerminalMsix)
+if (-not $BuildTerminal -and -not $usingExplicitPrebuiltTerminal) {
+    Write-Status "Building Terminal package by default so protocol components come from one source state ..."
+    $BuildTerminal = $true
+}
+if ($BuildTerminal -and $usingExplicitPrebuiltTerminal) {
+    throw 'Choose either -BuildTerminal or -TerminalMsix, not both.'
+}
+if ($usingExplicitPrebuiltTerminal -and -not $AllowPrebuiltTerminal) {
+    throw 'Using a prebuilt Terminal package requires -AllowPrebuiltTerminal. Its packaged protocol manifest will still be verified.'
+}
+
+$cargoPath = Find-CargoPath
+$rustTarget = Get-RustTarget -PlatformName $Platform
+$installedTargets = @(Get-InstalledRustTargets)
+
+if ($installedTargets.Count -gt 0 -and $installedTargets -notcontains $rustTarget) {
+    throw "Rust target $rustTarget is not installed. Install it with rustup target add $rustTarget."
+}
+
+# CascadiaPackage intentionally fail-closes unless the exact architecture and
+# Cargo profile binaries already exist. Build (or resolve) WTA before invoking
+# the package graph so the MSIX and the final bootstrap installer consume the
+# same wta.exe/wta-node.exe pair.
+if ($SkipWtaBuild) {
+    if (-not $WtaExePath) {
+        throw 'Use -WtaExePath when -SkipWtaBuild is set.'
+    }
+    $resolvedWtaExePath = Resolve-AbsolutePath -Path $WtaExePath
+} else {
+    Write-Status "Building wta.exe for $rustTarget with a static CRT ..."
+    $manifestPath = Join-Path $repoRoot 'tools\wta\Cargo.toml'
+    Invoke-RustBuild -CargoPath $cargoPath -ManifestPath $manifestPath -RustTarget $rustTarget -RepoRoot $repoRoot
+    $resolvedWtaExePath = Join-Path $repoRoot ("tools\wta\target\{0}\release\wta.exe" -f $rustTarget)
+}
+
+if (-not (Test-Path $resolvedWtaExePath -PathType Leaf)) {
+    throw "wta.exe not found: $resolvedWtaExePath"
+}
+
+$resolvedWtaNodeExePath = Join-Path (Split-Path -Parent $resolvedWtaExePath) 'wta-node.exe'
+if (-not (Test-Path $resolvedWtaNodeExePath -PathType Leaf)) {
+    throw "wta-node.exe not found beside wta.exe: $resolvedWtaNodeExePath"
+}
+
 if ($BuildTerminal) {
+    $expectedWtaDirectory = Join-Path $repoRoot ("tools\wta\target\{0}\release" -f $rustTarget)
+    $expectedWtaExePath = Join-Path $expectedWtaDirectory 'wta.exe'
+    $expectedWtaNodeExePath = Join-Path $expectedWtaDirectory 'wta-node.exe'
+    if ([System.IO.Path]::GetFullPath($resolvedWtaExePath) -ne [System.IO.Path]::GetFullPath($expectedWtaExePath) -or
+        [System.IO.Path]::GetFullPath($resolvedWtaNodeExePath) -ne [System.IO.Path]::GetFullPath($expectedWtaNodeExePath)) {
+        throw "A source-built Terminal package requires the exact WTA pair under $expectedWtaDirectory. Build WTA normally or point -WtaExePath at that exact target output."
+    }
     Build-TerminalPackage -RepoRoot $repoRoot -PlatformName $Platform -ConfigurationName $Configuration
 }
 
@@ -448,14 +645,6 @@ $installerVersion = $packageIdentity.Version
 
 if ($BuildTerminal -and $installerVersion -ne $expectedManifestIdentity.Version) {
     throw "Built package version $installerVersion does not match source manifest version $($expectedManifestIdentity.Version). Refusing to package a stale MSIX."
-}
-
-$cargoPath = Find-CargoPath
-$rustTarget = Get-RustTarget -PlatformName $Platform
-$installedTargets = Get-InstalledRustTargets
-
-if ($installedTargets.Count -gt 0 -and $installedTargets -notcontains $rustTarget) {
-    throw "Rust target $rustTarget is not installed. Install it with rustup target add $rustTarget."
 }
 
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -490,40 +679,35 @@ if (-not (Test-Path $unpackagedZipPath -PathType Leaf)) {
 Write-Status "Expanding unpackaged Terminal layout ..."
 Expand-Archive -Path $unpackagedZipPath -DestinationPath $payloadExtractRoot -Force
 $payloadRoot = Get-SingleChildDirectoryOrSelf -RootPath $payloadExtractRoot
-
-if ($SkipWtaBuild) {
-    if (-not $WtaExePath) {
-        throw 'Use -WtaExePath when -SkipWtaBuild is set.'
-    }
-    $resolvedWtaExePath = Resolve-AbsolutePath -Path $WtaExePath
-} else {
-    Write-Status "Building wta.exe for $rustTarget with a static CRT ..."
-    $manifestPath = Join-Path $repoRoot 'tools\wta\Cargo.toml'
-    Invoke-RustBuild -CargoPath $cargoPath -ManifestPath $manifestPath -RustTarget $rustTarget -RepoRoot $repoRoot
-    $resolvedWtaExePath = Join-Path $repoRoot ("tools\wta\target\{0}\release\wta.exe" -f $rustTarget)
-}
-
-if (-not (Test-Path $resolvedWtaExePath -PathType Leaf)) {
-    throw "wta.exe not found: $resolvedWtaExePath"
-}
+$payloadProtocol = Assert-PayloadProtocolManifest -PayloadRoot $payloadRoot -SourceManifestPath $protocolManifestPath
+Assert-PayloadNativeRuntime -PayloadRoot $payloadRoot
 
 Write-Status "Injecting wta.exe into the unpackaged payload ..."
 Copy-Item -Path $resolvedWtaExePath -Destination (Join-Path $payloadRoot 'wta.exe') -Force
+Write-Status "Injecting the native wta-node.exe runtime ..."
+Copy-Item -Path $resolvedWtaNodeExePath -Destination (Join-Path $payloadRoot 'wta-node.exe') -Force
 
-# wtcli.exe is built by MSBuild (C++) alongside the Terminal.  wta.exe discovers
-# it as a sibling, so it must be co-located in the installed layout.
-$wtcliSource = Join-Path $repoRoot ("bin\{0}\{1}\wtcli\wtcli.exe" -f $Platform, $Configuration)
-if (Test-Path $wtcliSource -PathType Leaf) {
-    Write-Status "Injecting wtcli.exe into the unpackaged payload ..."
-    Copy-Item -Path $wtcliSource -Destination (Join-Path $payloadRoot 'wtcli.exe') -Force
-} else {
-    Write-Warning "wtcli.exe not found at $wtcliSource — autofix and protocol features will not work."
+$linuxNodePath = Join-Path $repoRoot 'tools\wta\remote\linux-x64\wta-node'
+if (Test-Path $linuxNodePath -PathType Leaf) {
+    Write-Status "Injecting the verified Linux x64 wta-node runtime ..."
+    Copy-Item -Path $linuxNodePath -Destination (Join-Path $payloadRoot 'wta-node-linux-x64') -Force
 }
+
+# wtcli.exe is a protocol component and must stay byte-for-byte identical to
+# the copy built into the selected Terminal MSIX. Never replace it from the
+# repository's bin directory: that was the source of server=2.4/client=3.0
+# installations when a stale MSIX was combined with a current incremental
+# wtcli build.
+$packagedWtcli = Join-Path $payloadRoot 'wtcli.exe'
+Write-Status "Keeping MSIX-built wtcli.exe paired with its Terminal protocol server."
 
 $payloadPromptDir = Join-Path $payloadRoot 'prompts'
 Ensure-Directory -Path $payloadPromptDir
 Write-Status "Injecting planner prompt template into the payload ..."
 Copy-Item -Path $plannerPromptTemplate -Destination (Join-Path $payloadPromptDir 'terminal-agent.default.md') -Force
+Write-Status 'Injecting uninstall and COM registration support into the payload ...'
+Copy-Item -Path $uninstallerScript -Destination (Join-Path $payloadRoot 'uninstall-local-terminal.ps1') -Force
+Copy-Item -Path $comRegistrationScript -Destination (Join-Path $payloadRoot 'ComProxyRegistration.ps1') -Force
 
 $payloadMetadata = [ordered]@{
     productName = 'Intelligent Terminal'
@@ -533,6 +717,19 @@ $payloadMetadata = [ordered]@{
     processorArchitecture = $packageIdentity.ProcessorArchitecture
     platform = $Platform
     configuration = $Configuration
+    protocolVersion = $payloadProtocol.protocolVersion
+    componentVersion = $payloadProtocol.componentVersion
+    components = [ordered]@{
+        windowsTerminalSha256 = (Get-FileHash (Join-Path $payloadRoot 'WindowsTerminal.exe') -Algorithm SHA256).Hash
+        wtcliSha256 = (Get-FileHash $packagedWtcli -Algorithm SHA256).Hash
+        wtaSha256 = (Get-FileHash (Join-Path $payloadRoot 'wta.exe') -Algorithm SHA256).Hash
+        wtaNodeWindowsSha256 = (Get-FileHash (Join-Path $payloadRoot 'wta-node.exe') -Algorithm SHA256).Hash
+        wtaNodeLinuxX64Sha256 = if (Test-Path (Join-Path $payloadRoot 'wta-node-linux-x64')) {
+            (Get-FileHash (Join-Path $payloadRoot 'wta-node-linux-x64') -Algorithm SHA256).Hash
+        } else {
+            $null
+        }
+    }
     createdAtUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 $payloadMetadataPath = Join-Path $payloadRoot 'intelligent-terminal-install-metadata.json'
@@ -549,6 +746,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Copy-Item -Path $installerScript -Destination (Join-Path $installerSourceRoot 'install-local-terminal.ps1') -Force
+Copy-Item -Path $comRegistrationScript -Destination (Join-Path $installerSourceRoot 'ComProxyRegistration.ps1') -Force
 Copy-Item -Path $installerCmd -Destination (Join-Path $installerSourceRoot 'install.cmd') -Force
 Copy-Item -Path $payloadZip -Destination (Join-Path $installerSourceRoot 'payload.zip') -Force
 

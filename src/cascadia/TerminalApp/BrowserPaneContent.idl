@@ -1,0 +1,21 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+import "IPaneContent.idl";
+
+namespace TerminalApp
+{
+    [default_interface] runtimeclass BrowserPaneContent : Windows.UI.Xaml.Controls.UserControl,
+                                                          IPaneContent
+    {
+        BrowserPaneContent();
+        void Initialize(UInt64 ownerHwnd,
+                        String browserRecordId,
+                        String surfaceSessionId,
+                        String userDataFolder,
+                        UInt16 proxyPort,
+                        String initialUrl);
+        String BrowserRecordId { get; };
+        String SurfaceSessionId { get; };
+    }
+}

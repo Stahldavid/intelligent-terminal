@@ -12,7 +12,7 @@ use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
 
 use super::popup;
 use crate::app::{App, AvailableAgent};
-use crate::commands::{CommandSpec, MovePositionSpec, REGISTRY};
+use crate::commands::{CommandCandidate, MovePositionSpec, REGISTRY};
 use crate::theme;
 
 const POPUP_MAX_VISIBLE: usize = 6;
@@ -31,7 +31,7 @@ pub struct PopupState<'a> {
 }
 
 pub enum PopupCandidates<'a> {
-    Commands(Cow<'a, [&'static CommandSpec]>),
+    Commands(Cow<'a, [CommandCandidate]>),
     MovePositions(&'a [&'static MovePositionSpec]),
     Agents(Vec<&'a AvailableAgent>),
 }
@@ -58,14 +58,19 @@ pub fn render_popup(frame: &mut Frame, state: PopupState<'_>, input_area: Rect) 
     let items: Vec<ListItem> = match &state.candidates {
         PopupCandidates::Commands(candidates) => candidates
             .iter()
-            .map(|spec| {
+            .map(|candidate| {
+                let name = candidate.display_name();
                 let mut spans = vec![
-                    Span::styled(format!(" /{:<8} ", spec.name), theme::INPUT_TEXT),
-                    Span::styled(spec.summary(), theme::DIM),
+                    Span::styled(format!(" /{:<18} ", name), theme::INPUT_TEXT),
+                    Span::styled(format!("[{}] ", candidate.source()), theme::DIM),
+                    Span::styled(candidate.summary(), theme::DIM),
                 ];
                 // The `/model` row shows the pane's current model so the user can
                 // see what they're on before opening the picker.
-                if spec.name == "model" {
+                if matches!(
+                    candidate,
+                    CommandCandidate::Local(spec) if spec.name == "model"
+                ) {
                     if let Some(model) = state.current_model.as_deref() {
                         spans.push(Span::styled("  → ", theme::DIM));
                         spans.push(Span::styled(model, theme::INPUT_TEXT));
@@ -78,10 +83,7 @@ pub fn render_popup(frame: &mut Frame, state: PopupState<'_>, input_area: Rect) 
             .iter()
             .map(|position| {
                 ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!(" /move {:<6} ", position.name),
-                        theme::INPUT_TEXT,
-                    ),
+                    Span::styled(format!(" /move {:<6} ", position.name), theme::INPUT_TEXT),
                     Span::styled(format!("({})", position.alias), theme::DIM),
                 ]))
             })
@@ -118,10 +120,7 @@ pub fn render_popup(frame: &mut Frame, state: PopupState<'_>, input_area: Rect) 
 /// needs no special handling here — the App pre-filters the candidate list to
 /// just `/restart`, so the normal clamp lands on it. Pure so it can be
 /// unit-tested without a render frame.
-pub(crate) fn popup_highlight(
-    candidate_count: usize,
-    selected: usize,
-) -> Option<usize> {
+pub(crate) fn popup_highlight(candidate_count: usize, selected: usize) -> Option<usize> {
     if candidate_count == 0 {
         return None;
     }
@@ -140,9 +139,22 @@ pub fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         theme::DIM,
     )))
     .chain(std::iter::once(Line::default()))
+    .chain(
+        app.current_tab()
+            .available_agent_commands
+            .iter()
+            .map(|spec| {
+                Line::from(vec![
+                    Span::styled(format!("  /{:<18}  ", spec.name), theme::INPUT_TEXT),
+                    Span::styled("[Agent] ", theme::DIM),
+                    Span::styled(spec.description.clone(), theme::DIM),
+                ])
+            }),
+    )
     .chain(REGISTRY.iter().map(|spec| {
         Line::from(vec![
-            Span::styled(format!("  /{:<8}  ", spec.name), theme::INPUT_TEXT),
+            Span::styled(format!("  /terminal:{:<9}  ", spec.name), theme::INPUT_TEXT),
+            Span::styled("[Terminal] ", theme::DIM),
             Span::styled(spec.summary(), theme::DIM),
         ])
     }))
@@ -173,10 +185,10 @@ pub fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::popup_highlight;
-    use crate::commands;
+    use crate::commands::{self, CommandCandidate};
 
-    fn spec(name: &str) -> &'static commands::CommandSpec {
-        commands::lookup(name).expect("registered command")
+    fn spec(name: &str) -> CommandCandidate {
+        CommandCandidate::Local(commands::lookup(name).expect("registered command"))
     }
 
     #[test]

@@ -16,6 +16,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$comRegistrationScript = Join-Path $PSScriptRoot 'ComProxyRegistration.ps1'
+if (-not (Test-Path -LiteralPath $comRegistrationScript -PathType Leaf)) {
+    throw "COM registration helper not found: $comRegistrationScript"
+}
+. $comRegistrationScript
+
 $PromptConfigDir = Join-Path $env:LOCALAPPDATA 'IntelligentTerminal\prompts'
 $PromptUserPath = Join-Path $PromptConfigDir 'terminal-agent.md'
 $PromptDefaultPath = Join-Path $PromptConfigDir 'terminal-agent.default.md'
@@ -42,12 +48,55 @@ function Ensure-Directory {
     }
 }
 
-function Remove-DirectoryContents {
-    param([string]$Path)
+function Get-Sha256Hash {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
 
-    if (Test-Path $Path -PathType Container) {
-        Get-ChildItem $Path -Force | Remove-Item -Recurse -Force
+    # Use the BCL directly. Get-FileHash is module-backed in Windows
+    # PowerShell and is not guaranteed to autoload in a stripped installer
+    # process.
+    $stream = [System.IO.File]::OpenRead($Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant()
     }
+    finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Remove-DirectoryContents {
+    param(
+        [string]$Path,
+        [string[]]$ExcludeNames = @()
+    )
+
+    if (-not (Test-Path $Path -PathType Container)) {
+        return
+    }
+
+    # A just-terminated WinUI/WebView process can retain image mappings for a
+    # short time after its process object disappears. Treat that as a bounded
+    # transient rather than leaving an upgrade half-installed.
+    $deadline = (Get-Date).AddSeconds(10)
+    do {
+        try {
+            Get-ChildItem $Path -Force |
+                Where-Object { $_.Name -notin $ExcludeNames } |
+                Remove-Item -Recurse -Force
+            return
+        }
+        catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+            if ((Get-Date) -ge $deadline) {
+                throw
+            }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    while ($true)
 }
 
 function Add-InstallDirToUserPath {
@@ -186,7 +235,20 @@ function Get-ExecutablePathWithinInstallDir {
 function Get-RunningInstalledProcesses {
     param([string]$InstallRoot)
 
-    $candidates = Get-CimInstance Win32_Process -Filter "Name = 'WindowsTerminal.exe' OR Name = 'wta.exe'" -ErrorAction SilentlyContinue
+    # Query every executable shipped by the product that can outlive the UI.
+    # Path validation below is the actual ownership boundary, so identically
+    # named processes from Windows Terminal or another checkout are untouched.
+    $processNames = @(
+        'WindowsTerminal.exe',
+        'OpenConsole.exe',
+        'wta.exe',
+        'wta-node.exe',
+        'wtcli.exe',
+        'wtai.exe',
+        'elevate-shim.exe'
+    )
+    $filter = ($processNames | ForEach-Object { "Name = '$_'" }) -join ' OR '
+    $candidates = Get-CimInstance Win32_Process -Filter $filter -ErrorAction SilentlyContinue
     $running = @()
 
     foreach ($candidate in $candidates) {
@@ -288,6 +350,8 @@ if (-not (Test-Path $PayloadZip -PathType Leaf)) {
 
 $payloadRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("intelligent-terminal-install-" + [Guid]::NewGuid().ToString("N"))
 $expandedRoot = Join-Path $payloadRoot 'expanded'
+$settingsBackup = $null
+$settingsRestorePending = $false
 
 try {
     Ensure-Directory $payloadRoot
@@ -322,26 +386,63 @@ try {
 
     # Preserve user settings across upgrades.
     $settingsDir = Join-Path $InstallDir 'settings'
-    $settingsBackup = $null
     if (Test-Path $settingsDir -PathType Container) {
         $settingsBackup = Join-Path ([System.IO.Path]::GetTempPath()) "intelligent-terminal-settings-backup-$([System.IO.Path]::GetRandomFileName())"
         Copy-Item -Path $settingsDir -Destination $settingsBackup -Recurse -Force
+        $settingsRestorePending = $true
         Write-Status "Backed up settings to $settingsBackup"
     }
 
-    Remove-DirectoryContents $InstallDir
-    Copy-Item -Path (Join-Path $sourceRoot '*') -Destination $InstallDir -Recurse -Force
+    # COM proxy/stub DLLs may remain mapped in long-lived clients after the
+    # terminal exits. Never overwrite or delete a mapped proxy in place.
+    # Keep the legacy root copy (if any), install the new proxy under its
+    # content hash, and atomically move COM registration to that immutable path.
+    $proxyFileName = 'OpenConsoleProxy.dll'
+    $proxyStoreName = 'proxies'
+    Remove-DirectoryContents $InstallDir -ExcludeNames @($proxyFileName, $proxyStoreName)
+    Get-ChildItem -Path (Join-Path $sourceRoot '*') -Force |
+        Where-Object { $_.Name -ne $proxyFileName } |
+        Copy-Item -Destination $InstallDir -Recurse -Force
+
+    $incomingComProxy = Join-Path $sourceRoot $proxyFileName
+    if (-not (Test-Path -LiteralPath $incomingComProxy -PathType Leaf)) {
+        throw "Incoming terminal payload is missing $proxyFileName."
+    }
+    $proxyHash = Get-Sha256Hash -Path $incomingComProxy
+    $proxyVersionDir = Join-Path (Join-Path $InstallDir $proxyStoreName) $proxyHash
+    Ensure-Directory $proxyVersionDir
+    $comProxy = Join-Path $proxyVersionDir $proxyFileName
+    if (-not (Test-Path -LiteralPath $comProxy -PathType Leaf)) {
+        Copy-Item -LiteralPath $incomingComProxy -Destination $comProxy
+    }
+    if ((Get-Sha256Hash -Path $comProxy) -ne $proxyHash) {
+        throw "Versioned COM proxy hash mismatch at $comProxy."
+    }
+
+    # Retain a root compatibility copy for tooling that expects the historical
+    # package layout, but never replace it while another process may map it.
+    $legacyRootProxy = Join-Path $InstallDir $proxyFileName
+    if (-not (Test-Path -LiteralPath $legacyRootProxy -PathType Leaf)) {
+        Copy-Item -LiteralPath $incomingComProxy -Destination $legacyRootProxy
+    }
 
     # Restore preserved settings.
     if ($settingsBackup -and (Test-Path $settingsBackup -PathType Container)) {
         Ensure-Directory $settingsDir
         Copy-Item -Path (Join-Path $settingsBackup '*') -Destination $settingsDir -Recurse -Force
+        $settingsRestorePending = $false
         Remove-Item $settingsBackup -Recurse -Force -ErrorAction SilentlyContinue
         Write-Status "Restored user settings"
     }
 
     $terminalExe = Join-Path $InstallDir 'WindowsTerminal.exe'
     $wtaExe = Join-Path $InstallDir 'wta.exe'
+
+    Write-Status 'Registering the version-matched terminal protocol proxy for this user ...'
+    $proxyRegistrations = @(Register-PerUserComProxy -ProxyPath $comProxy)
+    foreach ($proxyRegistration in $proxyRegistrations) {
+        Write-Status ("  {0} -> {1}" -f $proxyRegistration.InterfaceId, $proxyRegistration.ProxyPath)
+    }
 
     if (-not $NoShortcuts) {
         Ensure-Directory $StartMenuDir
@@ -367,6 +468,21 @@ try {
     Write-Status "Installation complete."
 }
 finally {
+    # The settings backup is a transaction journal, not best-effort cleanup.
+    # If any package copy, COM registration or shortcut operation failed after
+    # the backup was taken, restore the user's settings before propagating the
+    # failure. Leave the backup intact if restoration itself cannot complete.
+    if ($settingsRestorePending -and
+        $settingsBackup -and
+        (Test-Path $settingsBackup -PathType Container)) {
+        Ensure-Directory $settingsDir
+        Remove-DirectoryContents $settingsDir
+        Copy-Item -Path (Join-Path $settingsBackup '*') -Destination $settingsDir -Recurse -Force
+        $settingsRestorePending = $false
+        Remove-Item $settingsBackup -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Status "Restored user settings after installation failure"
+    }
+
     if (Test-Path $payloadRoot -PathType Container) {
         Remove-Item $payloadRoot -Recurse -Force -ErrorAction SilentlyContinue
     }

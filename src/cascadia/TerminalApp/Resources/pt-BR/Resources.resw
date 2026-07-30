@@ -756,11 +756,11 @@
     <comment>{locked="{0}"}{0} is the window ID number. Shown in the workspace flyout for windows that have no name assigned.</comment>
   </data>
   <data name="DeleteWorkspaceMenuItem" xml:space="preserve">
-    <value>Excluir workspace?</value>
+    <value>Excluir layout salvo?</value>
     <comment>Menu item text shown in the right-click context menu on a saved workspace</comment>
   </data>
   <data name="OpenWorkspaceMenuItem" xml:space="preserve">
-    <value>Abrir workspace</value>
+    <value>Abrir layout salvo</value>
     <comment>Menu item text for opening a saved workspace</comment>
   </data>
   <data name="ConfirmDeleteWorkspaceTitle" xml:space="preserve">
@@ -768,7 +768,7 @@
     <comment>{locked="{0}"}{0} is the workspace name. Shown as the title of a confirmation dialog when the user tries to delete a saved workspace.</comment>
   </data>
   <data name="ConfirmDeleteWorkspaceBody" xml:space="preserve">
-    <value>Tem certeza de que deseja excluir "{0}"? As sessões associadas a este espaço de trabalho também serão excluídas.</value>
+    <value>Tem certeza de que deseja excluir o layout salvo "{0}"? As sessões associadas também serão excluídas.</value>
     <comment>{locked="{0}"}{0} is the workspace name. Body text of the confirmation dialog shown when the user tries to delete a saved workspace.</comment>
   </data>
   <data name="ConfirmDeleteWorkspaceDelete" xml:space="preserve">
@@ -838,7 +838,7 @@
     <value>Esta janela do Terminal está sendo executada como administrador</value>
   </data>
   <data name="WorkspaceDropdown.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
-    <value>Workspaces</value>
+    <value>Janelas e layouts salvos</value>
   </data>
   <data name="CommandPalette_MatchesAvailable" xml:space="preserve">
     <value>Sugestões encontradas: {0}</value>
@@ -1299,4 +1299,69 @@
     <value>⚠ A política de execução do PowerShell está bloqueando scripts. Detecção de erros desativada.</value>
     <comment>{Locked="PowerShell"}</comment>
   </data>
+  <data name="WorkspaceColorChoose" xml:space="preserve"><value>Alterar cor do workspace</value></data>
+  <data name="RenameWorkspaceText" xml:space="preserve"><value>Renomear workspace</value></data>
+  <data name="DuplicateWorkspaceText" xml:space="preserve"><value>Duplicar workspace</value></data>
+  <data name="SplitActivePaneText" xml:space="preserve"><value>Dividir painel ativo</value></data>
+  <data name="MoveWorkspaceToNewWindowText" xml:space="preserve"><value>Mover workspace para nova janela</value></data>
+  <data name="WorkspaceMoveUp" xml:space="preserve"><value>Mover para cima</value></data>
+  <data name="WorkspaceMoveDown" xml:space="preserve"><value>Mover para baixo</value></data>
+  <data name="WorkspaceMoveSubMenu" xml:space="preserve"><value>Mover workspace</value></data>
+  <data name="WorkspaceCloseBelow" xml:space="preserve"><value>Fechar workspaces abaixo</value></data>
+  <data name="WorkspaceCloseOther" xml:space="preserve"><value>Fechar outros workspaces</value></data>
+  <data name="WorkspaceClose" xml:space="preserve"><value>Fechar workspace</value></data>
+  <data name="ActiveSessionSubMenu" xml:space="preserve"><value>Sessão ativa</value></data>
+  <data name="WorkspaceSidebarTitle.Text" xml:space="preserve"><value>Workspaces</value></data>
+  <data name="WorkspaceSidebarSearchButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Buscar workspace</value></data>
+  <data name="WorkspaceSidebarSearchButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Buscar workspace</value></data>
+  <data name="WorkspaceSidebarNewButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Novo workspace</value></data>
+  <data name="WorkspaceSidebarNewButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Novo workspace</value></data>
+  <data name="WorkspaceSidebarAttentionButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Central de atenção</value></data>
+  <data name="WorkspaceSidebarAttentionButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Abrir central de atenção</value></data>
+  <data name="WorkspaceSidebarFleetButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Agentes e equipes</value></data>
+  <data name="WorkspaceSidebarFleetButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Abrir agentes e equipes</value></data>
+  <data name="WorkspaceFleetTitle" xml:space="preserve"><value>Agentes e equipes</value></data>
+  <data name="WorkspaceFleetDescription" xml:space="preserve"><value>Selecione um agente para focar o terminal dele. A coordenação de equipes fica aqui; o chat sempre acompanha o terminal focado.</value></data>
+  <data name="WorkspaceFleetEmpty" xml:space="preserve"><value>Nenhum terminal declarativo de agente está ativo. Crie ou componha um workspace para iniciar um layout nativo de agentes.</value></data>
+  <data name="WorkspaceSidebarCollapseButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Recolher sidebar de workspaces (Ctrl+Shift+B)</value></data>
+  <data name="WorkspaceSidebarSearch.PlaceholderText" xml:space="preserve"><value>Buscar workspace</value></data>
+  <data name="WorkspaceSidebarSearch.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Buscar workspace</value></data>
+  <data name="WorkspaceSidebarRecentButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Mostrar workspaces fechados recentemente</value></data>
+  <data name="WorkspaceSidebarRecentLabel.Text" xml:space="preserve"><value>Fechados recentemente</value></data>
+  <data name="WorkspaceSidebarGitButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Status e diff do Git</value></data>
+  <data name="WorkspaceSidebarGitButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Abrir visão Git do workspace</value></data>
+  <data name="WorkspaceSidebarDoctorButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Diagnóstico do workspace</value></data>
+  <data name="WorkspaceSidebarDoctorButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Executar diagnóstico do workspace</value></data>
+  <data name="WorkspaceSidebarRefreshButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Atualizar metadados dos workspaces</value></data>
+  <data name="WorkspaceSidebarRevealButton.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve"><value>Mostrar sidebar de workspaces (Ctrl+Shift+B)</value></data>
+  <data name="SurfaceNewTabToolTip" xml:space="preserve"><value>Nova aba de terminal neste painel (Ctrl+Alt+T)</value></data>
+  <data name="SurfaceNewTabWithProfileHelpText" xml:space="preserve"><value>Pressione o botão principal para duplicar o terminal atual. Abra o menu para escolher outro perfil (Ctrl+Alt+Shift+T).</value></data>
+  <data name="SurfaceNewWithProfileHeader" xml:space="preserve"><value>NOVA SUPERFÍCIE · ESCOLHA O PERFIL</value></data>
+  <data name="SurfaceNoProfilesAvailable" xml:space="preserve"><value>Nenhum perfil de terminal está disponível</value></data>
+  <data name="SurfaceMoveLeft" xml:space="preserve"><value>Mover aba para a esquerda</value></data>
+  <data name="SurfaceMoveRight" xml:space="preserve"><value>Mover aba para a direita</value></data>
+  <data name="SurfaceCloseOther" xml:space="preserve"><value>Fechar outras abas deste painel</value></data>
+  <data name="SurfaceClose" xml:space="preserve"><value>Fechar aba de terminal</value></data>
+  <data name="AgentFollowingContextPrefix" xml:space="preserve"><value>Seguindo</value></data>
+  <data name="AgentActiveContextAutomationName" xml:space="preserve"><value>Contexto ativo do agente: {0}</value></data>
+  <data name="NativeChatRetryButton.Content" xml:space="preserve"><value>Tentar novamente</value></data>
+  <data name="NativeChatRetryButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Tentar reconectar o agente</value></data>
+  <data name="NativePermissionTitle.Text" xml:space="preserve"><value>Permissão necessária</value></data>
+  <data name="NativeChatComposer.PlaceholderText" xml:space="preserve"><value>Envie uma mensagem ao agente</value></data>
+  <data name="NativeChatComposer.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Mensagem para o agente</value></data>
+  <data name="NativeChatCancelButton.Content" xml:space="preserve"><value>Cancelar</value></data>
+  <data name="NativeChatCancelButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Cancelar resposta atual do agente</value></data>
+  <data name="NativeChatSendButton.Content" xml:space="preserve"><value>Enviar</value></data>
+  <data name="NativeChatSendButton.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Enviar mensagem ao agente</value></data>
+  <data name="NativeChatPlanLabel" xml:space="preserve"><value>Plano</value></data>
+  <data name="NativeChatYouLabel" xml:space="preserve"><value>Você</value></data>
+  <data name="NativeChatAgentLabel" xml:space="preserve"><value>Agente</value></data>
+  <data name="NativeChatCompletedTurnLabel" xml:space="preserve"><value>Turno concluído</value></data>
+  <data name="NativeChatErrorLabel" xml:space="preserve"><value>Erro</value></data>
+  <data name="NativeChatStatusConnectionLabel" xml:space="preserve"><value>Conexão</value></data>
+  <data name="NativeChatStatusAgentLabel" xml:space="preserve"><value>Agente</value></data>
+  <data name="NativeChatStatusModelLabel" xml:space="preserve"><value>Modelo</value></data>
+  <data name="NativeChatStatusSessionLabel" xml:space="preserve"><value>Sessão</value></data>
+  <data name="NativeChatStatusCwdLabel" xml:space="preserve"><value>Diretório</value></data>
+  <data name="NativeChatStatusPermissionsLabel" xml:space="preserve"><value>Permissões</value></data>
 </root>

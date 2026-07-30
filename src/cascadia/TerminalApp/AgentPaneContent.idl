@@ -33,6 +33,21 @@ namespace TerminalApp
         // this back via the active tab when refreshing the bar.
         void SetAgentPanePosition(String position);
 
+        // Updates the native "following" context shown above the ACP
+        // conversation whenever the focused workspace/pane/surface changes.
+        void UpdateFocusContext(String workspace,
+                                String pane,
+                                String surface,
+                                String profile,
+                                String cwd);
+
+        // Applies an immutable WTA chat snapshot to the native XAML body.
+        void ApplyNativeChatSnapshot(String eventJson);
+
+        // Raised for submit/cancel/retry/permission actions from the native
+        // body. The String is a compact JSON params object routed back to WTA.
+        event Windows.Foundation.TypedEventHandler<AgentPaneContent, String> NativeChatAction;
+
         // Raised whenever cached bottom-bar-affecting state changes (autofix
         // state, sessions-view flag, agent-position). The outer page
         // subscribes to refresh the window-level bottom bar when the firing

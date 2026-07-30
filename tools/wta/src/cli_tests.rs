@@ -1,5 +1,10 @@
 use super::*;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+
+#[test]
+fn complete_cli_tree_has_no_duplicate_flags_or_aliases() {
+    Cli::command().debug_assert();
+}
 
 // Plan-C boot-time initial-load flags: WT bundles a session resume
 // with helper spawn by passing `--initial-load-session-id` (and
@@ -42,10 +47,7 @@ fn cli_parses_per_tab_wsl_agent_source() {
     .expect("WSL source flags must parse");
     assert_eq!(cli.agent_source.as_deref(), Some("wsl"));
     assert_eq!(cli.agent_wsl_distro.as_deref(), Some("Ubuntu"));
-    assert_eq!(
-        cli.agent_source_cwd.as_deref(),
-        Some("/home/user/project")
-    );
+    assert_eq!(cli.agent_source_cwd.as_deref(), Some("/home/user/project"));
 }
 
 #[test]
@@ -74,6 +76,33 @@ fn cli_parses_owner_tab_and_window_identity() {
 }
 
 #[test]
+fn first_window_id_accepts_numeric_protocol_ids() {
+    let result = serde_json::json!({
+        "windows": [{
+            "window_id": 1,
+            "title": "<unnamed window>"
+        }]
+    });
+
+    assert_eq!(
+        first_window_id_from_result(&result).unwrap(),
+        "1",
+        "WT protocol IDs may be emitted as JSON numbers"
+    );
+}
+
+#[test]
+fn first_window_id_accepts_string_protocol_ids() {
+    let result = serde_json::json!({
+        "windows": [{
+            "window_id": "window-guid"
+        }]
+    });
+
+    assert_eq!(first_window_id_from_result(&result).unwrap(), "window-guid");
+}
+
+#[test]
 fn sessions_list_cli_parses_json_and_master_override() {
     let cli = Cli::try_parse_from([
         "wta",
@@ -87,7 +116,9 @@ fn sessions_list_cli_parses_json_and_master_override() {
 
     assert!(cli.json);
     match cli.command {
-        Some(Command::Sessions { action: SessionsAction::List { master, origin } }) => {
+        Some(Command::Sessions {
+            action: SessionsAction::List { master, origin },
+        }) => {
             assert_eq!(master.as_deref(), Some(r"\\.\pipe\wta-master-test"));
             // Default keeps the historical debug behavior — show
             // every origin. MVP sessions picker has its own default in
@@ -105,12 +136,11 @@ fn sessions_list_cli_parses_origin_shell() {
     let cli = Cli::try_parse_from(["wta", "sessions", "list", "--origin", "shell"])
         .expect("sessions list --origin shell parses");
     match cli.command {
-        Some(Command::Sessions { action: SessionsAction::List { origin, .. } }) => {
+        Some(Command::Sessions {
+            action: SessionsAction::List { origin, .. },
+        }) => {
             assert_eq!(origin, SessionsOriginArg::Shell);
-            assert_eq!(
-                origin.to_filter(),
-                agent_sessions::OriginFilter::ShellOnly,
-            );
+            assert_eq!(origin.to_filter(), agent_sessions::OriginFilter::ShellOnly,);
         }
         other => panic!("expected sessions list command, got {other:?}"),
     }
@@ -121,7 +151,9 @@ fn sessions_list_cli_parses_origin_agent_pane() {
     let cli = Cli::try_parse_from(["wta", "sessions", "list", "--origin", "agent-pane"])
         .expect("sessions list --origin agent-pane parses");
     match cli.command {
-        Some(Command::Sessions { action: SessionsAction::List { origin, .. } }) => {
+        Some(Command::Sessions {
+            action: SessionsAction::List { origin, .. },
+        }) => {
             assert_eq!(origin, SessionsOriginArg::AgentPane);
             assert_eq!(
                 origin.to_filter(),
@@ -173,10 +205,19 @@ fn sessions_table_prints_header_and_rows() {
     // operator can tell "legacy / unclassified" from "shell".
     assert!(out.contains("ORIGIN"));
     let body = out.lines().nth(1).expect("body row present");
-    assert!(body.contains(" - "), "untagged origin renders as '-' got: {body}");
+    assert!(
+        body.contains(" - "),
+        "untagged origin renders as '-' got: {body}"
+    );
     // Leading 1-based index column.
-    assert!(out.lines().next().expect("header").starts_with("#"), "header has # column");
-    assert!(body.starts_with("1"), "first row is numbered 1, got: {body}");
+    assert!(
+        out.lines().next().expect("header").starts_with("#"),
+        "header has # column"
+    );
+    assert!(
+        body.starts_with("1"),
+        "first row is numbered 1, got: {body}"
+    );
 }
 
 #[test]
@@ -194,7 +235,10 @@ fn sessions_table_renders_origin_labels() {
 
     let out = format_sessions_table(&[shell, pane]);
     assert!(out.contains("Shell"), "shell origin label present: {out}");
-    assert!(out.contains("AgentPane"), "agent-pane origin label present: {out}");
+    assert!(
+        out.contains("AgentPane"),
+        "agent-pane origin label present: {out}"
+    );
 }
 
 #[test]
@@ -208,12 +252,17 @@ fn sessions_table_renders_location_labels() {
         agent_client_protocol::schema::v1::SessionId::new("sid-wsl"),
         std::path::PathBuf::from("/home/u"),
     );
-    wsl.location = agent_sessions::SessionLocation::Wsl { distro: "Ubuntu".into() };
+    wsl.location = agent_sessions::SessionLocation::Wsl {
+        distro: "Ubuntu".into(),
+    };
 
     let out = format_sessions_table(&[host, wsl]);
     assert!(out.contains("LOCATION"), "LOCATION header present: {out}");
     assert!(out.contains("host"), "host location label present: {out}");
-    assert!(out.contains("wsl:Ubuntu"), "wsl distro label present: {out}");
+    assert!(
+        out.contains("wsl:Ubuntu"),
+        "wsl distro label present: {out}"
+    );
 }
 
 #[test]
@@ -330,13 +379,9 @@ fn process_label_subcommands() {
     let probe = Cli::try_parse_from(["wta", "probe-models", "--agent", "copilot"]).unwrap();
     assert_eq!(process_label(&probe), "probe");
 
-    let probe_sources = Cli::try_parse_from([
-        "wta",
-        "probe-agent-sources",
-        "--wsl-distro",
-        "Ubuntu-24.04",
-    ])
-    .unwrap();
+    let probe_sources =
+        Cli::try_parse_from(["wta", "probe-agent-sources", "--wsl-distro", "Ubuntu-24.04"])
+            .unwrap();
     assert_eq!(process_label(&probe_sources), "probe");
     assert!(Cli::try_parse_from(["wta", "probe-agent-sources"]).is_err());
 
@@ -472,14 +517,20 @@ fn wsl_agent_probe_script_prints_command_v_resolution() {
     // returns empty for snap apps. sh_quote single-quotes the exe.
     assert_eq!(
         crate::agent_check::wsl_agent_probe_script("copilot"),
-        "printf '__WTA_PROBE_BEGIN__\\n'; command -v 'copilot' 2>/dev/null; \
-         printf '__WTA_PROBE_END__\\n'"
+        format!(
+            "{} printf '__WTA_PROBE_BEGIN__\\n'; command -v 'copilot' 2>/dev/null; \
+             printf '__WTA_PROBE_END__\\n'",
+            crate::agent_check::wsl_portable_node_path_prelude()
+        )
     );
     // An agent identity with shell metacharacters stays contained in the quotes.
     assert_eq!(
         crate::agent_check::wsl_agent_probe_script("my agent; rm -rf /"),
-        "printf '__WTA_PROBE_BEGIN__\\n'; command -v 'my agent; rm -rf /' 2>/dev/null; \
-         printf '__WTA_PROBE_END__\\n'"
+        format!(
+            "{} printf '__WTA_PROBE_BEGIN__\\n'; command -v 'my agent; rm -rf /' 2>/dev/null; \
+             printf '__WTA_PROBE_END__\\n'",
+            crate::agent_check::wsl_portable_node_path_prelude()
+        )
     );
 }
 
@@ -498,4 +549,33 @@ fn delegate_launchable_for_target_ors_host_and_wsl() {
     // Launchable on the host is always launchable, regardless of WSL.
     assert!(delegate_launchable_for_target(true, false));
     assert!(delegate_launchable_for_target(true, true));
+}
+
+#[test]
+fn cli_parses_declarative_workspace_surface() {
+    let plan = Cli::try_parse_from(["wta", "aw", "plan", "demo.yaml"]).unwrap();
+    assert!(matches!(
+        plan.command,
+        Some(Command::AgentWorkspace {
+            action: WorkspaceAction::Plan { manifest }
+        }) if manifest == std::path::PathBuf::from("demo.yaml")
+    ));
+
+    let send = Cli::try_parse_from([
+        "wta",
+        "agent-workspace",
+        "send",
+        "--name",
+        "feature",
+        "--target",
+        "builder",
+        "review this",
+    ])
+    .unwrap();
+    assert!(matches!(
+        send.command,
+        Some(Command::AgentWorkspace {
+            action: WorkspaceAction::Send { name, target, text, .. }
+        }) if name == "feature" && target == "builder" && text == "review this"
+    ));
 }

@@ -70,6 +70,10 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
         hstring _commandline{};
         hstring _startingDirectory{};
         hstring _startingTitle{};
+        // Private, host-supplied grant used exactly once to mint a
+        // workspace-scoped Terminal Protocol capability for a trusted helper.
+        // This value is never inferred from the child command line.
+        hstring _trustedWorkspaceCapabilityId{};
         bool _initialVisibility{ true };
         Windows::Foundation::Collections::ValueSet _environment{ nullptr };
         hstring _clientName{}; // The name of the process hosted by this ConPTY connection (as of launch).

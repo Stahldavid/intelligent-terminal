@@ -14,10 +14,10 @@ Sync `main` with a fast-forward whenever possible. Rebase active feature
 branches onto the refreshed `main`; do not merge stale upstream experiment
 branches wholesale.
 
-## First fork capability: multi-pane workspaces
+## Current feature branch
 
-The `feature/agent-workspace-launcher` branch adds a preview-first workspace
-launcher to WTA:
+The `feature/agent-workspace-launcher` branch started with a preview-first
+workspace launcher:
 
 ```powershell
 # Preview only: prints the exact JSON plan and does not mutate Terminal.
@@ -38,19 +38,41 @@ wta workspace `
   --apply
 ```
 
-The first release deliberately supports one to four panes. The layout is
-deterministic, all mutations go through the existing Terminal protocol, and
-execution stops if a creation response lacks a pane identity.
+The branch now also contains:
 
-## Roadmap
+- a native sidebar that projects existing Terminal tabs as workspaces;
+- pane-local surfaces with heterogeneous Terminal profiles;
+- a native contextual Chat Pane that follows the focused surface;
+- surface-scoped ACP sessions and a lazy multi-adapter pool;
+- native agent teams and an Agents & Tasks dashboard;
+- Terminal Protocol 3.1 authentication and scoped capabilities;
+- compute targets, sticky placement, worktrees, snapshots, jobs, and leases;
+- a versioned `wta-node` remote runtime with persistent PTY and ACP sessions;
+- scoped files, transfer, proxy, relay, restore, and Browser Surfaces;
+- reproducible build, installer transaction, and version-verification tooling.
 
-1. Project-local workspace manifests and named presets.
-2. Workspace sidebar with cwd, git branch, dirty state, ports, and agent status.
-3. Explicit worktree allocation for concurrent write-capable agents.
-4. Isolated WebView2 browser panes with visible, permissioned automation.
-5. Durable daemon-backed terminal sessions with honest resume semantics.
-6. Rich Codex App Server adapter for approvals, threads, and subagent trees,
-   alongside the generic ACP provider.
+The complete architectural and validation status is maintained in
+[Fork architecture and current status](doc/fork-architecture-and-status.md).
+The [cmux SSH parity plan](doc/specs/cmux-ssh-full-parity-plan.md) defines the
+remaining physical and release gates.
+
+## Upstream integration status
+
+As of 2026-07-30, this branch is based on merge base `5b2356490236`. The
+integration commit containing this snapshot brings it to two branch-only
+commits, while the fetched `upstream/main` has 20 commits not yet integrated.
+
+Do not describe the branch as current with upstream until those commits are
+reviewed and integrated. The overlap includes Terminal and WTA files, so a
+blind merge or rebase is not an acceptable validation strategy.
+
+## Remaining release work
+
+The principal open gates are physical host-key rotation, degraded-network and
+suspend recovery, multi-adapter physical coverage, installed relay/notification
+UX, application-level restore, WebView2 cross-workspace isolation and cleanup,
+accessibility, and a clean signed release build. Unit tests, source verifiers,
+WSL, or historical screenshots do not replace those gates.
 
 ## Safety boundaries
 
@@ -61,3 +83,6 @@ execution stops if a creation response lacks a pane identity.
   or terminal-control endpoints on a network listener.
 - Persist layout and resume identifiers, not credentials or false claims that
   a process survived a reboot.
+- Keep restricted and production targets outside automatic placement.
+- Keep Browser Surfaces separate from the native Chat Pane and fail closed if
+  proxy, profile, or policy isolation cannot be established.

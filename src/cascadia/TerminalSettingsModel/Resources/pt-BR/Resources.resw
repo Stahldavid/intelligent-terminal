@@ -519,11 +519,11 @@
     <value>Definir nome da janela</value>
   </data>
   <data name="OpenWorkspaceCommandKey" xml:space="preserve">
-    <value>Abrir workspace "{0}"</value>
+    <value>Abrir layout salvo "{0}"</value>
     <comment>{0} will be replaced with the workspace name</comment>
   </data>
   <data name="OpenWorkspaceDefaultCommandKey" xml:space="preserve">
-    <value>Abrir workspace</value>
+    <value>Abrir layout salvo</value>
   </data>
   <data name="OpenWindowRenamerCommandKey" xml:space="preserve">
     <value>Renomear janela...</value>

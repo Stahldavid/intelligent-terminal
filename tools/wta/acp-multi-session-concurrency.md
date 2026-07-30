@@ -1,5 +1,14 @@
 # ACP Multi-Session Concurrency — Investigation
 
+> **Historical experiment.** This document records an experiment against ACP
+> 0.10 and adapter versions available at that time. The current fork uses ACP
+> 1.2.0 and a lazy adapter pool in `wta-master`: one master can reuse an adapter
+> for multiple helpers and can run different trusted adapters in parallel.
+> Treat the measurements and recommendation below as historical evidence, not
+> as the current process architecture. See
+> [`OVERVIEW.md`](OVERVIEW.md) and
+> [`../../doc/fork-architecture-and-status.md`](../../doc/fork-architecture-and-status.md).
+
 ## Question
 
 wta currently runs **one ACP session** per agent process and serializes prompt
@@ -54,7 +63,7 @@ The prompt was deliberately model-bound work that streams gradually:
 
 The Codex row below records the deprecated `@zed-industries/codex-acp`
 adapter used when this experiment was run. The current runtime uses
-`@agentclientprotocol/codex-acp@1.1.0`; these historical timings have not been
+`@agentclientprotocol/codex-acp@1.1.7`; these historical timings have not been
 re-attributed to the replacement adapter.
 
 Each agent received the same prompt twice (one per session) at `t = 0` after

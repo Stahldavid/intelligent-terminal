@@ -40,7 +40,7 @@ auth.login_failed_help_default: "  Pressione Enter para tentar novamente, ou Esc
 # ── Visualização do chat (src/ui/chat.rs) ──────────────────────────────────────────────
 chat.activity_thinking: "Pensando…"
 # {Locked=qps-ploc,qps-ploca,qps-plocm}
-chat.welcome_title: "Bem-vindo ao Terminal Inteligente!"
+chat.welcome_title: "A IA pode cometer erros."
 chat.welcome_disclaimer: "O Terminal Inteligente usa IA. Verifique se há erros."
 chat.plan_header: "Plano:"
 chat.plan_marker_completed: "[x]"  # {Locked}
@@ -51,7 +51,7 @@ chat.turn_canceled: "(cancelado)"
 chat.turn_executed: "→ executado: %{title}"
 
 # ── Espaços reservados de entrada (src/ui/input.rs) ────────────────────────────────────────────
-input.placeholder.connected: "Pergunte qualquer coisa, / para comandos.."  # {Locked="/"}
+input.placeholder.connected: "Pergunte qualquer coisa…  (/ comandos)"  # {Locked="/"}
 input.placeholder.connecting: "Conectando..."
 input.placeholder.disconnected: "Desconectado"
 input.image_attachments: "📎 Imagens: %{items}"  # {Locked="📎","%{items}"}

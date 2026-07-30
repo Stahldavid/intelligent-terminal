@@ -9,6 +9,13 @@ default. Post-Z work tightened the multi-tab + multi-window event
 routing model (§7) and replaced toggle-destroy with toggle-stash (§8).
 See "Design history" for the rationale of the original pivot.
 
+> **Current architecture note (2026-07-30):** this document predates canonical
+> pane-local surfaces and the lazy multi-adapter pool. `wta-master` now reuses
+> one process per trusted adapter key and can host different adapters in
+> parallel. Routing prefers stable window/workspace/pane/surface identity over
+> the legacy per-tab fallback. See
+> [`../fork-architecture-and-status.md`](../fork-architecture-and-status.md).
+
 ## TL;DR
 
 - **Each agent pane runs as its own `wta-helper` process** spawned by

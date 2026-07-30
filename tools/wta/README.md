@@ -19,10 +19,15 @@ The binary is output to `tools/wta/target/debug/wta.exe`.
 ### How WTA runs
 
 WTA is normally launched **by Windows Terminal**, not by hand. WT spawns one
-`wta-master` singleton (owns the agent CLI) and one `wta-helper` per agent pane
-(renders this TUI and speaks ACP to master over a named pipe). Bare `wta` with no
-subcommand and neither `--master` nor `--connect-master` exits with an error —
-there is no standalone agent / TUI mode.
+`wta-master` singleton, which owns a lazy pool of trusted ACP adapters, and one
+`wta-helper` per agent pane. Helpers render the compatibility TUI and speak ACP
+to the master over a named pipe. Bare `wta` with no subcommand and neither
+`--master` nor `--connect-master` exits with an error — there is no standalone
+agent / TUI mode.
+
+The native Chat Pane, workspace sidebar, pane-local surfaces, teams, and remote
+compute model are summarized in
+[`doc/fork-architecture-and-status.md`](../../doc/fork-architecture-and-status.md).
 
 The default agent is Copilot; the agent and model come from Windows Terminal
 settings (`acpAgent` / `acpModel`) and are passed through to master via `--agent`
@@ -168,7 +173,7 @@ tailing log files.
 ```
 tools/wta/src/
 +-- main.rs                    Entry point, role/CLI dispatch, protocol discovery
-+-- master/mod.rs             wta-master: owns the agent CLI, multiplexes helpers
++-- master/mod.rs             wta-master: owns the adapter pool, multiplexes helpers
 +-- helper/mod.rs             wta-helper: per-pane entry (reuses the TUI over a pipe)
 +-- app.rs                     TUI state machine, event loop, per-tab sessions
 |   +-- app/autofix.rs         Autofix detection + suggestion

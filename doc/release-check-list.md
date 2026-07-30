@@ -387,7 +387,104 @@ Net effect: UT shrinks the manual matrix to "did the wiring and UI connect", not
 - [x] `C206` `[UT✓]` `[MANUAL]` **Pseudo-locales work:** qps pseudo-locales do not clip or corrupt layout. _(UT: `locale_parity_tests::every_locale_has_all_en_us_keys` iterates every `locales/*.yml` including qps-ploc/ploca/plocm and proves each is present + key-complete, so the pseudo-locales load with no missing-key en-US fallthrough. Visual clip/overflow inspection stays MANUAL.)_
 - [ ] `C207` `[UT~]` `[MANUAL]` **RTL works:** RTL layout is mirrored where expected. _(UT: `IsRtlLocale`.)_
 
-## 12. Release decision
+## 12. Surface-scoped workspaces and native teams
+
+**Feature definition:** A native tab is the workspace; panes contain
+independent surfaces; chat follows the focused surface; agent/team coordination
+uses the explicit sidebar view; native-team coordination and sensitive ACP
+operations fail closed.
+
+- [x] `C229` `[UT✓]` **Adapter launcher classification:** `npx`, `npx.cmd` and
+  absolute Windows launcher paths use the cold-start class; terminal errors do
+  not retry indefinitely.
+- [ ] `C230` `[E2E]` **Cold-cache Codex ACP:** With an empty npm cache,
+  `@agentclientprotocol/codex-acp@1.1.7` reaches initialize/session creation
+  without an orphan process.
+- [x] `C231` `[BUILD✓]` **Heterogeneous surface plumbing compiles:** profile
+  `INewContentArgs` propagate SurfaceStack → Pane → Tab → TerminalPage.
+- [ ] `C232` `[E2E]` **Heterogeneous workspace:** PowerShell, WSL and a custom
+  or SSH profile coexist in one workspace; duplicate preserves profile/CWD.
+- [ ] `C233` `[MANUAL]` **Customized new-tab menu parity:** surface and split
+  destinations preserve folders/actions from `newTabMenu`, not only active
+  profile rows. _(BUILD: the surface destination now recursively projects the
+  canonical menu and delegates non-newTab actions to ShortcutActionDispatch;
+  visual/manual parity remains unchecked.)_
+- [x] `C234` `[UT✓]` **Surface scope isolation:** two surface scope keys retain
+  independent session state; stale focus generation is rejected.
+- [ ] `C235` `[E2E]` **Rapid focus isolation:** switching surfaces during
+  streaming never renders an update in the newly focused surface. _(The Linux
+  node regression already proves distinct PIDs and isolated streams for two
+  persistent sessions; this item remains open because it specifically requires
+  UI focus changes while output is streaming.)_
+- [x] `C236` `[UT✓]` **Workspace coordinator isolation:** explicit workspace
+  scope does not reuse the active surface session.
+- [x] `C237` `[UT✓]` **Native team invariants:** ownership conflicts,
+  heartbeat, retry limits and shutdown lifecycle are deterministic and
+  audited.
+- [ ] `C238` `[OPT-IN E2E]` **Two real agents:** two installed/authenticated
+  agents accept independent team tasks and report results through `wta team`.
+  _(Observed below this gate: `Test-WtaNodePersistentAcp.ps1
+  -VerifyIsolation` started two real Codex ACP adapters in WSL with distinct
+  PIDs, preserved each PID across reattach and detected the WSL authentication
+  gate independently in both sessions. Task ownership/result reporting remains
+  opt-in and requires authenticated agents.)_
+- [x] `C239` `[UT✓]` **Confirmation enforcement:** unknown policy values map to
+  prompt; deny emits no operation; prompt requires allow/reject and caches only
+  the authorized read resource.
+- [x] `C240` `[BUILD✓]` **Authenticated Terminal Protocol:** protocol 3.1,
+  per-COM-instance authentication and `wtcli` token/version checks compile in
+  TerminalProtocol, WindowsTerminal and wtcli. The deterministic
+  `Verify-TerminalProtocolSecurity.ps1` also rejects any unguarded COM method,
+  non-prompt default or missing Agent CLI credential scrub.
+- [x] `C241` `[UT✓][BUILD✓]` **Per-binding capabilities:** ordinary ConPTY
+  children receive signed surface capabilities; trusted WTA helpers receive
+  workspace capabilities. Subject, issuer, resource, allowed operations,
+  expiry and nonce are validated, and session-target operations fail closed
+  outside that scope. _(Residual: nonce is unique but not backed by a one-use
+  revocation ledger; the trusted WTA master retains host-admin scope.)_
+- [x] `C242` `[UT✓][BUILD✓]` **Subscriber filtering:** protocol subscribers are
+  filtered before enqueue and scoped senders require an explicit matching
+  workspace/surface identity; unscoped events fail closed. _(Real hostile
+  cross-process E2E remains separate from this deterministic/build gate.)_
+- [x] `C243` `[BUILD✓]` **Native contextual dock chrome:** localized
+  `Following/Seguindo` context compiles as XAML, the manual
+  Surface/Workspace/Team selector is absent, and the Chat Pane creates no
+  WebView2. Browser Surfaces are a separate content type with their own gates.
+- [ ] `C244` `[UT✓][BUILD✓][MANUAL]` **Fully native conversation body:**
+  streaming, tool calls, permission cards, result cards and composer now use
+  XAML controls rather than the embedded WTA terminal TUI. Structured actions
+  are workspace/scope-bound and covered by deterministic tests. _Manual
+  visual, high-contrast, Narrator and real-adapter round-trip validation remain
+  unchecked._
+- [ ] `C245` `[E2E]` **Move/restore lifecycle:** workspace move between windows,
+  close/reopen and restore preserve logical identity and revalidate live
+  bindings. _(UT/BUILD: immutable create/activate/close/move/detach events are
+  routed and a close drops only its surface scope; real move/restore remains
+  unchecked.)_
+- [ ] `C246` `[BUILD✓][E2E]` **Browser Surface routing:** creating a browser
+  from a ready Remote Workspace targets the focused pane and exact remote
+  workspace; unavailable proxy/policy state fails closed.
+- [ ] `C247` `[SECURITY][E2E]` **Browser profile isolation:** two workspaces
+  visiting the same origin do not share cookies, storage, credentials, or
+  permissions.
+- [ ] `C248` `[SECURITY][E2E]` **Browser cleanup and revocation:** closing the
+  surface/workspace revokes its proxy and removes or retires its profile
+  according to policy; no listener or reusable capability remains.
+- [ ] `C249` `[SECURITY][E2E]` **Browser policy boundary:** non-HTTP(S)
+  navigation, popups, downloads, DevTools, web messages, host objects, autofill
+  and password storage remain unavailable in the installed build.
+- [ ] `C250` `[E2E]` **Remote browser recovery:** an SSH interruption does not
+  silently fall back to local networking or a shared profile; reconnect uses
+  the original workspace runtime or presents a clear failed state.
+- [ ] `C251` `[E2E]` **Remote files and relay:** root-scoped transfer, relay
+  notification, unread state, and exact workspace/surface jump pass through
+  the installed UI without accepting cross-workspace capabilities.
+
+Automated assertions and observed runtime E2E remain separate. A checked
+`[BUILD✓]` item proves compilation only; it does not substitute for the
+unchecked manual, security or opt-in gates.
+
+## 13. Release decision
 
 - [ ] `C208` `[MANUAL]` **All P0/P1 issues resolved:** No blocking agent pane, autofix, FRE, session, custom-agent, or packaging bugs remain.
 - [ ] `C209` `[MANUAL]` **Known limitations documented:** Any intentionally deferred behavior is documented in release notes.

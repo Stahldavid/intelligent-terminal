@@ -114,6 +114,13 @@
       <Link>Microsoft.Terminal.Protocol.winmd</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <!-- Immutable artifact-level compatibility marker. The local installer
+         compares this packaged snapshot with the source snapshot before it
+         combines the Terminal payload with wta.exe. -->
+    <Content Include="$(OpenConsoleDir)src\cascadia\TerminalProtocol\protocol-version.json">
+      <Link>protocol-version.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
   <!-- Deploy wta.exe (Rust-built WTA agent) into the package root.
        wta.exe discovers wtcli.exe as a sibling, so both must be co-located.
@@ -145,7 +152,27 @@
       <Link>wta.exe</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <Content Include="$(SolutionDir)tools\wta\target\$(WtaRustTarget)\$(WtaRustProfile)\wta-node.exe"
+             Condition="Exists('$(SolutionDir)tools\wta\target\$(WtaRustTarget)\$(WtaRustProfile)\wta-node.exe')">
+      <Link>wta-node.exe</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="$(SolutionDir)tools\wta\remote\linux-x64\wta-node"
+             Condition="Exists('$(SolutionDir)tools\wta\remote\linux-x64\wta-node')">
+      <Link>wta-node-linux-x64</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
+  <Target Name="ValidatePackagedWtaExecutable"
+          BeforeTargets="PrepareForBuild"
+          Condition="'$(GenerateAppxPackageOnBuild)' == 'true'">
+    <Error
+      Condition="!Exists('$(SolutionDir)tools\wta\target\$(WtaRustTarget)\$(WtaRustProfile)\wta.exe')"
+      Text="The exact wta.exe for $(Platform)/$(Configuration) is missing. Build tools/wta with --target $(WtaRustTarget) using the $(WtaRustProfile) Cargo profile before packaging; a host-architecture or opposite-profile fallback is not allowed in MSIX." />
+    <Error
+      Condition="!Exists('$(SolutionDir)tools\wta\target\$(WtaRustTarget)\$(WtaRustProfile)\wta-node.exe')"
+      Text="The exact wta-node.exe for $(Platform)/$(Configuration) is missing. Build all tools/wta bins before packaging." />
+  </Target>
   <!-- Deploy the static wt-agent-hooks bundle next to wta.exe.
        wta resolves <exe-dir>/wt-agent-hooks/ at runtime via
        agent_hooks_installer::bundle::candidate_roots(), feeds the per-CLI

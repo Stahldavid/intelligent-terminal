@@ -517,6 +517,7 @@ impl WtChannel for CliChannel {
                 let mut args = vec!["new-tab"];
                 let cmd = params
                     .get("commandline")
+                    .or_else(|| params.get("command"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("");
@@ -544,6 +545,112 @@ impl WtChannel for CliChannel {
                 }
                 self.run_wtcli(&args).await
             }
+            "create_surface" => {
+                let pane_id = params
+                    .get("session_id")
+                    .and_then(json_id_as_str)
+                    .unwrap_or_default();
+                let cmd = params
+                    .get("commandline")
+                    .or_else(|| params.get("command"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let profile = params.get("profile").and_then(|v| v.as_str()).unwrap_or("");
+                let cwd = params.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+                let background = params
+                    .get("background")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let cmd_owned;
+                let profile_owned;
+                let cwd_owned;
+                let mut args = vec!["new-surface"];
+                if !pane_id.is_empty() {
+                    args.extend(["-t", &pane_id]);
+                }
+                if !cmd.is_empty() {
+                    cmd_owned = cmd.to_string();
+                    args.extend(["-c", &cmd_owned]);
+                }
+                if !profile.is_empty() {
+                    profile_owned = profile.to_string();
+                    args.extend(["-p", &profile_owned]);
+                }
+                if !cwd.is_empty() {
+                    cwd_owned = cwd.to_string();
+                    args.extend(["-d", &cwd_owned]);
+                }
+                if background {
+                    args.push("--background");
+                }
+                self.run_wtcli(&args).await
+            }
+            "create_managed_surface" => {
+                let pane_id = params
+                    .get("session_id")
+                    .and_then(json_id_as_str)
+                    .unwrap_or_default();
+                let compute_target = params
+                    .get("compute_target")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("create_managed_surface: missing compute_target"))?;
+                let agent_id = params
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("create_managed_surface: missing agent_id"))?;
+                let background = params
+                    .get("background")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mut args = vec![
+                    "new-agent-surface",
+                    "--compute-target",
+                    compute_target,
+                    "--agent",
+                    agent_id,
+                ];
+                if !pane_id.is_empty() {
+                    args.extend(["-t", &pane_id]);
+                }
+                if background {
+                    args.push("--background");
+                }
+                self.run_wtcli(&args).await
+            }
+            "create_browser_surface" => {
+                let pane_id = params
+                    .get("session_id")
+                    .and_then(json_id_as_str)
+                    .unwrap_or_default();
+                let remote_workspace = params
+                    .get("remote_workspace_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                    anyhow!("create_browser_surface: missing remote_workspace_id")
+                })?;
+                let url = params
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("https://example.com");
+                let background = params
+                    .get("background")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mut args = vec![
+                    "new-browser-surface",
+                    "--remote-workspace",
+                    remote_workspace,
+                    "--url",
+                    url,
+                ];
+                if !pane_id.is_empty() {
+                    args.extend(["-t", &pane_id]);
+                }
+                if background {
+                    args.push("--background");
+                }
+                self.run_wtcli(&args).await
+            }
             "split_pane" => {
                 let pane_id = params
                     .get("session_id")
@@ -551,19 +658,21 @@ impl WtChannel for CliChannel {
                     .unwrap_or_default();
                 let cmd = params
                     .get("commandline")
+                    .or_else(|| params.get("command"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let dir = params
                     .get("direction")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let profile = params
-                    .get("profile")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let profile = params.get("profile").and_then(|v| v.as_str()).unwrap_or("");
+                let cwd = params.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+                let size = params.get("size").and_then(|v| v.as_f64()).unwrap_or(0.5);
                 let cmd_owned;
                 let dir_owned;
                 let profile_owned;
+                let cwd_owned;
+                let size_owned = size.to_string();
                 let mut args = vec!["split-pane"];
                 if !pane_id.is_empty() {
                     args.extend(["-t", &pane_id]);
@@ -576,6 +685,7 @@ impl WtChannel for CliChannel {
                     dir_owned = dir.to_string();
                     args.extend(["-d", &dir_owned]);
                 }
+                args.extend(["-s", &size_owned]);
                 if !cmd.is_empty() {
                     cmd_owned = cmd.to_string();
                     args.extend(["-c", &cmd_owned]);
@@ -583,6 +693,10 @@ impl WtChannel for CliChannel {
                 if !profile.is_empty() {
                     profile_owned = profile.to_string();
                     args.extend(["-p", &profile_owned]);
+                }
+                if !cwd.is_empty() {
+                    cwd_owned = cwd.to_string();
+                    args.extend(["--cwd", &cwd_owned]);
                 }
                 self.run_wtcli(&args).await
             }
@@ -648,6 +762,10 @@ impl WtChannel for CliChannel {
                 args.push("--");
                 args.push(&text_owned);
                 self.run_wtcli(&args).await
+            }
+            "send_event" => {
+                let event = serde_json::to_string(&params)?;
+                self.run_wtcli(&["publish", "--", &event]).await
             }
             "get_capabilities" => self.run_wtcli(&["info"]).await,
             other => bail!("Unsupported method: {}", other),

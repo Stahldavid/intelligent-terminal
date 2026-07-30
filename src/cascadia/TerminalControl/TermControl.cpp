@@ -837,6 +837,18 @@ namespace winrt::Microsoft::Terminal::Control::implementation
     {
         UpdateControlSettings(settings, _core.UnfocusedAppearance());
     }
+
+    void TermControl::SetTrimLeftPadding(const bool trim)
+    {
+        if (_trimLeftPadding == trim)
+        {
+            return;
+        }
+
+        _trimLeftPadding = trim;
+        _UpdateSettingsFromUIThread();
+    }
+
     // Method Description:
     // - Given Settings having been updated, applies the settings to the current terminal.
     // Return Value:
@@ -957,7 +969,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         auto settings{ _core.Settings() };
 
         // Apply padding as swapChainPanel's margin
-        const auto newMargin = StringToXamlThickness(settings.Padding());
+        auto newMargin = StringToXamlThickness(settings.Padding());
+        if (_trimLeftPadding)
+        {
+            newMargin.Left = 0;
+        }
         SwapChainPanel().Margin(newMargin);
 
         // Apply settings for scrollbar
@@ -3207,6 +3223,23 @@ namespace winrt::Microsoft::Terminal::Control::implementation
                 if (!strong)
                 {
                     co_return;
+                }
+
+                if (StorageItemsDropped)
+                {
+                    std::vector<winrt::hstring> paths;
+                    paths.reserve(fullPaths.size());
+                    for (const auto& path : fullPaths)
+                    {
+                        paths.emplace_back(path);
+                    }
+                    const auto args = winrt::make<StorageItemsDroppedEventArgs>(
+                        winrt::single_threaded_vector<winrt::hstring>(std::move(paths)).GetView());
+                    StorageItemsDropped.raise(*this, args);
+                    if (args.Handled())
+                    {
+                        co_return;
+                    }
                 }
 
                 std::wstring allPathsString;

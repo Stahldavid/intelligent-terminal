@@ -26,6 +26,7 @@ namespace Protocol = winrt::Microsoft::Terminal::Protocol;
 
 // Static state — set once before registration, never mutated.
 WindowEmperor* TerminalProtocolComServer::s_emperor = nullptr;
+std::wstring TerminalProtocolComServer::s_capabilityToken;
 
 static DWORD g_comRegistration = 0;
 static std::shared_mutex g_mtx;
@@ -39,6 +40,11 @@ std::vector<TerminalProtocolComServer*> TerminalProtocolComServer::s_instances;
 void TerminalProtocolComServer::s_setEmperor(WindowEmperor* emperor) noexcept
 {
     s_emperor = emperor;
+}
+
+void TerminalProtocolComServer::s_setCapabilityToken(std::wstring token)
+{
+    s_capabilityToken = std::move(token);
 }
 
 HRESULT TerminalProtocolComServer::s_StartListening()
@@ -227,6 +233,7 @@ static Json::Value _toJson(const Protocol::TabInfo& t)
 {
     Json::Value v;
     v["tab_id"] = static_cast<Json::UInt>(t.TabId);
+    v["workspace_id"] = winrt::to_string(t.WorkspaceId);
     v["window_id"] = static_cast<Json::UInt64>(t.WindowId);
     v["title"] = winrt::to_string(t.Title);
     v["is_active"] = static_cast<bool>(t.IsActive);
@@ -239,6 +246,8 @@ static Json::Value _toJson(const Protocol::PaneInfo& p)
     Json::Value v;
     v["session_id"] = _guidStr(p.SessionId);
     v["tab_id"] = static_cast<Json::UInt>(p.TabId);
+    v["workspace_id"] = winrt::to_string(p.WorkspaceId);
+    v["pane_id"] = static_cast<Json::UInt>(p.PaneId);
     v["window_id"] = static_cast<Json::UInt64>(p.WindowId);
     v["title"] = winrt::to_string(p.Title);
     v["profile"] = winrt::to_string(p.Profile);
@@ -250,6 +259,11 @@ static Json::Value _toJson(const Protocol::PaneInfo& p)
     v["cwd"] = winrt::to_string(p.Cwd);
     v["shell"] = winrt::to_string(p.Shell);
     v["shell_version"] = winrt::to_string(p.ShellVersion);
+    v["surface_id"] = static_cast<Json::UInt>(p.SurfaceId);
+    v["surface_index"] = static_cast<Json::UInt>(p.SurfaceIndex);
+    v["surface_count"] = static_cast<Json::UInt>(p.SurfaceCount);
+    v["surface_session_id"] = _guidStr(p.SurfaceSessionId);
+    v["focus_generation"] = static_cast<Json::UInt64>(p.FocusGeneration);
     return v;
 }
 
@@ -302,6 +316,237 @@ static Json::Value _toJson(const Protocol::TabCreationResult& r)
 static winrt::hstring _hstr(BSTR b)
 {
     return b ? winrt::hstring{ b } : winrt::hstring{};
+}
+
+static std::wstring _lowerIdentifier(std::wstring value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](const wchar_t ch) {
+        return ch >= L'A' && ch <= L'Z' ? static_cast<wchar_t>(ch - L'A' + L'a') : ch;
+    });
+    if (value.size() > 2 && value.front() == L'{' && value.back() == L'}')
+    {
+        value = value.substr(1, value.size() - 2);
+    }
+    return value;
+}
+
+bool TerminalProtocolComServer::_isAuthenticated() const noexcept
+{
+    return _hostAuthenticated || (_claims && !_claims->IsExpired());
+}
+
+bool TerminalProtocolComServer::_hasOperation(const CapabilityOperation operation) const noexcept
+{
+    return _hostAuthenticated || (_claims && !_claims->IsExpired() && _claims->Has(operation));
+}
+
+std::optional<std::wstring> TerminalProtocolComServer::_workspaceForSession(const GUID& sessionId) const
+{
+    if (!s_emperor || winrt::guid{ sessionId } == winrt::guid{})
+    {
+        return std::nullopt;
+    }
+
+    for (const auto& host : s_emperor->GetWindows())
+    {
+        const auto page = _getPage(host.get());
+        if (!page)
+        {
+            continue;
+        }
+        const auto panes = page.GetProtocolPanes(UINT32_MAX).get();
+        for (uint32_t i = 0; i < panes.Size(); ++i)
+        {
+            const auto pane = panes.GetAt(i);
+            if (pane.SessionId == winrt::guid{ sessionId } ||
+                pane.SurfaceSessionId == winrt::guid{ sessionId })
+            {
+                return _lowerIdentifier(std::wstring{ pane.WorkspaceId });
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::pair<std::wstring, uint32_t>> TerminalProtocolComServer::_paneForSession(
+    const std::wstring_view sessionId) const
+{
+    if (!s_emperor || sessionId.empty())
+    {
+        return std::nullopt;
+    }
+
+    const auto expected = _lowerIdentifier(std::wstring{ sessionId });
+    for (const auto& host : s_emperor->GetWindows())
+    {
+        const auto page = _getPage(host.get());
+        if (!page)
+        {
+            continue;
+        }
+
+        const auto panes = page.GetProtocolPanes(UINT32_MAX).get();
+        for (uint32_t i = 0; i < panes.Size(); ++i)
+        {
+            const auto pane = panes.GetAt(i);
+            const auto paneSession = _lowerIdentifier(
+                winrt::to_hstring(_guidStr(pane.SessionId)).c_str());
+            const auto surfaceSession = _lowerIdentifier(
+                winrt::to_hstring(_guidStr(pane.SurfaceSessionId)).c_str());
+            if (expected == paneSession || expected == surfaceSession)
+            {
+                return std::pair{
+                    _lowerIdentifier(std::wstring{ pane.WorkspaceId }),
+                    pane.PaneId
+                };
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+bool TerminalProtocolComServer::_isWorkspaceAuthorized(
+    const std::wstring_view workspaceId,
+    const CapabilityOperation operation) const noexcept
+{
+    if (!_hasOperation(operation))
+    {
+        return false;
+    }
+    if (_hostAuthenticated)
+    {
+        return true;
+    }
+    return _claims &&
+           _claims->scope == Microsoft::Terminal::Protocol::Capability::Scope::Workspace &&
+           _claims->workspaceId == _lowerIdentifier(std::wstring{ workspaceId });
+}
+
+bool TerminalProtocolComServer::_isSessionAuthorized(
+    const GUID& sessionId,
+    const CapabilityOperation operation) const
+{
+    if (!_hasOperation(operation))
+    {
+        return false;
+    }
+    if (_hostAuthenticated)
+    {
+        return true;
+    }
+    if (!_claims)
+    {
+        return false;
+    }
+
+    const auto session = _lowerIdentifier(winrt::to_hstring(_guidStr(winrt::guid{ sessionId })).c_str());
+    if (_claims->scope == Microsoft::Terminal::Protocol::Capability::Scope::Surface)
+    {
+        if (_claims->surfaceId == session)
+        {
+            return true;
+        }
+
+        // A surface-scoped process may navigate, enumerate and close sibling
+        // surfaces in its own pane. It still cannot read their output, send
+        // input, inspect process state or cross a pane/workspace boundary.
+        // This is the minimum authority needed for agent/UI parity around the
+        // pane-local surface stack created through CreateSurface.
+        const auto paneScopedOperation =
+            operation == CapabilityOperation::GetActivePane ||
+            operation == CapabilityOperation::ListWindows ||
+            operation == CapabilityOperation::ListTabs ||
+            operation == CapabilityOperation::ListPanes ||
+            operation == CapabilityOperation::ClosePane ||
+            operation == CapabilityOperation::FocusPane;
+        if (!paneScopedOperation)
+        {
+            return false;
+        }
+
+        const auto sourcePane = _paneForSession(_claims->surfaceId);
+        const auto targetPane = _paneForSession(session);
+        return sourcePane && targetPane && *sourcePane == *targetPane;
+    }
+    if (_claims->scope == Microsoft::Terminal::Protocol::Capability::Scope::Workspace)
+    {
+        const auto workspace = _workspaceForSession(sessionId);
+        return workspace && *workspace == _claims->workspaceId;
+    }
+    return false;
+}
+
+bool TerminalProtocolComServer::_isEventAuthorized(
+    const std::string& eventJson,
+    const CapabilityOperation operation) const
+{
+    if (!_isAuthenticated())
+    {
+        return false;
+    }
+    if (_hostAuthenticated)
+    {
+        return true;
+    }
+    if (!_claims || !_claims->Has(operation))
+    {
+        return false;
+    }
+
+    Json::Value event;
+    if (!_parseJson(eventJson, event) || !event.isObject())
+    {
+        return false;
+    }
+
+    const auto& params = event.isMember("params") && event["params"].isObject() ? event["params"] : event;
+    const auto stringAt = [](const Json::Value& object, const char* key) -> std::optional<std::wstring> {
+        if (!object.isObject() || !object.isMember(key) || !object[key].isString())
+        {
+            return std::nullopt;
+        }
+        return _lowerIdentifier(winrt::to_hstring(object[key].asString()).c_str());
+    };
+
+    for (const auto* key : { "workspace_id", "owner_tab_id", "tab_id" })
+    {
+        if (const auto workspace = stringAt(params, key);
+            workspace && _claims->scope == Microsoft::Terminal::Protocol::Capability::Scope::Workspace)
+        {
+            return *workspace == _claims->workspaceId;
+        }
+    }
+
+    for (const auto* key : {
+             "session_id",
+             "surface_session_id",
+             "pane_session_id",
+             "source_session_id",
+             "pane_id",
+             "pane",
+         })
+    {
+        const auto session = stringAt(params, key);
+        if (!session)
+        {
+            continue;
+        }
+        if (_claims->scope == Microsoft::Terminal::Protocol::Capability::Scope::Surface)
+        {
+            return *session == _claims->surfaceId;
+        }
+
+        // Workspace subscribers require an explicit workspace/tab identity in
+        // the event. Do not perform a UI-thread pane lookup from the fan-out
+        // producer: VT events can originate on the UI thread and a synchronous
+        // lookup here would deadlock it. TerminalPage emits tab_id/workspace_id
+        // on workspace-routable events.
+        return false;
+    }
+
+    // Scoped subscribers never receive unscoped events. Trusted host clients
+    // still receive them through the administrative capability.
+    return false;
 }
 
 void TerminalProtocolComServer::_ensurePageEventsRegistered()
@@ -386,6 +631,11 @@ void TerminalProtocolComServer::s_NotifyEventToComClients(const std::string& eve
 
 void TerminalProtocolComServer::_enqueueEvent(const std::string& eventJson)
 {
+    if (!_isEventAuthorized(eventJson, CapabilityOperation::Subscribe))
+    {
+        return;
+    }
+
     // Hand the event to the current subscriber's bounded queue and return. The
     // queue applies the subscribe-gate (drops while inactive) and drop-oldest
     // back-pressure; the producer never blocks. The detached worker performs the
@@ -478,55 +728,86 @@ void TerminalProtocolComServer::_runDeliveryWorker(std::shared_ptr<_DeliveryStat
 // ITerminalProtocol — Meta
 // ============================================================================
 
-STDMETHODIMP TerminalProtocolComServer::Authenticate(BSTR /*token*/, BSTR* resultJson)
+STDMETHODIMP TerminalProtocolComServer::Authenticate(BSTR token, BSTR* resultJson)
 try
 {
     RETURN_HR_IF_NULL(E_POINTER, resultJson);
     *resultJson = nullptr;
     RETURN_HR_IF(E_NOT_VALID_STATE, !s_emperor);
 
-    // Compatibility handshake only. COM activation is the trust boundary; no
-    // ITerminalProtocol method is gated on this call.
+    const std::wstring_view presented{ token ? token : L"" };
+    _hostAuthenticated = !s_capabilityToken.empty() && presented == s_capabilityToken;
+    _claims.reset();
+    if (!_hostAuthenticated && !s_capabilityToken.empty())
+    {
+        _claims = Microsoft::Terminal::Protocol::Capability::Validate(s_capabilityToken, presented);
+    }
+
     Json::Value v;
-    v["authenticated"] = true;
-    // 2.2 — SendInput restored on the COM surface; pane identifiers remain GUIDs.
-    v["protocol_version"] = "2.2";
+    v["authenticated"] = _isAuthenticated();
+    v["scope"] = _hostAuthenticated ? "host" :
+                     _claims && _claims->scope == Microsoft::Terminal::Protocol::Capability::Scope::Workspace ? "workspace" :
+                                                                                                                "surface";
+    if (_claims)
+    {
+        v["subject"] = winrt::to_string(winrt::hstring{ _claims->subject });
+        v["workspace_id"] = winrt::to_string(winrt::hstring{ _claims->workspaceId });
+        v["surface_id"] = winrt::to_string(winrt::hstring{ _claims->surfaceId });
+        v["expires_at"] = static_cast<Json::UInt64>(_claims->expiresAtUnixSeconds);
+        v["nonce"] = winrt::to_string(winrt::hstring{ _claims->nonce });
+    }
+    // 3.1 gates every query, mutation and subscription on a per-COM-instance
+    // capability established by Authenticate.
+    v["protocol_version"] = "3.1";
+    v["component_version"] = "0.9.4";
     *resultJson = _bstrFromJson(v);
     return S_OK;
 }
 CATCH_RETURN()
 
+#define RETURN_IF_PROTOCOL_UNAUTHENTICATED() RETURN_HR_IF(E_ACCESSDENIED, !_isAuthenticated())
+
 STDMETHODIMP TerminalProtocolComServer::GetCapabilities(BSTR* json)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_hasOperation(CapabilityOperation::GetCapabilities));
     RETURN_HR_IF_NULL(E_POINTER, json);
     *json = nullptr;
 
-    static const std::vector<std::string> supportedMethods = {
-        "authenticate",
-        "get_capabilities",
-        "get_active_pane",
-        "list_windows",
-        "list_tabs",
-        "list_panes",
-        "read_pane_output",
-        "get_process_status",
-        "get_session_variable",
-        "get_settings",
-        "create_tab",
-        "split_pane",
-        "close_pane",
-        "send_input",
-        "focus_pane",
-        "set_session_variable",
-        "subscribe",
-        "unsubscribe",
-        "send_event",
+    static const std::vector<std::pair<std::string, CapabilityOperation>> supportedMethods = {
+        { "get_capabilities", CapabilityOperation::GetCapabilities },
+        { "get_active_pane", CapabilityOperation::GetActivePane },
+        { "list_windows", CapabilityOperation::ListWindows },
+        { "list_tabs", CapabilityOperation::ListTabs },
+        { "list_panes", CapabilityOperation::ListPanes },
+        { "read_pane_output", CapabilityOperation::ReadPaneOutput },
+        { "get_process_status", CapabilityOperation::GetProcessStatus },
+        { "get_session_variable", CapabilityOperation::GetSessionVariable },
+        { "get_settings", CapabilityOperation::GetSettings },
+        { "create_tab", CapabilityOperation::CreateTab },
+        { "create_surface", CapabilityOperation::CreateSurface },
+        { "create_managed_surface", CapabilityOperation::CreateSurface },
+        { "create_browser_surface", CapabilityOperation::CreateSurface },
+        { "split_pane", CapabilityOperation::SplitPane },
+        { "close_pane", CapabilityOperation::ClosePane },
+        { "send_input", CapabilityOperation::SendInput },
+        { "focus_pane", CapabilityOperation::FocusPane },
+        { "set_session_variable", CapabilityOperation::SetSessionVariable },
+        { "subscribe", CapabilityOperation::Subscribe },
+        { "unsubscribe", CapabilityOperation::Unsubscribe },
+        { "send_event", CapabilityOperation::SendEvent },
     };
 
     Json::Value methods(Json::arrayValue);
-    for (const auto& m : supportedMethods)
-        methods.append(m);
+    methods.append("authenticate");
+    for (const auto& [method, operation] : supportedMethods)
+    {
+        if (_hasOperation(operation))
+        {
+            methods.append(method);
+        }
+    }
 
     *json = _bstrFromJson(methods);
     return S_OK;
@@ -540,6 +821,8 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::GetActivePane(BSTR* json)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_hasOperation(CapabilityOperation::GetActivePane));
     RETURN_HR_IF_NULL(E_POINTER, json);
     *json = nullptr;
     RETURN_HR_IF(E_NOT_VALID_STATE, !s_emperor);
@@ -552,6 +835,7 @@ try
 
     auto info = page.GetProtocolActivePane().get();
     RETURN_HR_IF(E_FAIL, info.SessionId == winrt::guid{});
+    RETURN_HR_IF(E_ACCESSDENIED, !_isSessionAuthorized(info.SessionId, CapabilityOperation::GetActivePane));
 
     // TerminalPage doesn't know the window ID — fill it in here.
     const auto& props = host->Logic().WindowProperties();
@@ -565,6 +849,8 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::ListWindows(BSTR* json)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_hasOperation(CapabilityOperation::ListWindows));
     RETURN_HR_IF_NULL(E_POINTER, json);
     *json = nullptr;
     RETURN_HR_IF(E_NOT_VALID_STATE, !s_emperor);
@@ -579,6 +865,36 @@ try
             continue;
 
         const auto& props = logic.WindowProperties();
+        if (!_hostAuthenticated)
+        {
+            const auto page = _getPage(host.get());
+            if (!page)
+            {
+                continue;
+            }
+            bool visible = false;
+            const auto panes = page.GetProtocolPanes(UINT32_MAX).get();
+            for (uint32_t i = 0; i < panes.Size(); ++i)
+            {
+                const auto pane = panes.GetAt(i);
+                const auto paneSession = _lowerIdentifier(std::wstring{
+                    winrt::to_hstring(_guidStr(
+                        pane.SurfaceSessionId == winrt::guid{} ? pane.SessionId : pane.SurfaceSessionId))
+                });
+                if ((_claims->scope == Microsoft::Terminal::Protocol::Capability::Scope::Surface &&
+                     _claims->surfaceId == paneSession) ||
+                    (_claims->scope == Microsoft::Terminal::Protocol::Capability::Scope::Workspace &&
+                     _claims->workspaceId == _lowerIdentifier(std::wstring{ pane.WorkspaceId })))
+                {
+                    visible = true;
+                    break;
+                }
+            }
+            if (!visible)
+            {
+                continue;
+            }
+        }
 
         Protocol::WindowInfo info{};
         info.WindowId = props.WindowId();
@@ -596,6 +912,8 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::ListTabs(unsigned __int64 windowIdFilter, BSTR* json)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_hasOperation(CapabilityOperation::ListTabs));
     RETURN_HR_IF_NULL(E_POINTER, json);
     *json = nullptr;
     RETURN_HR_IF(E_NOT_VALID_STATE, !s_emperor);
@@ -621,6 +939,33 @@ try
         for (uint32_t i = 0; i < tabs.Size(); ++i)
         {
             auto t = tabs.GetAt(i);
+            if (!_hostAuthenticated)
+            {
+                if (_claims->scope == Microsoft::Terminal::Protocol::Capability::Scope::Workspace)
+                {
+                    if (!_isWorkspaceAuthorized(t.WorkspaceId, CapabilityOperation::ListTabs))
+                    {
+                        continue;
+                    }
+                }
+                else
+                {
+                    bool ownsSurface = false;
+                    const auto panes = page.GetProtocolPanes(i).get();
+                    for (uint32_t paneIndex = 0; paneIndex < panes.Size(); ++paneIndex)
+                    {
+                        if (_isSessionAuthorized(panes.GetAt(paneIndex).SessionId, CapabilityOperation::ListTabs))
+                        {
+                            ownsSurface = true;
+                            break;
+                        }
+                    }
+                    if (!ownsSurface)
+                    {
+                        continue;
+                    }
+                }
+            }
             t.WindowId = windowId;
             arr.append(_toJson(t));
         }
@@ -634,6 +979,8 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::ListPanes(unsigned __int64 windowIdFilter, unsigned long tabIdFilter, BSTR* json)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_hasOperation(CapabilityOperation::ListPanes));
     RETURN_HR_IF_NULL(E_POINTER, json);
     *json = nullptr;
     RETURN_HR_IF(E_NOT_VALID_STATE, !s_emperor);
@@ -659,6 +1006,10 @@ try
         for (uint32_t i = 0; i < panes.Size(); ++i)
         {
             auto p = panes.GetAt(i);
+            if (!_isSessionAuthorized(p.SessionId, CapabilityOperation::ListPanes))
+            {
+                continue;
+            }
             p.WindowId = windowId;
             arr.append(_toJson(p));
         }
@@ -672,6 +1023,8 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::ReadPaneOutput(GUID sessionId, BSTR source, long maxLines, BSTR* json)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_isSessionAuthorized(sessionId, CapabilityOperation::ReadPaneOutput));
     RETURN_HR_IF_NULL(E_POINTER, json);
     *json = nullptr;
     RETURN_HR_IF(E_NOT_VALID_STATE, !s_emperor);
@@ -700,6 +1053,8 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::GetProcessStatus(GUID sessionId, BSTR* json)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_isSessionAuthorized(sessionId, CapabilityOperation::GetProcessStatus));
     RETURN_HR_IF_NULL(E_POINTER, json);
     *json = nullptr;
     RETURN_HR_IF(E_NOT_VALID_STATE, !s_emperor);
@@ -725,6 +1080,8 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::GetSessionVariable(GUID sessionId, BSTR name, BSTR* json)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_isSessionAuthorized(sessionId, CapabilityOperation::GetSessionVariable));
     RETURN_HR_IF_NULL(E_POINTER, json);
     *json = nullptr;
     RETURN_HR_IF(E_NOT_VALID_STATE, !s_emperor);
@@ -750,6 +1107,8 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::GetSettings(BSTR* json)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_hasOperation(CapabilityOperation::GetSettings));
     RETURN_HR_IF_NULL(E_POINTER, json);
     *json = nullptr;
 
@@ -775,6 +1134,8 @@ STDMETHODIMP TerminalProtocolComServer::CreateTab(unsigned __int64 windowId,
                                                   BSTR* json)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_hasOperation(CapabilityOperation::CreateTab));
     RETURN_HR_IF_NULL(E_POINTER, json);
     *json = nullptr;
     RETURN_HR_IF(E_NOT_VALID_STATE, !s_emperor);
@@ -828,17 +1189,127 @@ STDMETHODIMP TerminalProtocolComServer::SplitPane(GUID sessionId,
                                                   float size,
                                                   BSTR profile,
                                                   BSTR commandline,
+                                                  BSTR startingDirectory,
                                                   boolean background,
                                                   BSTR* json)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
     RETURN_HR_IF_NULL(E_POINTER, json);
     *json = nullptr;
     RETURN_HR_IF(E_NOT_VALID_STATE, !s_emperor);
     RETURN_HR_IF(E_INVALIDARG, winrt::guid{ sessionId } == winrt::guid{});
 
+    // ITerminalProtocol is marshaled by the load-bearing, shared
+    // OpenConsoleProxy ABI. New methods must never be inserted into that
+    // interface. Protocol 3.1 therefore transports pane-local surface
+    // creation through SplitPane with reserved directions while retaining a
+    // distinct CreateSurface capability and the normal structured result.
+    const auto directionH = _hstr(direction);
+    constexpr std::wstring_view createSurfaceDirection{ L"__intellterm_surface_v1__" };
+    constexpr std::wstring_view createManagedSurfaceDirection{ L"__intellterm_managed_surface_v1__" };
+    constexpr std::wstring_view createBrowserSurfaceDirection{ L"__intellterm_browser_surface_v1__" };
+
+    if (directionH == createSurfaceDirection)
+    {
+        RETURN_HR_IF(E_ACCESSDENIED, !_isSessionAuthorized(sessionId, CapabilityOperation::CreateSurface));
+
+        winrt::Microsoft::Terminal::Settings::Model::NewTerminalArgs newTermArgs;
+        const auto profileH = _hstr(profile);
+        const auto commandlineH = _hstr(commandline);
+        const auto startingDirectoryH = _hstr(startingDirectory);
+        if (!profileH.empty())
+            newTermArgs.Profile(profileH);
+        if (!commandlineH.empty())
+            newTermArgs.Commandline(commandlineH);
+        if (!startingDirectoryH.empty())
+            newTermArgs.StartingDirectory(startingDirectoryH);
+
+        for (const auto& host : s_emperor->GetWindows())
+        {
+            const auto page = _getPage(host.get());
+            if (!page)
+                continue;
+
+            auto cr = page.CreateProtocolSurface(
+                              winrt::guid{ sessionId },
+                              newTermArgs,
+                              background != 0)
+                          .get();
+            if (cr.SessionId == winrt::guid{})
+                continue;
+
+            cr.WindowId = host->Logic().WindowProperties().WindowId();
+            *json = _bstrFromJson(_toJson(cr));
+            return S_OK;
+        }
+        return E_FAIL;
+    }
+
+    if (directionH == createManagedSurfaceDirection)
+    {
+        RETURN_HR_IF(E_ACCESSDENIED, !_isSessionAuthorized(sessionId, CapabilityOperation::CreateSurface));
+
+        const auto target = _hstr(profile);
+        const auto agent = _hstr(commandline);
+        RETURN_HR_IF(E_INVALIDARG, target.empty() || agent.empty());
+
+        for (const auto& host : s_emperor->GetWindows())
+        {
+            const auto page = _getPage(host.get());
+            if (!page)
+                continue;
+
+            auto cr = page.CreateProtocolManagedSurface(
+                              winrt::guid{ sessionId },
+                              target,
+                              agent,
+                              background != 0)
+                          .get();
+            if (cr.SessionId == winrt::guid{})
+                continue;
+
+            cr.WindowId = host->Logic().WindowProperties().WindowId();
+            *json = _bstrFromJson(_toJson(cr));
+            return S_OK;
+        }
+        return E_FAIL;
+    }
+
+    if (directionH == createBrowserSurfaceDirection)
+    {
+        RETURN_HR_IF(E_ACCESSDENIED, !_isSessionAuthorized(sessionId, CapabilityOperation::CreateSurface));
+
+        const auto remoteWorkspace = _hstr(profile);
+        const auto initialUrl = _hstr(commandline);
+        RETURN_HR_IF(E_INVALIDARG, remoteWorkspace.empty() || initialUrl.empty());
+
+        for (const auto& host : s_emperor->GetWindows())
+        {
+            const auto page = _getPage(host.get());
+            if (!page)
+                continue;
+
+            auto cr = page.CreateProtocolBrowserSurface(
+                              winrt::guid{ sessionId },
+                              remoteWorkspace,
+                              initialUrl,
+                              background != 0)
+                          .get();
+            if (cr.SessionId == winrt::guid{})
+                continue;
+
+            cr.WindowId = host->Logic().WindowProperties().WindowId();
+            *json = _bstrFromJson(_toJson(cr));
+            return S_OK;
+        }
+        return E_FAIL;
+    }
+
+    RETURN_HR_IF(E_ACCESSDENIED, !_isSessionAuthorized(sessionId, CapabilityOperation::SplitPane));
+
     // Map direction string to SplitDirection enum via shared parsing logic.
-    const auto parsedDir = ProtocolParsing::ParseSplitDirection(winrt::to_string(_hstr(direction)));
+    const auto parsedDir = ProtocolParsing::ParseSplitDirection(winrt::to_string(directionH));
     auto splitDir = static_cast<winrt::Microsoft::Terminal::Settings::Model::SplitDirection>(
         static_cast<int>(parsedDir));
 
@@ -846,10 +1317,13 @@ try
     winrt::Microsoft::Terminal::Settings::Model::NewTerminalArgs newTermArgs;
     const auto profileH = _hstr(profile);
     const auto commandlineH = _hstr(commandline);
+    const auto startingDirectoryH = _hstr(startingDirectory);
     if (!profileH.empty())
         newTermArgs.Profile(profileH);
     if (!commandlineH.empty())
         newTermArgs.Commandline(commandlineH);
+    if (!startingDirectoryH.empty())
+        newTermArgs.StartingDirectory(startingDirectoryH);
 
     for (const auto& host : s_emperor->GetWindows())
     {
@@ -874,6 +1348,8 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::ClosePane(GUID sessionId)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_isSessionAuthorized(sessionId, CapabilityOperation::ClosePane));
     RETURN_HR_IF(E_NOT_VALID_STATE, !s_emperor);
     RETURN_HR_IF(E_INVALIDARG, winrt::guid{ sessionId } == winrt::guid{});
 
@@ -894,6 +1370,8 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::SendInput(GUID sessionId, BSTR text)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_isSessionAuthorized(sessionId, CapabilityOperation::SendInput));
     RETURN_HR_IF(E_NOT_VALID_STATE, !s_emperor);
     RETURN_HR_IF(E_INVALIDARG, winrt::guid{ sessionId } == winrt::guid{});
 
@@ -923,6 +1401,8 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::FocusPane(GUID sessionId)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_isSessionAuthorized(sessionId, CapabilityOperation::FocusPane));
     RETURN_HR_IF(E_NOT_VALID_STATE, !s_emperor);
     RETURN_HR_IF(E_INVALIDARG, winrt::guid{ sessionId } == winrt::guid{});
 
@@ -943,6 +1423,8 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::SetSessionVariable(GUID sessionId, BSTR name, BSTR value)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_isSessionAuthorized(sessionId, CapabilityOperation::SetSessionVariable));
     RETURN_HR_IF(E_NOT_VALID_STATE, !s_emperor);
     RETURN_HR_IF(E_INVALIDARG, winrt::guid{ sessionId } == winrt::guid{});
 
@@ -970,6 +1452,8 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::Subscribe(ITerminalProtocolEventSink* sink)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_hasOperation(CapabilityOperation::Subscribe));
     RETURN_HR_IF(E_INVALIDARG, !sink);
 
     // Store the sink as an agile reference so it can be resolved + called from
@@ -1023,6 +1507,8 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::Unsubscribe()
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_hasOperation(CapabilityOperation::Unsubscribe));
     // Allocate the fresh replacement state BEFORE taking the lock so a throwing
     // allocation is caught by CATCH_RETURN (escaping a COM method would crash
     // the process) and never leaves _delivery half-swapped under the lock.
@@ -1052,8 +1538,11 @@ CATCH_RETURN()
 STDMETHODIMP TerminalProtocolComServer::SendEvent(BSTR eventJson)
 try
 {
+    RETURN_IF_PROTOCOL_UNAUTHENTICATED();
+    RETURN_HR_IF(E_ACCESSDENIED, !_hasOperation(CapabilityOperation::SendEvent));
     const auto eventH = _hstr(eventJson);
     auto jsonStr = winrt::to_string(eventH);
+    RETURN_HR_IF(E_ACCESSDENIED, !_isEventAuthorized(jsonStr, CapabilityOperation::SendEvent));
     Json::Value evt;
     const auto route = ProtocolParsing::ClassifySendEvent(jsonStr, evt);
     RETURN_HR_IF(E_INVALIDARG, route == ProtocolParsing::SendEventRoute::Invalid);
@@ -1103,6 +1592,16 @@ try
         // re-warms a fresh helper, resuming `session_id`. Suppressed when
         // the pane was torn down deliberately (Ctrl+C×2, tab close).
         _dispatchRestartAgentPaneToPage(eventH);
+        return S_OK;
+    case ProtocolParsing::SendEventRoute::NativeChatSnapshot:
+        // Structured, immutable chat projection from the helper. The page
+        // routes it by stable workspace id to the matching XAML dock.
+        _dispatchNativeChatSnapshotToPage(eventH);
+        return S_OK;
+    case ProtocolParsing::SendEventRoute::RemoteRelayEvent:
+        // Remote events reuse the authenticated, scope-checked SendEvent bus.
+        // The SSH relay therefore does not create a second UI control plane.
+        _dispatchRemoteRelayEventToPage(eventH);
         return S_OK;
     case ProtocolParsing::SendEventRoute::Broadcast:
     {
@@ -1365,6 +1864,72 @@ void TerminalProtocolComServer::_dispatchAgentStateChangedToPage(const winrt::hs
                 catch (...)
                 {
                     // Swallow: page may have been torn down during dispatch.
+                }
+            });
+    }
+}
+
+void TerminalProtocolComServer::_dispatchNativeChatSnapshotToPage(const winrt::hstring& eventJson)
+{
+    if (!s_emperor)
+    {
+        return;
+    }
+    for (const auto& host : s_emperor->GetWindows())
+    {
+        auto page = _getPage(host.get());
+        if (!page)
+        {
+            continue;
+        }
+        const auto dispatcher = page.Dispatcher();
+        if (!dispatcher)
+        {
+            continue;
+        }
+        dispatcher.RunAsync(
+            winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+            [page, eventJson]() {
+                try
+                {
+                    page.OnNativeChatSnapshot(eventJson);
+                }
+                catch (...)
+                {
+                    // Page may have been torn down during dispatch.
+                }
+            });
+    }
+}
+
+void TerminalProtocolComServer::_dispatchRemoteRelayEventToPage(const winrt::hstring& eventJson)
+{
+    if (!s_emperor)
+    {
+        return;
+    }
+    for (const auto& host : s_emperor->GetWindows())
+    {
+        auto page = _getPage(host.get());
+        if (!page)
+        {
+            continue;
+        }
+        const auto dispatcher = page.Dispatcher();
+        if (!dispatcher)
+        {
+            continue;
+        }
+        dispatcher.RunAsync(
+            winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+            [page, eventJson]() {
+                try
+                {
+                    page.OnRemoteRelayEvent(eventJson);
+                }
+                catch (...)
+                {
+                    // Page may have been torn down during dispatch.
                 }
             });
     }

@@ -25,24 +25,23 @@ use std::path::{Path, PathBuf};
 const PROVIDER_NAME: &str = "Microsoft.Windows.Terminal.WTA";
 
 fn main() {
-    // Set the default thread stack size to 8 MB on Windows debug builds.
+    // Set the default thread stack size to 8 MB on Windows MSVC builds.
     //
     // Why this is needed:
     //   rust-i18n v3 embeds all translations at compile time. Each `t!()`
     //   call-site expands into a match over every available locale (~89).
-    //   In unoptimized (debug) builds the compiler does not collapse these
-    //   match arms, so functions that contain several `t!()` calls produce
-    //   stack frames large enough to overflow the default 1 MB stack.
-    //
-    //   Release builds are unaffected — the optimizer folds the match arms
-    //   and keeps stack usage well within 1 MB.
+    //   In lightly optimized local release builds as well as debug builds,
+    //   those frames can overflow the PE default of 1 MB while clap builds
+    //   the complete command tree. Keep the same deterministic reservation
+    //   in every distributable instead of relying on optimizer side effects.
     //
     // 8 MB is a conservative choice — many Windows desktop applications
     // (including the .NET CLR) default to 4–8 MB stacks.
-    #[cfg(all(debug_assertions, target_os = "windows", target_env = "msvc"))]
+    #[cfg(all(target_os = "windows", target_env = "msvc"))]
     println!("cargo:rustc-link-arg=/STACK:8388608");
 
-    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     // tools/wta -> repo root
     let repo_root = manifest_dir
         .parent()
@@ -55,7 +54,11 @@ fn main() {
     // `terminal-internals` package in official builds; OSS falls back to the stub.
     let overlay = repo_root.join("src/inc/telemetry/ProjectTelemetry.h");
     let stub = repo_root.join("dep/telemetry/ProjectTelemetry.h");
-    let proj_tel_h = if overlay.exists() { overlay.clone() } else { stub.clone() };
+    let proj_tel_h = if overlay.exists() {
+        overlay.clone()
+    } else {
+        stub.clone()
+    };
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", overlay.display());
@@ -131,7 +134,12 @@ fn parse_group_guid(path: &Path) -> String {
             })
         })
         .collect();
-    assert_eq!(f.len(), 11, "group GUID: expected 11 fields, got {}", f.len());
+    assert_eq!(
+        f.len(),
+        11,
+        "group GUID: expected 11 fields, got {}",
+        f.len()
+    );
     format!(
         "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10]
@@ -158,17 +166,16 @@ fn extract_define_u64(path: &Path, name: &str) -> u64 {
             _ => continue,
         };
         // Strip a trailing comment, if any.
-        let value_text = rest
-            .split_once("//")
-            .map(|(v, _)| v)
-            .unwrap_or(rest)
-            .trim();
+        let value_text = rest.split_once("//").map(|(v, _)| v).unwrap_or(rest).trim();
         // Strip a C numeric suffix.
         let digits_end = value_text
             .find(|c: char| !(c.is_ascii_hexdigit() || c == 'x' || c == 'X'))
             .unwrap_or(value_text.len());
         let digits = &value_text[..digits_end];
-        let parsed = if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+        let parsed = if let Some(hex) = digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+        {
             u64::from_str_radix(hex, 16)
         } else {
             digits.parse::<u64>()

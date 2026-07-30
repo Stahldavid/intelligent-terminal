@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -72,6 +73,7 @@ static winrt::com_ptr<ITerminalProtocol> ConnectToTerminal(bool* outAuthenticate
                                                           std::string* outVersion = nullptr,
                                                           bool skipAuthenticate = false)
 {
+    constexpr std::string_view RequiredProtocolVersion{ "3.1" };
     if (outAuthenticated)
         *outAuthenticated = false;
     if (outVersion)
@@ -103,8 +105,23 @@ static winrt::com_ptr<ITerminalProtocol> ConnectToTerminal(bool* outAuthenticate
         return server;
     }
 
+    // Scoped capability tokens contain signed claims (scope, resource,
+    // operations, expiry and nonce) and are intentionally longer than the
+    // legacy host GUID.
+    wchar_t capabilityToken[2048]{};
+    if (!GetEnvironmentVariableW(L"WT_PROTOCOL_TOKEN", capabilityToken, ARRAYSIZE(capabilityToken)))
+    {
+        fprintf(stderr, "[wtcli] WT_PROTOCOL_TOKEN not set. Refusing unauthenticated terminal control.\n");
+        return nullptr;
+    }
     BSTR rawAuth = nullptr;
-    hr = server->Authenticate(nullptr, &rawAuth);
+    const wil::unique_bstr token{ SysAllocString(capabilityToken) };
+    if (!token)
+    {
+        fprintf(stderr, "[wtcli] Failed to allocate authentication token\n");
+        return nullptr;
+    }
+    hr = server->Authenticate(token.get(), &rawAuth);
     bool parsed = false;
     bool authenticated = false;
     std::string version;
@@ -140,6 +157,16 @@ static winrt::com_ptr<ITerminalProtocol> ConnectToTerminal(bool* outAuthenticate
     if (!authenticated)
     {
         fprintf(stderr, "[wtcli] Authentication rejected by server\n");
+        return nullptr;
+    }
+    if (version != RequiredProtocolVersion)
+    {
+        fprintf(stderr,
+                "[wtcli] Incompatible terminal protocol: server=%s client=%.*s. "
+                "Install matching Intelligent Terminal components.\n",
+                version.c_str(),
+                static_cast<int>(RequiredProtocolVersion.size()),
+                RequiredProtocolVersion.data());
         return nullptr;
     }
 
@@ -489,8 +516,163 @@ int main()
             FormatCreatedTabHuman(result);
     });
 
+    // ── new-surface ──
+    std::string newSurfaceTarget, newSurfaceCommand, newSurfaceProfile, newSurfaceCwd;
+    bool newSurfaceBackground = false;
+    auto* newSurfaceCmd = app.add_subcommand(
+        "new-surface",
+        "Create a terminal surface (pane-local tab) in an existing pane")
+                              ->alias("news");
+    newSurfaceCmd->add_option("-t,--target", newSurfaceTarget, "Target surface session ID (GUID)");
+    newSurfaceCmd->add_option("-c,--command", newSurfaceCommand, "Command to run");
+    newSurfaceCmd->add_option("-p,--profile", newSurfaceProfile, "Profile");
+    newSurfaceCmd->add_option("-d,--cwd", newSurfaceCwd, "Starting directory");
+    newSurfaceCmd->add_flag("-b,--background", newSurfaceBackground, "Keep the current surface active");
+    newSurfaceCmd->callback([&]() {
+        auto server = connect();
+        if (!server) return;
+        const auto sessionId = ResolveSessionId(server.get(), newSurfaceTarget);
+        if (IsEqualGUID(sessionId, GUID{}))
+        {
+            exitCode = 1;
+            return;
+        }
+        wil::unique_bstr profile{ Bstr(newSurfaceProfile) };
+        wil::unique_bstr command{ Bstr(newSurfaceCommand) };
+        wil::unique_bstr cwd{ Bstr(newSurfaceCwd) };
+        wil::unique_bstr internalDirection{ Bstr("__intellterm_surface_v1__") };
+        Json::Value result;
+        const auto hr = CallJson([&](BSTR* j) {
+            return server->SplitPane(
+                sessionId,
+                internalDirection.get(),
+                0.0f,
+                profile.get(),
+                command.get(),
+                cwd.get(),
+                newSurfaceBackground,
+                j);
+        }, result);
+        if (FAILED(hr))
+        {
+            fprintf(stderr, "CreateSurface failed: 0x%08X\n", static_cast<uint32_t>(hr));
+            exitCode = 1;
+            return;
+        }
+        if (jsonMode)
+            PrintJson(result);
+        else
+            FormatCreatedPaneHuman(result);
+    });
+
+    // ── new-agent-surface ──
+    std::string newAgentSurfaceTarget, newAgentSurfaceComputeTarget, newAgentSurfaceAgent;
+    bool newAgentSurfaceBackground = false;
+    auto* newAgentSurfaceCmd = app.add_subcommand(
+        "new-agent-surface",
+        "Create a managed agent surface bound to a compute target")
+                                   ->alias("newas");
+    newAgentSurfaceCmd->add_option("-t,--target", newAgentSurfaceTarget, "Target surface session ID (GUID)");
+    newAgentSurfaceCmd->add_option(
+        "--compute-target",
+        newAgentSurfaceComputeTarget,
+        "Canonical ComputeTarget ID")
+        ->required();
+    newAgentSurfaceCmd->add_option(
+        "-a,--agent",
+        newAgentSurfaceAgent,
+        "Agent ID (codex, claude, gemini, copilot, or configured custom ID)")
+        ->required();
+    newAgentSurfaceCmd->add_flag("-b,--background", newAgentSurfaceBackground, "Keep the current surface active");
+    newAgentSurfaceCmd->callback([&]() {
+        auto server = connect();
+        if (!server) return;
+        const auto sessionId = ResolveSessionId(server.get(), newAgentSurfaceTarget);
+        if (IsEqualGUID(sessionId, GUID{}))
+        {
+            exitCode = 1;
+            return;
+        }
+        wil::unique_bstr computeTarget{ Bstr(newAgentSurfaceComputeTarget) };
+        wil::unique_bstr agent{ Bstr(newAgentSurfaceAgent) };
+        wil::unique_bstr internalDirection{ Bstr("__intellterm_managed_surface_v1__") };
+        Json::Value result;
+        const auto hr = CallJson([&](BSTR* j) {
+            return server->SplitPane(
+                sessionId,
+                internalDirection.get(),
+                0.0f,
+                computeTarget.get(),
+                agent.get(),
+                nullptr,
+                newAgentSurfaceBackground,
+                j);
+        }, result);
+        if (FAILED(hr))
+        {
+            fprintf(stderr, "CreateManagedSurface failed: 0x%08X\n", static_cast<uint32_t>(hr));
+            exitCode = 1;
+            return;
+        }
+        if (jsonMode)
+            PrintJson(result);
+        else
+            FormatCreatedPaneHuman(result);
+    });
+
+    // ── new-browser-surface ──
+    std::string newBrowserSurfaceTarget, newBrowserRemoteWorkspace, newBrowserUrl{ "https://example.com" };
+    bool newBrowserSurfaceBackground = false;
+    auto* newBrowserSurfaceCmd = app.add_subcommand(
+        "new-browser-surface",
+        "Create an isolated remote browser surface")
+                                     ->alias("newbs");
+    newBrowserSurfaceCmd->add_option("-t,--target", newBrowserSurfaceTarget, "Target surface session ID (GUID)");
+    newBrowserSurfaceCmd->add_option(
+        "--remote-workspace",
+        newBrowserRemoteWorkspace,
+        "Canonical RemoteWorkspace ID")
+        ->required();
+    newBrowserSurfaceCmd->add_option("--url", newBrowserUrl, "Initial HTTP/HTTPS URL");
+    newBrowserSurfaceCmd->add_flag("-b,--background", newBrowserSurfaceBackground, "Keep the current surface active");
+    newBrowserSurfaceCmd->callback([&]() {
+        auto server = connect();
+        if (!server) return;
+        const auto sessionId = ResolveSessionId(server.get(), newBrowserSurfaceTarget);
+        if (IsEqualGUID(sessionId, GUID{}))
+        {
+            exitCode = 1;
+            return;
+        }
+        wil::unique_bstr remoteWorkspace{ Bstr(newBrowserRemoteWorkspace) };
+        wil::unique_bstr url{ Bstr(newBrowserUrl) };
+        wil::unique_bstr internalDirection{ Bstr("__intellterm_browser_surface_v1__") };
+        Json::Value result;
+        const auto hr = CallJson([&](BSTR* j) {
+            return server->SplitPane(
+                sessionId,
+                internalDirection.get(),
+                0.0f,
+                remoteWorkspace.get(),
+                url.get(),
+                nullptr,
+                newBrowserSurfaceBackground,
+                j);
+        }, result);
+        if (FAILED(hr))
+        {
+            fprintf(stderr, "CreateBrowserSurface failed: 0x%08X\n", static_cast<uint32_t>(hr));
+            exitCode = 1;
+            return;
+        }
+        if (jsonMode)
+            PrintJson(result);
+        else
+            FormatCreatedPaneHuman(result);
+    });
+
     // ── split-pane ──
-    std::string splitPaneTarget, splitPaneCommand, splitPaneDirection, splitPaneProfile;
+    std::string splitPaneTarget, splitPaneCommand, splitPaneDirection, splitPaneProfile, splitPaneCwd;
     bool splitHorizontal = false, splitVertical = false;
     double splitSize = 0.5;
     auto* splitPaneCmd = app.add_subcommand("split-pane", "Split a pane")->alias("splitw");
@@ -501,6 +683,7 @@ int main()
     splitPaneCmd->add_option("-s,--size", splitSize, "Size fraction");
     splitPaneCmd->add_option("-c,--command", splitPaneCommand, "Command to run");
     splitPaneCmd->add_option("-p,--profile", splitPaneProfile, "Profile");
+    splitPaneCmd->add_option("--cwd", splitPaneCwd, "Starting directory");
     splitPaneCmd->callback([&]() {
         auto server = connect();
         if (!server) return;
@@ -514,10 +697,10 @@ int main()
             dir = "right";
         else
             dir = "automatic";
-        wil::unique_bstr dirB{ Bstr(dir) }, profile{ Bstr(splitPaneProfile) }, command{ Bstr(splitPaneCommand) };
+        wil::unique_bstr dirB{ Bstr(dir) }, profile{ Bstr(splitPaneProfile) }, command{ Bstr(splitPaneCommand) }, cwd{ Bstr(splitPaneCwd) };
         Json::Value result;
         auto hr = CallJson([&](BSTR* j) {
-            return server->SplitPane(sessionId, dirB.get(), static_cast<float>(splitSize), profile.get(), command.get(), true, j);
+            return server->SplitPane(sessionId, dirB.get(), static_cast<float>(splitSize), profile.get(), command.get(), cwd.get(), true, j);
         }, result);
         if (FAILED(hr)) { fprintf(stderr, "SplitPane failed: 0x%08X\n", static_cast<uint32_t>(hr)); exitCode = 1; return; }
         if (jsonMode)
@@ -780,6 +963,47 @@ int main()
         wil::unique_bstr evt{ Bstr(publishJson) };
         auto hr = server->SendEvent(evt.get());
         if (FAILED(hr)) { fprintf(stderr, "publish failed: 0x%08X\n", static_cast<uint32_t>(hr)); exitCode = 1; }
+    });
+
+    // ── publish-stdin ──
+    // Persistent variant used by WTA's native chat bridge. Authentication and
+    // COM activation happen once, then each compact single-line JSON document
+    // is forwarded in order. This avoids spawning wtcli for every streaming
+    // snapshot while retaining the exact same server-side authorization.
+    auto* publishStdinCmd = app.add_subcommand(
+        "publish-stdin",
+        "Forward newline-delimited JSON from stdin to SendEvent");
+    publishStdinCmd->callback([&]() {
+        auto server = connect();
+        if (!server) return;
+
+        constexpr size_t MaximumEventBytes = 1024 * 1024;
+        std::string line;
+        while (std::getline(std::cin, line))
+        {
+            if (line.empty())
+            {
+                continue;
+            }
+            if (line.size() > MaximumEventBytes)
+            {
+                fprintf(stderr, "publish-stdin: event exceeds 1 MiB\n");
+                std::cout << "error\n" << std::flush;
+                exitCode = 1;
+                continue;
+            }
+
+            wil::unique_bstr evt{ Bstr(line) };
+            const auto hr = server->SendEvent(evt.get());
+            if (FAILED(hr))
+            {
+                fprintf(stderr, "publish-stdin failed: 0x%08X\n", static_cast<uint32_t>(hr));
+                std::cout << "error\n" << std::flush;
+                exitCode = 1;
+                break;
+            }
+            std::cout << "ok\n" << std::flush;
+        }
     });
 
     // ── send-event ──

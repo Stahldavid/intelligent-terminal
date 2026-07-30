@@ -22,6 +22,7 @@
 
 #include "TaskbarState.h"
 #include "TerminalPaneContent.h"
+#include "SurfaceStackPaneContent.h"
 
 // fwdecl unittest classes
 namespace TerminalAppLocalTests
@@ -94,7 +95,19 @@ public:
     }
 
     winrt::Windows::UI::Xaml::Controls::Grid GetRootElement();
-    winrt::TerminalApp::IPaneContent GetContent() const noexcept { return _IsLeaf() ? _content : nullptr; }
+    // The pane owns the SurfaceStack host, while callers continue to operate on
+    // the active native IPaneContent. This preserves the existing command,
+    // protocol and focus model instead of introducing a competing tab model.
+    winrt::TerminalApp::IPaneContent GetContent() const noexcept;
+    winrt::TerminalApp::IPaneContent GetContentEventSource() const noexcept { return _IsLeaf() ? _content : nullptr; }
+    winrt::TerminalApp::SurfaceStackPaneContent GetSurfaceStack() const noexcept;
+    uint32_t AddSurface(const winrt::TerminalApp::IPaneContent& content);
+    winrt::TerminalApp::IPaneContent DetachActiveSurface();
+    uint32_t SurfaceCount() const noexcept;
+    std::vector<winrt::TerminalApp::IPaneContent> GetContents() const;
+    winrt::TerminalApp::IPaneContent FindContentBySessionId(const winrt::guid& sessionId) const;
+    bool ActivateSurfaceBySessionId(const winrt::guid& sessionId);
+    bool CloseSurfaceBySessionId(const winrt::guid& sessionId);
 
     bool WasLastFocused() const noexcept;
     void UpdateVisuals();
@@ -112,6 +125,7 @@ public:
     winrt::Microsoft::Terminal::Settings::Model::INewContentArgs GetTerminalArgsForPane(winrt::TerminalApp::BuildStartupKind kind) const;
 
     void UpdateSettings(const winrt::Microsoft::Terminal::Settings::Model::CascadiaSettings& settings);
+    void SetOuterLeftPaddingTrim(bool trim);
     bool ResizePane(const winrt::Microsoft::Terminal::Settings::Model::ResizeDirection& direction);
     std::shared_ptr<Pane> NavigateDirection(const std::shared_ptr<Pane> sourcePane,
                                             const winrt::Microsoft::Terminal::Settings::Model::FocusDirection& direction,
@@ -161,10 +175,11 @@ public:
     std::shared_ptr<Pane> FindPaneByContentId(const uint32_t contentId);
     std::shared_ptr<Pane> FindPaneBySessionId(const winrt::guid& sessionId);
 
-    // Session variables for protocol support
-    std::optional<winrt::hstring> GetSessionVariable(const winrt::hstring& name) const;
-    void SetSessionVariable(const winrt::hstring& name, const winrt::hstring& value);
-    void RemoveSessionVariable(const winrt::hstring& name);
+    // Session variables for protocol support. A pane may host multiple terminal
+    // surfaces, so the session ID is part of the key.
+    std::optional<winrt::hstring> GetSessionVariable(const winrt::guid& sessionId, const winrt::hstring& name) const;
+    void SetSessionVariable(const winrt::guid& sessionId, const winrt::hstring& name, const winrt::hstring& value);
+    void RemoveSessionVariable(const winrt::guid& sessionId, const winrt::hstring& name);
 
     void FinalizeConfigurationGivenDefault();
 
@@ -252,6 +267,14 @@ public:
     til::event<gotFocusArgs> GotFocus;
     til::event<winrt::delegate<std::shared_ptr<Pane>>> LostFocus;
     til::event<winrt::delegate<std::shared_ptr<Pane>>> Detached;
+    using newSurfaceRequestedArgs = winrt::delegate<
+        std::shared_ptr<Pane>,
+        winrt::Microsoft::Terminal::Settings::Model::INewContentArgs>;
+    til::event<newSurfaceRequestedArgs> NewSurfaceRequested;
+    using surfaceActionRequestedArgs = winrt::delegate<
+        std::shared_ptr<Pane>,
+        winrt::Microsoft::Terminal::Settings::Model::ActionAndArgs>;
+    til::event<surfaceActionRequestedArgs> SurfaceActionRequested;
 
 private:
     struct PanePoint;
@@ -288,8 +311,8 @@ private:
     std::weak_ptr<Pane> _parentChildPath{};
     bool _lastActive{ false };
 
-    // Session variables for protocol support (per-pane key-value store)
-    std::unordered_map<std::wstring, std::wstring> _sessionVariables;
+    // Session variables for protocol support (per terminal surface/session).
+    std::unordered_map<std::wstring, std::unordered_map<std::wstring, std::wstring>> _sessionVariables;
 
     static std::atomic<uint32_t> s_nextContentId;
     winrt::event_token _firstClosedToken{ 0 };
@@ -298,6 +321,8 @@ private:
     winrt::Windows::UI::Xaml::UIElement::GotFocus_revoker _gotFocusRevoker;
     winrt::Windows::UI::Xaml::UIElement::LostFocus_revoker _lostFocusRevoker;
     winrt::TerminalApp::IPaneContent::CloseRequested_revoker _closeRequestedRevoker;
+    winrt::TerminalApp::SurfaceStackPaneContent::NewSurfaceRequested_revoker _newSurfaceRequestedRevoker;
+    winrt::TerminalApp::SurfaceStackPaneContent::ActionRequested_revoker _surfaceActionRequestedRevoker;
 
     Borders _borders{ Borders::None };
 

@@ -3,6 +3,7 @@
 
 #include "pch.h"
 #include "Pane.h"
+#include "BrowserPaneContent.h"
 
 using namespace winrt::Windows::Foundation;
 using namespace winrt::Windows::Graphics::Display;
@@ -37,6 +38,13 @@ static const Duration AnimationDuration = DurationHelper::FromTimeSpan(winrt::Wi
 Pane::Pane(IPaneContent content, const bool lastFocused) :
     _lastActive{ lastFocused }
 {
+    // Plain terminal sessions are promoted to a SurfaceStack at the ownership
+    // boundary. Special panes (settings, snippets and the agent dashboard)
+    // retain their own presentation and are not given redundant local tabs.
+    if (content.try_as<TerminalPaneContent>())
+    {
+        content = winrt::make<winrt::TerminalApp::implementation::SurfaceStackPaneContent>(content);
+    }
     _setPaneContent(std::move(content), s_nextContentId.fetch_add(1));
     _root.Children().Append(_borderFirst);
 
@@ -103,7 +111,165 @@ INewContentArgs Pane::GetTerminalArgsForPane(BuildStartupKind kind) const
     {
         return nullptr;
     }
-    return _content.GetNewTerminalArgs(kind);
+    return GetContent().GetNewTerminalArgs(kind);
+}
+
+IPaneContent Pane::GetContent() const noexcept
+{
+    if (!_IsLeaf())
+    {
+        return nullptr;
+    }
+    if (const auto stack = _content.try_as<winrt::TerminalApp::SurfaceStackPaneContent>())
+    {
+        return stack.ActiveSurface();
+    }
+    return _content;
+}
+
+winrt::TerminalApp::SurfaceStackPaneContent Pane::GetSurfaceStack() const noexcept
+{
+    return _IsLeaf() ? _content.try_as<winrt::TerminalApp::SurfaceStackPaneContent>() : nullptr;
+}
+
+uint32_t Pane::AddSurface(const IPaneContent& content)
+{
+    if (const auto stack = GetSurfaceStack())
+    {
+        return stack.AddSurface(content);
+    }
+    return 0;
+}
+
+IPaneContent Pane::DetachActiveSurface()
+{
+    if (const auto stack = GetSurfaceStack())
+    {
+        return stack.DetachActiveSurface();
+    }
+    return nullptr;
+}
+
+uint32_t Pane::SurfaceCount() const noexcept
+{
+    if (const auto stack = GetSurfaceStack())
+    {
+        return stack.SurfaceCount();
+    }
+    return _IsLeaf() && _content ? 1 : 0;
+}
+
+std::vector<IPaneContent> Pane::GetContents() const
+{
+    std::vector<IPaneContent> contents;
+    if (!_IsLeaf() || !_content)
+    {
+        return contents;
+    }
+    if (const auto stack = GetSurfaceStack())
+    {
+        contents.reserve(stack.SurfaceCount());
+        for (uint32_t i = 0; i < stack.SurfaceCount(); ++i)
+        {
+            if (const auto content = stack.SurfaceAt(i))
+            {
+                contents.emplace_back(content);
+            }
+        }
+    }
+    else
+    {
+        contents.emplace_back(_content);
+    }
+    return contents;
+}
+
+static winrt::guid _getSessionIdFromContent(const IPaneContent& content)
+{
+    TerminalPaneContent terminal{ nullptr };
+    if (const auto t = content.try_as<TerminalPaneContent>())
+    {
+        terminal = t;
+    }
+    else if (const auto agent = content.try_as<AgentPaneContent>())
+    {
+        terminal = agent.GetTerminalContent();
+    }
+    else if (const auto browser = content.try_as<BrowserPaneContent>())
+    {
+        try
+        {
+            return winrt::guid{ browser.SurfaceSessionId() };
+        }
+        catch (...)
+        {
+            return {};
+        }
+    }
+    if (terminal)
+    {
+        if (const auto control = terminal.GetTermControl())
+        {
+            if (const auto connection = control.Connection())
+            {
+                return connection.SessionId();
+            }
+        }
+    }
+    return {};
+}
+
+IPaneContent Pane::FindContentBySessionId(const winrt::guid& sessionId) const
+{
+    if (sessionId == winrt::guid{})
+    {
+        return nullptr;
+    }
+    for (const auto& content : GetContents())
+    {
+        if (_getSessionIdFromContent(content) == sessionId)
+        {
+            return content;
+        }
+    }
+    return nullptr;
+}
+
+bool Pane::ActivateSurfaceBySessionId(const winrt::guid& sessionId)
+{
+    if (const auto stack = GetSurfaceStack())
+    {
+        for (uint32_t i = 0; i < stack.SurfaceCount(); ++i)
+        {
+            if (_getSessionIdFromContent(stack.SurfaceAt(i)) == sessionId)
+            {
+                return stack.ActivateSurface(stack.SurfaceIdAt(i));
+            }
+        }
+        return false;
+    }
+    return FindContentBySessionId(sessionId) != nullptr;
+}
+
+bool Pane::CloseSurfaceBySessionId(const winrt::guid& sessionId)
+{
+    if (const auto stack = GetSurfaceStack())
+    {
+        for (uint32_t i = 0; i < stack.SurfaceCount(); ++i)
+        {
+            if (_getSessionIdFromContent(stack.SurfaceAt(i)) == sessionId)
+            {
+                return stack.CloseSurface(stack.SurfaceIdAt(i));
+            }
+        }
+        return false;
+    }
+    if (FindContentBySessionId(sessionId))
+    {
+        Close();
+        return true;
+    }
+    return false;
 }
 
 // Method Description:
@@ -1348,6 +1514,24 @@ void Pane::UpdateSettings(const CascadiaSettings& settings)
     }
 }
 
+// Removes the left presentation inset only from leaves that physically touch
+// the outer-left edge of this pane tree. For a horizontal split both children
+// share that edge; for a vertical split only the first child does.
+void Pane::SetOuterLeftPaddingTrim(const bool trim)
+{
+    if (_IsLeaf())
+    {
+        if (const auto control = GetTerminalControl())
+        {
+            control.SetTrimLeftPadding(trim);
+        }
+        return;
+    }
+
+    _firstChild->SetOuterLeftPaddingTrim(trim);
+    _secondChild->SetOuterLeftPaddingTrim(_splitState == SplitState::Horizontal ? trim : false);
+}
+
 // Method Description:
 // - Attempts to add the provided pane as a split of the current pane.
 // Arguments:
@@ -1937,6 +2121,8 @@ void Pane::_SetupChildCloseHandlers()
 IPaneContent Pane::_takePaneContent()
 {
     _closeRequestedRevoker.revoke();
+    _newSurfaceRequestedRevoker.revoke();
+    _surfaceActionRequestedRevoker.revoke();
     _contentId = std::nullopt;
     return std::move(_content);
 }
@@ -1959,6 +2145,20 @@ void Pane::_setPaneContent(IPaneContent content, std::optional<uint32_t> content
         _content = std::move(content);
         _contentId = contentId;
         _closeRequestedRevoker = _content.CloseRequested(winrt::auto_revoke, [this](auto&&, auto&&) { Close(); });
+        if (const auto stack = GetSurfaceStack())
+        {
+            _newSurfaceRequestedRevoker = stack.NewSurfaceRequested(winrt::auto_revoke, [this](auto&&, const winrt::Windows::Foundation::IInspectable& request) {
+                NewSurfaceRequested.raise(
+                    shared_from_this(),
+                    request.try_as<winrt::Microsoft::Terminal::Settings::Model::INewContentArgs>());
+            });
+            _surfaceActionRequestedRevoker = stack.ActionRequested(winrt::auto_revoke, [this](auto&&, const winrt::Windows::Foundation::IInspectable& request) {
+                if (const auto action = request.try_as<winrt::Microsoft::Terminal::Settings::Model::ActionAndArgs>())
+                {
+                    SurfaceActionRequested.raise(shared_from_this(), action);
+                }
+            });
+        }
     }
 }
 
@@ -2763,24 +2963,38 @@ void Pane::Id(uint32_t id) noexcept
     _id = id;
 }
 
-std::optional<winrt::hstring> Pane::GetSessionVariable(const winrt::hstring& name) const
+std::optional<winrt::hstring> Pane::GetSessionVariable(const winrt::guid& sessionId, const winrt::hstring& name) const
 {
-    const auto it = _sessionVariables.find(std::wstring{ name });
-    if (it != _sessionVariables.end())
+    const auto sessionIt = _sessionVariables.find(std::wstring{ winrt::to_hstring(sessionId) });
+    if (sessionIt == _sessionVariables.end())
+    {
+        return std::nullopt;
+    }
+
+    const auto it = sessionIt->second.find(std::wstring{ name });
+    if (it != sessionIt->second.end())
     {
         return winrt::hstring{ it->second };
     }
     return std::nullopt;
 }
 
-void Pane::SetSessionVariable(const winrt::hstring& name, const winrt::hstring& value)
+void Pane::SetSessionVariable(const winrt::guid& sessionId, const winrt::hstring& name, const winrt::hstring& value)
 {
-    _sessionVariables[std::wstring{ name }] = std::wstring{ value };
+    _sessionVariables[std::wstring{ winrt::to_hstring(sessionId) }][std::wstring{ name }] = std::wstring{ value };
 }
 
-void Pane::RemoveSessionVariable(const winrt::hstring& name)
+void Pane::RemoveSessionVariable(const winrt::guid& sessionId, const winrt::hstring& name)
 {
-    _sessionVariables.erase(std::wstring{ name });
+    const auto sessionKey = std::wstring{ winrt::to_hstring(sessionId) };
+    if (const auto sessionIt = _sessionVariables.find(sessionKey); sessionIt != _sessionVariables.end())
+    {
+        sessionIt->second.erase(std::wstring{ name });
+        if (sessionIt->second.empty())
+        {
+            _sessionVariables.erase(sessionIt);
+        }
+    }
 }
 
 // Method Description:
@@ -2849,7 +3063,8 @@ winrt::TerminalApp::TerminalPaneContent Pane::_getTerminalContent() const
     {
         return nullptr;
     }
-    if (auto term = _content.try_as<winrt::TerminalApp::TerminalPaneContent>())
+    const auto activeContent = GetContent();
+    if (auto term = activeContent.try_as<winrt::TerminalApp::TerminalPaneContent>())
     {
         return term;
     }
@@ -2857,7 +3072,7 @@ winrt::TerminalApp::TerminalPaneContent Pane::_getTerminalContent() const
     // so the leaf can render an XAML agent bar above the term control.
     // Unwrap it so all the existing Pane internals (focus, broadcast,
     // resize, etc.) keep operating on the underlying TermControl.
-    if (auto agent = _content.try_as<winrt::TerminalApp::AgentPaneContent>())
+    if (auto agent = activeContent.try_as<winrt::TerminalApp::AgentPaneContent>())
     {
         return agent.GetTerminalContent();
     }
@@ -2887,27 +3102,7 @@ std::shared_ptr<Pane> Pane::FindPaneBySessionId(const winrt::guid& sessionId)
         return nullptr;
     }
     return _FindPane([&](const auto& p) {
-        if (!p->_IsLeaf() || !p->_content)
-            return false;
-        // Use `_getTerminalContent()` so agent panes (whose `_content`
-        // is an `AgentPaneContent` wrapping a `TerminalPaneContent`)
-        // are matched too. Without this unwrap, FindPaneBySessionId
-        // would skip every agent pane → `TerminalProtocolComServer::FocusPane`
-        // would walk every tab without finding a match → throw E_FAIL
-        // (0x80004005), which surfaces in WTA as
-        // `FocusPane failed: 0x80004005` whenever the user presses
-        // Enter on an active agent-pane session row in the session management list.
-        const auto termContent = p->_getTerminalContent();
-        if (!termContent)
-            return false;
-        if (const auto control = termContent.GetTermControl())
-        {
-            if (const auto conn = control.Connection())
-            {
-                return conn.SessionId() == sessionId;
-            }
-        }
-        return false;
+        return p->_IsLeaf() && p->FindContentBySessionId(sessionId) != nullptr;
     });
 }
 
@@ -3032,7 +3227,7 @@ Pane::SnapSizeResult Pane::_CalcSnappedDimension(const bool widthOrHeight, const
 
     if (_IsLeaf())
     {
-        const auto& snappable{ _content.try_as<ISnappable>() };
+        const auto& snappable{ GetContent().try_as<ISnappable>() };
         // Agent panes are fixed-position and don't participate in the terminal
         // character grid. Their TermControl may also be uninitialized, which
         // makes GridUnitSize/SnapDownToGrid return inf/NaN and poisons the
@@ -3123,7 +3318,7 @@ void Pane::_AdvanceSnappedDimension(const bool widthOrHeight, LayoutSizeNode& si
 {
     if (_IsLeaf())
     {
-        const auto& snappable{ _content.try_as<ISnappable>() };
+        const auto& snappable{ GetContent().try_as<ISnappable>() };
         // Same reasoning as _CalcSnappedDimension: treat agent panes as
         // non-snappable so we never touch their (uninitialized) GridUnitSize.
         if (snappable && !_isAgentPane)
@@ -3358,7 +3553,7 @@ int Pane::GetLeafPaneCount() const noexcept
 //   created via default handoff
 void Pane::FinalizeConfigurationGivenDefault()
 {
-    if (const auto& terminalPane{ _content.try_as<TerminalPaneContent>() })
+    if (const auto& terminalPane{ GetContent().try_as<TerminalPaneContent>() })
     {
         terminalPane.MarkAsDefterm();
     }
@@ -3434,7 +3629,8 @@ winrt::guid Pane::GetSessionId() const
     // walk content → control → connection and read the SessionId. Using
     // GetContent() (instead of `_content` directly) keeps the non-leaf
     // case to a clean nullptr without needing an explicit leaf check.
-    if (const auto termContent = GetContent().try_as<winrt::TerminalApp::TerminalPaneContent>())
+    const auto content = GetContent();
+    if (const auto termContent = content.try_as<winrt::TerminalApp::TerminalPaneContent>())
     {
         if (const auto control = termContent.GetTermControl())
         {
@@ -3442,6 +3638,30 @@ winrt::guid Pane::GetSessionId() const
             {
                 return conn.SessionId();
             }
+        }
+    }
+    if (const auto agent = content.try_as<winrt::TerminalApp::AgentPaneContent>())
+    {
+        if (const auto terminal = agent.GetTerminalContent())
+        {
+            if (const auto control = terminal.GetTermControl())
+            {
+                if (const auto conn = control.Connection())
+                {
+                    return conn.SessionId();
+                }
+            }
+        }
+    }
+    if (const auto browser = content.try_as<winrt::TerminalApp::BrowserPaneContent>())
+    {
+        try
+        {
+            return winrt::guid{ browser.SurfaceSessionId() };
+        }
+        catch (...)
+        {
+            return {};
         }
     }
     return {};

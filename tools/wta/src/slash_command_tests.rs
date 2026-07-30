@@ -64,7 +64,10 @@ fn classify_not_a_command() {
     assert_eq!(commands::classify("/"), ParseOutcome::NotCommand);
     assert_eq!(commands::classify("/  "), ParseOutcome::NotCommand);
     // A `/` in the middle of a prompt is not an attempt.
-    assert_eq!(commands::classify("run cmd /flag"), ParseOutcome::NotCommand);
+    assert_eq!(
+        commands::classify("run cmd /flag"),
+        ParseOutcome::NotCommand
+    );
 }
 
 // ---- App dispatch — state effects via handle_slash_command ----
@@ -241,8 +244,16 @@ fn slash_model_without_models_notes_none() {
 fn slash_model_bare_opens_picker_when_models_present() {
     let mut app = test_app();
     app.available_models = vec![
-        AcpModelInfo { id: "fast".into(), name: "Fast".into(), description: None },
-        AcpModelInfo { id: "smart".into(), name: "Smart".into(), description: None },
+        AcpModelInfo {
+            id: "fast".into(),
+            name: "Fast".into(),
+            description: None,
+        },
+        AcpModelInfo {
+            id: "smart".into(),
+            name: "Smart".into(),
+            description: None,
+        },
     ];
 
     run_slash(&mut app, "model");
@@ -256,8 +267,11 @@ fn slash_model_bare_opens_picker_when_models_present() {
 #[test]
 fn agent_and_model_pickers_are_mutually_exclusive() {
     let mut app = test_app();
-    app.available_models =
-        vec![AcpModelInfo { id: "fast".into(), name: "Fast".into(), description: None }];
+    app.available_models = vec![AcpModelInfo {
+        id: "fast".into(),
+        name: "Fast".into(),
+        description: None,
+    }];
 
     app.open_model_picker();
     assert!(app.current_tab().model_picker_open);
@@ -276,8 +290,16 @@ fn agent_and_model_pickers_are_mutually_exclusive() {
 fn slash_model_direct_switch_sets_override() {
     let mut app = test_app();
     app.available_models = vec![
-        AcpModelInfo { id: "fast".into(), name: "Fast".into(), description: None },
-        AcpModelInfo { id: "smart".into(), name: "Smart".into(), description: None },
+        AcpModelInfo {
+            id: "fast".into(),
+            name: "Fast".into(),
+            description: None,
+        },
+        AcpModelInfo {
+            id: "smart".into(),
+            name: "Smart".into(),
+            description: None,
+        },
     ];
 
     run_slash_args(&mut app, "model", "smart");
@@ -307,8 +329,7 @@ fn slash_move_changes_only_the_active_tab() {
         "/move l must normalize to the canonical left position"
     );
     assert_eq!(
-        app.tab_sessions["other-tab"].agent_pane_position,
-        None,
+        app.tab_sessions["other-tab"].agent_pane_position, None,
         "/move must not alter another tab's pane position"
     );
 }

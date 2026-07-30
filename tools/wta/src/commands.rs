@@ -56,9 +56,13 @@ pub enum CommandKind {
     /// Move this tab's agent pane without changing the global pane-position
     /// setting or any other tab.
     Move,
+    /// Select an ACP session mode advertised by the active agent.
+    Mode,
+    /// Inspect or change an ACP session configuration option.
+    Config,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandSpec {
     pub name: &'static str,
     /// rust-i18n key for the user-facing description. Resolved at render
@@ -71,6 +75,70 @@ pub struct CommandSpec {
     pub takes_args: bool,
 }
 
+/// A slash command advertised by the active ACP session.
+///
+/// Unlike [`CommandSpec`], this is owned and session-scoped: agents may
+/// replace the complete list at any time via `available_commands_update`.
+/// Keeping the wire data out of the static registry prevents Codex, Claude,
+/// Copilot and custom agents from competing with terminal-local commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCommandSpec {
+    pub name: String,
+    pub description: String,
+    pub input_hint: Option<String>,
+}
+
+impl AgentCommandSpec {
+    pub fn takes_args(&self) -> bool {
+        self.input_hint.is_some()
+    }
+}
+
+/// One row in the merged command palette.
+///
+/// Local commands are always presented under `/terminal:*`. Legacy
+/// unnamespaced spellings remain accepted when they do not collide with a
+/// command advertised by the active agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandCandidate {
+    Local(&'static CommandSpec),
+    Agent(AgentCommandSpec),
+}
+
+impl CommandCandidate {
+    pub fn completion_name(&self) -> String {
+        match self {
+            Self::Local(spec) => format!("terminal:{}", spec.name),
+            Self::Agent(spec) => spec.name.clone(),
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        self.completion_name()
+    }
+
+    pub fn summary(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Local(spec) => spec.summary(),
+            Self::Agent(spec) => std::borrow::Cow::Owned(spec.description.clone()),
+        }
+    }
+
+    pub fn source(&self) -> &'static str {
+        match self {
+            Self::Local(_) => "Terminal",
+            Self::Agent(_) => "Agent",
+        }
+    }
+
+    pub fn takes_args(&self) -> bool {
+        match self {
+            Self::Local(spec) => spec.takes_args,
+            Self::Agent(spec) => spec.takes_args(),
+        }
+    }
+}
+
 impl CommandSpec {
     /// Look up the localized summary at render time.
     ///
@@ -79,7 +147,19 @@ impl CommandSpec {
     /// time-embedded yml) avoids an allocation on every render — the
     /// command popup re-fetches summaries per frame and per row.
     pub fn summary(&self) -> std::borrow::Cow<'static, str> {
-        rust_i18n::t!(self.summary_key)
+        match self.kind {
+            // ACP-aware host controls are deliberately kept as compact
+            // protocol terms in every locale until they enter the product's
+            // translation pipeline. This avoids silently falling back to an
+            // unrelated command description and keeps locale key parity.
+            CommandKind::Mode => std::borrow::Cow::Borrowed(
+                "Inspect or change the active agent mode (/terminal:mode <id>)",
+            ),
+            CommandKind::Config => std::borrow::Cow::Borrowed(
+                "Inspect or change an agent option (/terminal:config <id>=<value>)",
+            ),
+            _ => rust_i18n::t!(self.summary_key),
+        }
     }
 }
 
@@ -145,6 +225,18 @@ pub const REGISTRY: &[CommandSpec] = &[
         name: "move",
         summary_key: "commands.move.summary",
         kind: CommandKind::Move,
+        takes_args: true,
+    },
+    CommandSpec {
+        name: "mode",
+        summary_key: "commands.model.summary",
+        kind: CommandKind::Mode,
+        takes_args: true,
+    },
+    CommandSpec {
+        name: "config",
+        summary_key: "commands.model.summary",
+        kind: CommandKind::Config,
         takes_args: true,
     },
 ];
@@ -241,12 +333,23 @@ pub fn parse(input: &str) -> Option<ParsedCommand> {
         return None;
     }
 
-    let spec = lookup(name)?;
+    let local_name = name.strip_prefix("terminal:").unwrap_or(name);
+    let spec = lookup(local_name)?;
     Some(ParsedCommand {
         kind: spec.kind,
         spec,
         rest: args.to_string(),
     })
+}
+
+/// Whether a committed input explicitly addresses the terminal-local
+/// namespace. This is used by the App before consulting agent commands, so
+/// `/terminal:new` can never be captured by an agent advertising `/new`.
+pub fn is_explicit_local(input: &str) -> bool {
+    input
+        .trim_start()
+        .strip_prefix('/')
+        .is_some_and(|rest| rest.to_ascii_lowercase().starts_with("terminal:"))
 }
 
 /// Classify a committed input line into [`ParseOutcome`]. This is the entry
@@ -297,15 +400,28 @@ pub fn matches(prefix: &str) -> Vec<&'static CommandSpec> {
         .collect()
 }
 
+/// Prefix-match local commands using their canonical `terminal:` namespace.
+pub fn matches_namespaced(prefix: &str) -> Vec<&'static CommandSpec> {
+    let needle = prefix.trim().to_ascii_lowercase();
+    let local_needle = needle.strip_prefix("terminal:").unwrap_or(&needle);
+    REGISTRY
+        .iter()
+        .filter(|spec| {
+            if needle.starts_with("terminal:") {
+                spec.name.starts_with(local_needle)
+            } else {
+                format!("terminal:{}", spec.name).starts_with(&needle)
+            }
+        })
+        .collect()
+}
+
 /// Resolve a `/move` argument from either its full name or one-letter alias.
 pub fn lookup_move_position(value: &str) -> Option<&'static MovePositionSpec> {
     let value = value.trim();
-    MOVE_POSITIONS
-        .iter()
-        .find(|position| {
-            position.name.eq_ignore_ascii_case(value)
-                || position.alias.eq_ignore_ascii_case(value)
-        })
+    MOVE_POSITIONS.iter().find(|position| {
+        position.name.eq_ignore_ascii_case(value) || position.alias.eq_ignore_ascii_case(value)
+    })
 }
 
 /// Prefix-match `/move` positions by full name or one-letter alias.
@@ -371,6 +487,36 @@ mod tests {
         let p = parse("/help").unwrap();
         assert_eq!(p.kind, CommandKind::Help);
         assert_eq!(p.rest, "");
+    }
+
+    #[test]
+    fn terminal_namespace_forces_local_command() {
+        let p = parse("/terminal:new").unwrap();
+        assert_eq!(p.kind, CommandKind::New);
+        assert_eq!(p.spec.name, "new");
+        assert!(is_explicit_local("/terminal:new"));
+        assert!(is_explicit_local("  /TERMINAL:restart"));
+        assert!(!is_explicit_local("/new"));
+    }
+
+    #[test]
+    fn namespaced_matches_and_candidates_use_canonical_names() {
+        let matches = matches_namespaced("terminal:he");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "help");
+
+        let local = CommandCandidate::Local(lookup("help").unwrap());
+        assert_eq!(local.completion_name(), "terminal:help");
+        assert_eq!(local.source(), "Terminal");
+
+        let agent = CommandCandidate::Agent(AgentCommandSpec {
+            name: "review".to_string(),
+            description: "Review the active change".to_string(),
+            input_hint: Some("<path>".to_string()),
+        });
+        assert_eq!(agent.completion_name(), "review");
+        assert_eq!(agent.source(), "Agent");
+        assert!(agent.takes_args());
     }
 
     #[test]

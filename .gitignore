@@ -38,6 +38,9 @@ x86/
 ARM64/
 bld/
 [Bb]in/
+# `wta-node` is a real Rust source target, not Visual Studio build output.
+!tools/wta/src/bin/
+!tools/wta/src/bin/wta-node.rs
 [Oo]bj/
 [Ll]og/
 objfre/

@@ -129,7 +129,7 @@ pub const KNOWN_AGENTS: &[AgentProfile] = &[
         acp_flags: &[],
         // Codex CLI itself doesn't speak ACP. Use the ACP-project-maintained
         // adapter, pinned so a future npm release cannot silently break startup.
-        acp_launch_command: "npx -y @agentclientprotocol/codex-acp@1.1.0",
+        acp_launch_command: "npx -y @agentclientprotocol/codex-acp@1.1.7",
         acp_model_flags: &[],
         acp_auth_flow: AcpAuthFlow::External,
         delegate_prompt_flag: PromptFlag::Positional,
@@ -434,11 +434,20 @@ pub fn resolve_bare_agent_name(bare_name: &str) -> String {
         Err(_) => return bare_name.to_string(),
     };
 
-    for ext in profile.exe_search_order {
-        let candidate = format!("{}{}", trimmed, ext);
-        for dir in std::env::split_paths(&path_var) {
-            if dir.join(&candidate).is_file() {
-                return candidate;
+    // PATH directory precedence is authoritative. Checking every `.exe`
+    // globally before any `.cmd` can skip an accessible npm shim in an early
+    // directory and select a protected WindowsApps executable later.
+    for dir in std::env::split_paths(&path_var) {
+        for ext in profile.exe_search_order {
+            let candidate = format!("{}{}", trimmed, ext);
+            let resolved = dir.join(&candidate);
+            if resolved.is_file() {
+                // Return the absolute path, not only `codex.exe`. The wta
+                // process and the Terminal server can have different PATH
+                // snapshots (especially after installing/updating an agent).
+                // CreateProcess runs in the server, so a basename that wta
+                // found can still fail there with ERROR_FILE_NOT_FOUND.
+                return resolved.to_string_lossy().into_owned();
             }
         }
     }
@@ -461,9 +470,9 @@ pub fn is_cli_available(bare_name: &str) -> bool {
         Err(_) => return false,
     };
     let profile = lookup_profile(trimmed);
-    for ext in profile.exe_search_order {
-        let candidate = format!("{}{}", trimmed, ext);
-        for dir in std::env::split_paths(&path_var) {
+    for dir in std::env::split_paths(&path_var) {
+        for ext in profile.exe_search_order {
+            let candidate = format!("{}{}", trimmed, ext);
             if dir.join(&candidate).is_file() {
                 return true;
             }
@@ -502,13 +511,68 @@ mod tests {
     #[test]
     fn is_cli_available_returns_false_for_obviously_bogus_name() {
         // A 64-char random-looking name will not exist on any sane PATH.
-        assert!(!is_cli_available("zzzzz_does_not_exist_anywhere_qqqqq_82h3kf9"));
+        assert!(!is_cli_available(
+            "zzzzz_does_not_exist_anywhere_qqqqq_82h3kf9"
+        ));
+    }
+
+    #[test]
+    fn resolve_bare_agent_name_returns_absolute_path_for_terminal_server() {
+        let _guard = crate::test_support::lock_env();
+        let root = std::env::temp_dir().join(format!("wta-agent-resolve-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("codex.exe");
+        std::fs::write(&executable, b"test").unwrap();
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", &root);
+
+        assert_eq!(
+            resolve_bare_agent_name("codex"),
+            executable.to_string_lossy()
+        );
+
+        match old_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_bare_agent_name_preserves_path_directory_precedence() {
+        let _guard = crate::test_support::lock_env();
+        let root =
+            std::env::temp_dir().join(format!("wta-agent-path-order-{}", uuid::Uuid::new_v4()));
+        let npm = root.join("npm");
+        let windows_apps = root.join("windows-apps");
+        std::fs::create_dir_all(&npm).unwrap();
+        std::fs::create_dir_all(&windows_apps).unwrap();
+        let shim = npm.join("codex.cmd");
+        std::fs::write(&shim, b"@echo off").unwrap();
+        std::fs::write(windows_apps.join("codex.exe"), b"protected").unwrap();
+        let old_path = std::env::var_os("PATH");
+        let path = std::env::join_paths([&npm, &windows_apps]).unwrap();
+        std::env::set_var("PATH", path);
+
+        assert_eq!(resolve_bare_agent_name("codex"), shim.to_string_lossy());
+
+        match old_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn resolve_agent_id_from_cmd_recognises_bare_names_with_flags() {
-        assert_eq!(resolve_agent_id_from_cmd("copilot --acp --stdio"), "copilot");
-        assert_eq!(resolve_agent_id_from_cmd("gemini --experimental-acp"), "gemini");
+        assert_eq!(
+            resolve_agent_id_from_cmd("copilot --acp --stdio"),
+            "copilot"
+        );
+        assert_eq!(
+            resolve_agent_id_from_cmd("gemini --experimental-acp"),
+            "gemini"
+        );
         assert_eq!(resolve_agent_id_from_cmd("opencode acp"), "opencode");
         assert_eq!(resolve_agent_id_from_cmd("claude --resume foo"), "claude");
     }
@@ -521,7 +585,7 @@ mod tests {
             "claude",
         );
         assert_eq!(
-            resolve_agent_id_from_cmd("npx -y @agentclientprotocol/codex-acp@1.1.0"),
+            resolve_agent_id_from_cmd("npx -y @agentclientprotocol/codex-acp@1.1.7"),
             "codex",
         );
         assert_eq!(
@@ -558,7 +622,7 @@ mod tests {
     #[test]
     fn strip_acp_flags_recognises_codex_adapter_compatibility_commands() {
         for command in [
-            "npx -y @agentclientprotocol/codex-acp@1.1.0",
+            "npx -y @agentclientprotocol/codex-acp@1.1.7",
             "npx -y @agentclientprotocol/codex-acp",
             "npx -y @zed-industries/codex-acp",
             "npx -y @zed-industries/codex-acp --debug",
@@ -574,7 +638,7 @@ mod tests {
     fn codex_acp_launch_command_stays_pinned() {
         assert_eq!(
             build_acp_command("codex", None),
-            "npx -y @agentclientprotocol/codex-acp@1.1.0",
+            "npx -y @agentclientprotocol/codex-acp@1.1.7",
         );
     }
 
@@ -629,9 +693,9 @@ mod tests {
 
     #[test]
     fn resolve_agent_id_from_cmd_falls_back_to_unknown() {
-        assert_eq!(resolve_agent_id_from_cmd(""),           "unknown");
-        assert_eq!(resolve_agent_id_from_cmd("   "),        "unknown");
-        assert_eq!(resolve_agent_id_from_cmd("npx"),        "unknown");
+        assert_eq!(resolve_agent_id_from_cmd(""), "unknown");
+        assert_eq!(resolve_agent_id_from_cmd("   "), "unknown");
+        assert_eq!(resolve_agent_id_from_cmd("npx"), "unknown");
         assert_eq!(resolve_agent_id_from_cmd("my-bot --x"), "unknown");
     }
 

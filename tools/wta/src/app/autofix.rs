@@ -64,10 +64,7 @@ pub enum AutofixBarSnapshot {
         hotkey_hint: String,
     },
     /// Analysis in progress ("Analyzing…"). Non-interactive.
-    Pending {
-        pane_id: String,
-        summary: String,
-    },
+    Pending { pane_id: String, summary: String },
     /// Analysis finished; a result (a fix or an explanation) is waiting in
     /// the agent pane chat. Surfaced ONLY when the pane is not open — the
     /// bar invites the user to open the pane and review. Once the pane
@@ -240,6 +237,10 @@ impl App {
             tab_id: Some(target_tab_id.clone()),
             window_id: self.window_id.clone(),
             cwd: None,
+            terminal_session_id: Some(notification.pane_id.clone()),
+            workspace_id: Some(target_tab_id.clone()),
+            surface_id: None,
+            focus_generation: None,
             source_pane_id: Some(notification.pane_id.clone()),
         };
 
@@ -301,7 +302,12 @@ impl App {
     // tab_changed, `project_active_tab_state` re-emits the new active
     // tab's snapshot so the bar matches.
 
-    pub(super) fn emit_autofix_state_pending(&mut self, target_tab_id: &str, pane_id: &str, summary: &str) {
+    pub(super) fn emit_autofix_state_pending(
+        &mut self,
+        target_tab_id: &str,
+        pane_id: &str,
+        summary: &str,
+    ) {
         let snapshot = AutofixBarSnapshot::Pending {
             pane_id: pane_id.to_string(),
             summary: summary.to_string(),
@@ -318,7 +324,12 @@ impl App {
     /// bar shows a clickable hint; the user activates the fix via the
     /// pill or the hotkey, which fires `autofix_execute_from_detected`
     /// and replays through `trigger_autofix_inner` with `force=true`.
-    pub(super) fn emit_autofix_state_detected(&mut self, target_tab_id: &str, pane_id: &str, summary: &str) {
+    pub(super) fn emit_autofix_state_detected(
+        &mut self,
+        target_tab_id: &str,
+        pane_id: &str,
+        summary: &str,
+    ) {
         let snapshot = AutofixBarSnapshot::Detected {
             pane_id: pane_id.to_string(),
             summary: summary.to_string(),

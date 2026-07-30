@@ -1,36 +1,38 @@
 @echo off
 cd /d "%~dp0"
 
-rem Resolve MSBuild robustly instead of hard-coding one VS edition/drive:
-rem   1. honor an externally supplied MSBUILD env var (CI / custom installs);
-rem   2. otherwise locate it via vswhere, which works across Community /
-rem      Professional / Enterprise / Build Tools and non-default install drives.
-rem The value is stored UNQUOTED and quoted at each call site below.
-rem Guard the vswhere call with `if exist`: on minimal/custom installs that
-rem lack vswhere.exe, calling it would print a confusing error and leave
-rem MSBUILD unset; skipping it lets the clear message below handle the case.
-if not defined MSBUILD (
-    if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" (
-        for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe`) do set "MSBUILD=%%i"
+rem Reuse the canonical bootstrap. It selects the v145-capable VS 18 toolset
+rem required by the repository's vcpkg overlay triplets.
+if defined MSBUILD if not exist "%MSBUILD%" set "MSBUILD="
+if not defined MSBUILD for %%X in (msbuild.exe) do set "MSBUILD=%%~$PATH:X"
+if not defined MSBUILD call tools\razzle.cmd
+if not defined MSBUILD exit /b 1
+rem vcpkg otherwise auto-selects the newest installed Visual Studio, which can
+rem produce STL-incompatible .lib files for the MSBuild/toolset selected above.
+set "VCPKG_VISUAL_STUDIO_PATH=%MSBUILD:\MSBuild\Current\Bin\amd64\MSBuild.exe=%"
+if "%VCPKG_VISUAL_STUDIO_PATH%"=="%MSBUILD%" set "VCPKG_VISUAL_STUDIO_PATH=%MSBUILD:\MSBuild\Current\Bin\MSBuild.exe=%"
+if "%VCPKG_VISUAL_STUDIO_PATH%"=="%MSBUILD%" (
+    echo Could not derive the Visual Studio installation from MSBuild: %MSBUILD%
+    exit /b 1
+)
+rem A standalone, pinned vcpkg can be newer than the copy bundled with Visual
+rem Studio (notably for VS 2026/v145 discovery). When VCPKG_ROOT is supplied,
+rem make MSBuild import that exact integration instead of silently falling back
+rem to the Visual Studio bundled executable and targets.
+set "VCPKG_ROOT_ARG="
+if defined VCPKG_ROOT (
+    if not exist "%VCPKG_ROOT%\vcpkg.exe" (
+        echo VCPKG_ROOT does not contain vcpkg.exe: %VCPKG_ROOT%
+        exit /b 1
     )
-)
-if not defined MSBUILD (
-    echo Could not locate MSBuild. Install the "MSBuild" VS component, or set the MSBUILD env var to your MSBuild.exe path.
-    exit /b 1
-)
-rem Strip any surrounding/literal quotes a caller may have baked into the
-rem MSBUILD env var (e.g. set MSBUILD="C:\...\MSBuild.exe"). A path can't
-rem contain a double-quote, so dropping them all is safe — and it stops the
-rem existence check and the quoted call sites below from seeing doubled
-rem quotes (`""C:\...""`), which would spuriously fail.
-set MSBUILD=%MSBUILD:"=%
-if not exist "%MSBUILD%" (
-    echo MSBUILD points to a missing file: "%MSBUILD%"
-    exit /b 1
+    set "VCPKG_ROOT_ARG=/p:VcpkgRoot=%VCPKG_ROOT%\"
 )
 
 set SOLUTION_DIR=%CD%\
-set COMMON=/p:Platform=x64 /p:Configuration=Release /p:WindowsTerminalBranding=Dev /p:SolutionDir=%SOLUTION_DIR% /m /nologo
+rem This project has several very large C++/WinRT PCHs. Building more than one
+rem compiler at a time can exhaust the default Windows page file (C3859/1455)
+rem on normal developer workstations, so keep the local packaging path serial.
+set COMMON=/p:Platform=x64 /p:Configuration=Release /p:WindowsTerminalBranding=Dev /p:SolutionDir=%SOLUTION_DIR% %VCPKG_ROOT_ARG% /p:MultiProcessorCompilation=false /p:CL_MPCount=1 /m:1 /nodeReuse:false /nologo
 
 rem Wipe the wapproj's Release intermediates so glob-based Content items
 rem (like wt-agent-hooks\**) get re-evaluated. Without this, an incremental
@@ -38,6 +40,17 @@ rem MSIX build keeps the cached file list and silently drops freshly-added
 rem files from the package.
 if exist "src\cascadia\CascadiaPackage\obj\x64\Release" rmdir /s /q "src\cascadia\CascadiaPackage\obj\x64\Release"
 if exist "src\cascadia\CascadiaPackage\bin\x64\Release\AppX" rmdir /s /q "src\cascadia\CascadiaPackage\bin\x64\Release\AppX"
+
+rem Generate ITerminalHandoff.h and ITerminalProtocol.h before any consumer
+rem graph can compile TerminalConnection in parallel.
+> _build_msix_x64.log echo MSBuild=%MSBUILD%
+>> _build_msix_x64.log echo VCPKG_ROOT=%VCPKG_ROOT%
+>> _build_msix_x64.log echo VCPKG_VISUAL_STUDIO_PATH=%VCPKG_VISUAL_STUDIO_PATH%
+"%MSBUILD%" src\host\proxy\Host.Proxy.vcxproj %COMMON% >> _build_msix_x64.log 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo OpenConsoleProxy build failed: %ERRORLEVEL%
+    exit /b %ERRORLEVEL%
+)
 
 rem Build Settings Model first. Its winmd is the source-of-truth for the
 rem Profile / Globals WinRT projection. If we don't pin its build ahead
@@ -59,6 +72,9 @@ if %ERRORLEVEL% NEQ 0 (
 
 rem Now build the full package
 "%MSBUILD%" src\cascadia\CascadiaPackage\CascadiaPackage.wapproj %COMMON% /p:GenerateAppxPackageOnBuild=true /p:AppxBundle=Never >> _build_msix_x64.log 2>&1
-set BUILD_EXIT=%ERRORLEVEL%
-echo Exit code: %BUILD_EXIT%
-exit /b %BUILD_EXIT%
+if errorlevel 1 (
+    echo CascadiaPackage build failed.
+    exit /b 1
+)
+echo Exit code: 0
+exit /b 0

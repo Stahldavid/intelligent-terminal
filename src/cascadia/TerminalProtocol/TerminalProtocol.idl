@@ -16,6 +16,9 @@ namespace Microsoft.Terminal.Protocol
     struct TabInfo
     {
         UInt32 TabId;
+        // Stable native Tab identity. TabId remains the visual index for
+        // backwards compatibility; WorkspaceId is the automation key.
+        String WorkspaceId;
         UInt64 WindowId;
         String Title;
         Boolean IsActive;
@@ -26,6 +29,8 @@ namespace Microsoft.Terminal.Protocol
     {
         Guid SessionId;
         UInt32 TabId;
+        String WorkspaceId;
+        UInt32 PaneId;
         UInt64 WindowId;
         String Title;
         String Profile;
@@ -43,6 +48,16 @@ namespace Microsoft.Terminal.Protocol
         // shell has not reported its identity.
         String Shell;
         String ShellVersion;
+        // A pane may host multiple live terminal surfaces. SessionId remains
+        // the canonical automation identity; these optional metadata fields
+        // describe its position in the pane-local stack.
+        UInt32 SurfaceId;
+        UInt32 SurfaceIndex;
+        UInt32 SurfaceCount;
+        // Stable live-surface identity. Unlike SurfaceId (a pane-local
+        // ordinal), this GUID is never reused by another live connection.
+        Guid SurfaceSessionId;
+        UInt64 FocusGeneration;
     };
 
     struct PaneOutput
@@ -102,8 +117,8 @@ namespace Microsoft.Terminal.Protocol
     interface IProtocolServer
     {
         // Meta
-        // Compatibility handshake. COM activation is the trust boundary; this
-        // call does not gate any protocol method.
+        // Per-client capability handshake. All remaining methods fail closed
+        // until this instance authenticates.
         AuthResult Authenticate(String token);
         String GetCapabilities();
 
@@ -119,7 +134,9 @@ namespace Microsoft.Terminal.Protocol
 
         // Mutations
         TabCreationResult CreateTab(UInt64 windowId, String profile, String commandline, String title, String startingDirectory, Boolean suppressAppTitle, Boolean background);
-        TabCreationResult SplitPane(Guid sessionId, String direction, Single size, String profile, String commandline, Boolean background);
+        TabCreationResult CreateSurface(Guid sessionId, String profile, String commandline, String startingDirectory, Boolean background);
+        TabCreationResult CreateManagedSurface(Guid sessionId, String targetId, String agentId, Boolean background);
+        TabCreationResult SplitPane(Guid sessionId, String direction, Single size, String profile, String commandline, String startingDirectory, Boolean background);
         void ClosePane(Guid sessionId);
         void SendInput(Guid sessionId, String text);
         void FocusPane(Guid sessionId);

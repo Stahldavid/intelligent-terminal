@@ -26,6 +26,24 @@ use crate::app::AcpModelInfo;
 use crate::protocol::acp::conn;
 use crate::protocol::acp::spawn::{spawn_agent_process, AgentStderrLog};
 
+const LOCAL_PROBE_INIT_TIMEOUT_SECS: u64 = 10;
+const ADAPTER_PROBE_INIT_TIMEOUT_SECS: u64 = 25;
+
+fn probe_init_timeout_secs(is_npx: bool, resolved_program: &str) -> u64 {
+    let program = std::path::Path::new(resolved_program)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(resolved_program);
+    let remote_transport = ["wsl", "wsl.exe", "ssh", "ssh.exe"]
+        .iter()
+        .any(|candidate| program.eq_ignore_ascii_case(candidate));
+    if is_npx || remote_transport {
+        ADAPTER_PROBE_INIT_TIMEOUT_SECS
+    } else {
+        LOCAL_PROBE_INIT_TIMEOUT_SECS
+    }
+}
+
 #[derive(Serialize)]
 pub struct ProbeResult {
     pub available_models: Vec<AcpModelInfo>,
@@ -44,7 +62,12 @@ pub async fn probe_models(agent_cmd: &str) -> Result<ProbeResult> {
         spawned.child.id()
     );
 
-    let outgoing = spawned.child.stdin.take().expect("stdin piped").compat_write();
+    let outgoing = spawned
+        .child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .compat_write();
     let incoming = spawned.child.stdout.take().expect("stdout piped").compat();
     let stderr_log = AgentStderrLog::new(spawned.label().to_string());
     let stderr_task = spawned
@@ -53,8 +76,10 @@ pub async fn probe_models(agent_cmd: &str) -> Result<ProbeResult> {
         .take()
         .map(|stderr| stderr_log.drain(stderr));
 
-    let (conn, handle_io) =
-        conn::spawn_client(acp::Client.builder().name("wta-probe"), conn::byte_streams(outgoing, incoming));
+    let (conn, handle_io) = conn::spawn_client(
+        acp::Client.builder().name("wta-probe"),
+        conn::byte_streams(outgoing, incoming),
+    );
 
     tokio::task::spawn_local(async move {
         if let Err(e) = handle_io.await {
@@ -66,7 +91,7 @@ pub async fn probe_models(agent_cmd: &str) -> Result<ProbeResult> {
     // user-blocking, so we'd rather fail fast and let the user retry
     // than make them stare at the dropdown placeholder for 60s+.
     // Cached adapters complete in <2s.
-    let init_timeout_secs: u64 = if spawned.is_npx { 25 } else { 10 };
+    let init_timeout_secs = probe_init_timeout_secs(spawned.is_npx, &spawned.resolved_program);
 
     let init_req = acp::schema::v1::InitializeRequest::new(acp::schema::ProtocolVersion::V1)
         .client_capabilities(acp::schema::v1::ClientCapabilities::new().terminal(true))
@@ -197,7 +222,12 @@ pub async fn probe_sessions(agent_cmd: &str) -> Result<SessionProbeResult> {
         spawned.child.id()
     );
 
-    let outgoing = spawned.child.stdin.take().expect("stdin piped").compat_write();
+    let outgoing = spawned
+        .child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .compat_write();
     let incoming = spawned.child.stdout.take().expect("stdout piped").compat();
     let stderr_log = AgentStderrLog::new(spawned.label().to_string());
     let stderr_task = spawned
@@ -206,15 +236,17 @@ pub async fn probe_sessions(agent_cmd: &str) -> Result<SessionProbeResult> {
         .take()
         .map(|stderr| stderr_log.drain(stderr));
 
-    let (conn, handle_io) =
-        conn::spawn_client(acp::Client.builder().name("wta-probe-sessions"), conn::byte_streams(outgoing, incoming));
+    let (conn, handle_io) = conn::spawn_client(
+        acp::Client.builder().name("wta-probe-sessions"),
+        conn::byte_streams(outgoing, incoming),
+    );
     tokio::task::spawn_local(async move {
         if let Err(e) = handle_io.await {
             tracing::warn!("session probe handle_io failed: {:#}", e);
         }
     });
 
-    let init_timeout_secs: u64 = if spawned.is_npx { 25 } else { 10 };
+    let init_timeout_secs = probe_init_timeout_secs(spawned.is_npx, &spawned.resolved_program);
     let init_req = acp::schema::v1::InitializeRequest::new(acp::schema::ProtocolVersion::V1)
         .client_capabilities(acp::schema::v1::ClientCapabilities::new().terminal(true))
         .client_info(
@@ -281,4 +313,29 @@ pub async fn probe_sessions(agent_cmd: &str) -> Result<SessionProbeResult> {
         list_sessions_error,
         sessions,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_adapter_transports_get_the_cold_start_timeout() {
+        assert_eq!(
+            probe_init_timeout_secs(false, r"C:\Windows\System32\wsl.exe"),
+            ADAPTER_PROBE_INIT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            probe_init_timeout_secs(false, "ssh"),
+            ADAPTER_PROBE_INIT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            probe_init_timeout_secs(true, "npx.cmd"),
+            ADAPTER_PROBE_INIT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            probe_init_timeout_secs(false, "copilot.exe"),
+            LOCAL_PROBE_INIT_TIMEOUT_SECS
+        );
+    }
 }

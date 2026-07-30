@@ -4,6 +4,7 @@
 #pragma once
 
 #include <ThrottledFunc.h>
+#include <unordered_set>
 
 #include "TerminalPage.g.h"
 #include "Tab.h"
@@ -246,6 +247,9 @@ namespace winrt::TerminalApp::implementation
         Windows::Foundation::IAsyncOperation<Microsoft::Terminal::Protocol::SessionVariable> GetProtocolSessionVariable(winrt::guid sessionId, hstring name);
         Windows::Foundation::IAsyncOperation<bool> SetProtocolSessionVariable(winrt::guid sessionId, hstring name, hstring value);
         Windows::Foundation::IAsyncOperation<Microsoft::Terminal::Protocol::TabCreationResult> CreateProtocolTab(Microsoft::Terminal::Settings::Model::NewTerminalArgs args, bool background);
+        Windows::Foundation::IAsyncOperation<Microsoft::Terminal::Protocol::TabCreationResult> CreateProtocolSurface(winrt::guid sessionId, Microsoft::Terminal::Settings::Model::NewTerminalArgs args, bool background);
+        Windows::Foundation::IAsyncOperation<Microsoft::Terminal::Protocol::TabCreationResult> CreateProtocolManagedSurface(winrt::guid sessionId, winrt::hstring targetId, winrt::hstring agentId, bool background);
+        Windows::Foundation::IAsyncOperation<Microsoft::Terminal::Protocol::TabCreationResult> CreateProtocolBrowserSurface(winrt::guid sessionId, winrt::hstring remoteWorkspaceId, winrt::hstring initialUrl, bool background);
         Windows::Foundation::IAsyncOperation<Microsoft::Terminal::Protocol::TabCreationResult> SplitProtocolPane(winrt::guid sessionId, Microsoft::Terminal::Settings::Model::SplitDirection direction, float size, Microsoft::Terminal::Settings::Model::NewTerminalArgs args, bool background);
         Windows::Foundation::IAsyncOperation<bool> CloseProtocolPane(winrt::guid sessionId);
         Windows::Foundation::IAsyncOperation<bool> SendProtocolInput(winrt::guid sessionId, hstring text);
@@ -255,6 +259,8 @@ namespace winrt::TerminalApp::implementation
         void OnAgentSwitchRequested(hstring eventJson);
         void OnCloseAgentPaneRequested(hstring eventJson);
         void OnAgentStateChanged(hstring eventJson);
+        void OnNativeChatSnapshot(hstring eventJson);
+        void OnRemoteRelayEvent(hstring eventJson);
         void OnResumeInNewAgentTabRequested(hstring eventJson);
         void OnAgentChipTargetChanged(hstring eventJson);
         void OnRestartAgentStackRequested(hstring eventJson);
@@ -347,7 +353,13 @@ namespace winrt::TerminalApp::implementation
         bool _activated{ false };
         bool _visible{ true };
 
-        std::vector<std::vector<Microsoft::Terminal::Settings::Model::ActionAndArgs>> _previouslyClosedPanesAndTabs{};
+        struct PreviouslyClosedPaneOrTabEntry
+        {
+            uint64_t id{ 0 };
+            std::vector<Microsoft::Terminal::Settings::Model::ActionAndArgs> actions;
+        };
+        std::vector<PreviouslyClosedPaneOrTabEntry> _previouslyClosedPanesAndTabs{};
+        uint64_t _nextPreviouslyClosedPaneOrTabId{ 1 };
 
         uint32_t _systemRowsToScroll{ DefaultRowsToScroll };
 
@@ -409,6 +421,368 @@ namespace winrt::TerminalApp::implementation
         // Wired once per AgentPaneContent creation.
         void _WireAgentPaneEvents(const winrt::TerminalApp::AgentPaneContent& content,
                                   const winrt::com_ptr<Tab>& ownerTab);
+
+        // ── Native workspace sidebar ─────────────────────────────────────
+        // The sidebar is a second projection of `_tabs`, never a competing
+        // workspace/session store. A normal tab is an ad-hoc workspace; a
+        // declarative `wta agent-workspace` tab is enriched asynchronously
+        // from its persisted runtime/context.
+        struct WorkspaceSidebarMetadata
+        {
+            struct Agent
+            {
+                winrt::hstring id;
+                winrt::hstring role;
+                winrt::hstring model;
+                winrt::hstring activity;
+                winrt::hstring sessionId;
+                winrt::hstring cwd;
+                winrt::hstring command;
+                winrt::hstring notification;
+                winrt::hstring teamName;
+                winrt::hstring currentTaskId;
+                uint64_t lastHeartbeatMs{ 0 };
+                bool coordinator{ false };
+            };
+
+            struct Team
+            {
+                winrt::hstring id;
+                winrt::hstring name;
+                winrt::hstring leader;
+                winrt::hstring status;
+                uint32_t workerCount{ 0 };
+                uint64_t updatedAtMs{ 0 };
+            };
+
+            struct Task
+            {
+                winrt::hstring teamName;
+                winrt::hstring id;
+                winrt::hstring title;
+                winrt::hstring status;
+                winrt::hstring owner;
+                winrt::hstring result;
+                winrt::hstring error;
+                uint32_t attempts{ 0 };
+                uint32_t maxAttempts{ 0 };
+            };
+
+            struct Event
+            {
+                winrt::hstring id;
+                winrt::hstring kind;
+                winrt::hstring source;
+                winrt::hstring target;
+                winrt::hstring summary;
+                uint64_t timestampMs{ 0 };
+            };
+
+            struct ComputeTarget
+            {
+                winrt::hstring id;
+                winrt::hstring name;
+                winrt::hstring provider;
+                winrt::hstring os;
+                winrt::hstring arch;
+                winrt::hstring health;
+                winrt::hstring trust;
+                winrt::hstring sshAlias;
+                winrt::hstring wslDistro;
+                uint32_t agentSlots{ 0 };
+                uint32_t buildSlots{ 0 };
+                bool disabled{ false };
+            };
+
+            struct SurfaceBinding
+            {
+                winrt::hstring id;
+                winrt::hstring surfaceId;
+                winrt::hstring paneId;
+                winrt::hstring kind;
+                winrt::hstring state;
+                winrt::hstring agentId;
+                winrt::hstring adapterKind;
+                winrt::hstring acpSessionId;
+                winrt::hstring homeTargetId;
+                winrt::hstring remoteSessionId;
+                winrt::hstring environmentId;
+                winrt::hstring worktreeId;
+                winrt::hstring writerLeaseId;
+            };
+
+            struct ComputeJob
+            {
+                winrt::hstring id;
+                winrt::hstring state;
+                winrt::hstring targetId;
+                winrt::hstring workload;
+                winrt::hstring snapshotId;
+                winrt::hstring terminationReason;
+                uint32_t attempt{ 0 };
+            };
+
+            struct FileTransfer
+            {
+                winrt::hstring id;
+                winrt::hstring state;
+                winrt::hstring targetId;
+                winrt::hstring surfaceId;
+                winrt::hstring displayName;
+                winrt::hstring remotePath;
+                winrt::hstring error;
+                uint64_t sizeBytes{ 0 };
+                uint64_t bytesTransferred{ 0 };
+            };
+
+            struct RemoteWorkspace
+            {
+                winrt::hstring id;
+                winrt::hstring targetId;
+                winrt::hstring environmentId;
+                winrt::hstring state;
+                winrt::hstring lastError;
+                uint32_t reconnectAttempt{ 0 };
+            };
+
+            struct BrowserSurface
+            {
+                winrt::hstring id;
+                winrt::hstring surfaceId;
+                winrt::hstring targetId;
+                winrt::hstring environmentId;
+                winrt::hstring state;
+                winrt::hstring url;
+                winrt::hstring lastError;
+            };
+
+            struct ExecutionEnvironment
+            {
+                winrt::hstring id;
+                winrt::hstring targetId;
+                winrt::hstring runtimeVersion;
+                winrt::hstring state;
+                winrt::hstring launchMethod;
+                uint32_t protocolVersion{ 0 };
+            };
+
+            struct EnvironmentConnection
+            {
+                winrt::hstring environmentId;
+                winrt::hstring endpointId;
+                winrt::hstring state;
+                winrt::hstring lastError;
+                uint32_t retryAttempt{ 0 };
+                uint64_t nextRetryAtMs{ 0 };
+            };
+
+            winrt::hstring cwd;
+            winrt::hstring workspaceId;
+            winrt::hstring manifestPath;
+            winrt::hstring branch;
+            winrt::hstring pullRequest;
+            winrt::hstring pullRequestUrl;
+            winrt::hstring ports;
+            winrt::hstring agentActivity;
+            winrt::hstring lastNotification;
+            winrt::hstring group;
+            winrt::hstring workspaceName;
+            uint32_t changedFiles{ 0 };
+            uint32_t ahead{ 0 };
+            uint32_t behind{ 0 };
+            std::vector<uint16_t> listeningPorts;
+            bool persisted{ false };
+            bool pinned{ false };
+            uint32_t unread{ 0 };
+            uint64_t lastSeenEventMs{ 0 };
+            uint64_t lastDesktopNotificationMs{ 0 };
+            uint64_t refreshedAtMs{ 0 };
+            bool refreshInFlight{ false };
+            std::vector<Agent> agents;
+            std::vector<Team> teams;
+            std::vector<Task> tasks;
+            std::vector<Event> events;
+            std::vector<ComputeTarget> computeTargets;
+            std::vector<SurfaceBinding> surfaceBindings;
+            std::vector<ComputeJob> computeJobs;
+            std::vector<FileTransfer> fileTransfers;
+            std::vector<RemoteWorkspace> remoteWorkspaces;
+            std::vector<BrowserSurface> browsers;
+            std::vector<ExecutionEnvironment> environments;
+            std::vector<EnvironmentConnection> connections;
+            std::vector<Event> computeEvents;
+            winrt::hstring computeError;
+        };
+
+        struct RecentlyClosedWorkspace
+        {
+            winrt::hstring title;
+            winrt::hstring cwd;
+            winrt::hstring workspaceId;
+            winrt::hstring workspaceName;
+            winrt::hstring manifestPath;
+            winrt::hstring group;
+            uint64_t closedAtMs{ 0 };
+            uint64_t nativeHistoryId{ 0 };
+        };
+
+        std::unordered_map<std::wstring, WorkspaceSidebarMetadata> _workspaceSidebarMetadata;
+        std::unordered_map<std::wstring, WorkspaceSidebarMetadata> _workspaceSidebarPersistedMetadata;
+        std::unordered_map<std::wstring, uint64_t> _workspaceSidebarPendingHistoryIds;
+        std::unordered_map<std::wstring, bool> _workspaceSidebarGroupCollapsed;
+        std::vector<RecentlyClosedWorkspace> _workspaceSidebarRecent;
+        std::unordered_set<std::wstring> _workspaceSidebarRecordedClosedIds;
+        bool _workspaceSidebarVisible{ true };
+        bool _workspaceSidebarShowRecent{ false };
+        bool _workspaceSidebarSearchVisible{ false };
+        bool _workspaceSidebarInitialized{ false };
+        bool _workspaceSidebarReconcilingOrder{ false };
+        double _workspaceSidebarWidth{ 292.0 };
+
+        void _InitializeWorkspaceSidebar();
+        void _LoadWorkspaceSidebarState();
+        void _SaveWorkspaceSidebarState();
+        void _ApplyWorkspaceSidebarVisibility();
+        void _ApplyWorkspaceNavigationPresentation();
+        bool _ReconcileWorkspaceSidebarTabOrder();
+        void _RefreshWorkspaceSidebar(bool requestMetadata = false);
+        void _RequestWorkspaceSidebarMetadata(const winrt::com_ptr<Tab>& tab, bool force = false);
+        safe_void_coroutine _RefreshWorkspaceSidebarMetadata(winrt::hstring stableId,
+                                                             winrt::hstring cwd,
+                                                             bool force);
+        void _RecordRecentlyClosedWorkspace(const winrt::TerminalApp::Tab& tab);
+        void _MarkWorkspaceUnread(const winrt::hstring& stableId,
+                                  const winrt::hstring& notification);
+        std::wstring _WorkspaceSidebarPersistentKey(const winrt::com_ptr<Tab>& tab) const;
+        WorkspaceSidebarMetadata& _WorkspaceSidebarMetadataFor(const winrt::com_ptr<Tab>& tab);
+        void _EnsureWorkspaceContextMenuExtension(
+            const winrt::com_ptr<Tab>& tab,
+            const winrt::Windows::UI::Xaml::Controls::MenuFlyout& contextMenu);
+        void _PopulateWorkspaceContextMenuExtension(
+            const winrt::hstring& stableId,
+            const winrt::Windows::UI::Xaml::Controls::MenuFlyoutSubItem& workspaceMenu);
+        safe_void_coroutine _PromptWorkspaceGroup(winrt::hstring stableId);
+        void _RestoreRecentlyClosedWorkspace(size_t recentIndex);
+        void _WorkspaceSidebarNewClicked(const winrt::Windows::Foundation::IInspectable& sender,
+                                         const winrt::Microsoft::UI::Xaml::Controls::SplitButtonClickEventArgs& eventArgs);
+        void _WorkspaceSidebarComposerClicked(const winrt::Windows::Foundation::IInspectable& sender,
+                                              const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceSidebarAttentionClicked(const winrt::Windows::Foundation::IInspectable& sender,
+                                               const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceSidebarFleetClicked(const winrt::Windows::Foundation::IInspectable& sender,
+                                           const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceFleetCloseClicked(const winrt::Windows::Foundation::IInspectable& sender,
+                                         const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceFleetRefreshClicked(const winrt::Windows::Foundation::IInspectable& sender,
+                                            const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceFleetDiscoverTargetsClicked(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceFleetAddClicked(const winrt::Windows::Foundation::IInspectable& sender,
+                                       const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceTeamComposerOperationChanged(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::Controls::SelectionChangedEventArgs& eventArgs);
+        void _WorkspaceSidebarGitClicked(const winrt::Windows::Foundation::IInspectable& sender,
+                                         const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceSidebarDoctorClicked(const winrt::Windows::Foundation::IInspectable& sender,
+                                            const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceComposerPreviewClicked(const winrt::Windows::Foundation::IInspectable& sender,
+                                              const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceSidebarToggleClicked(const winrt::Windows::Foundation::IInspectable& sender,
+                                            const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceSidebarRecentClicked(const winrt::Windows::Foundation::IInspectable& sender,
+                                            const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceSidebarRefreshClicked(const winrt::Windows::Foundation::IInspectable& sender,
+                                             const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceSidebarSearchChanged(const winrt::Windows::Foundation::IInspectable& sender,
+                                            const winrt::Windows::UI::Xaml::Controls::TextChangedEventArgs& eventArgs);
+        void _WorkspaceSidebarSearchClicked(const winrt::Windows::Foundation::IInspectable& sender,
+                                            const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceSidebarAcceleratorInvoked(
+            const winrt::Windows::UI::Xaml::Input::KeyboardAccelerator& sender,
+            const winrt::Windows::UI::Xaml::Input::KeyboardAcceleratorInvokedEventArgs& eventArgs);
+        void _WorkspaceSidebarResizeDelta(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::Controls::Primitives::DragDeltaEventArgs& eventArgs);
+        void _WorkspaceSidebarResizeCompleted(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::Controls::Primitives::DragCompletedEventArgs& eventArgs);
+        safe_void_coroutine _ShowWorkspaceComposer();
+        safe_void_coroutine _ShowWorkspaceAttentionCenter();
+        safe_void_coroutine _ShowWorkspaceFleet();
+        void _RefreshWorkspaceFleet();
+        safe_void_coroutine _ShowRemoteFileExplorer(winrt::hstring targetId);
+        safe_void_coroutine _RefreshRemoteFileExplorer();
+        safe_void_coroutine _OpenRemoteFilePreview(winrt::hstring relativePath,
+                                                   winrt::hstring displayName);
+        safe_void_coroutine _RunRemoteFileMutation(winrt::hstring operation,
+                                                   winrt::hstring sourcePath = {},
+                                                   winrt::hstring destinationPath = {});
+        safe_void_coroutine _AuthorizeRemoteFileRoot(winrt::hstring label,
+                                                     winrt::hstring path,
+                                                     winrt::hstring source,
+                                                     bool writable,
+                                                     bool deletable,
+                                                     bool acknowledgeWideScope);
+        void _WorkspaceRemoteFilesRefreshClicked(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceRemoteFilesUpClicked(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceRemoteFileEntryClicked(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceRemoteFileNewFolderClicked(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceRemoteFileRenameClicked(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceRemoteFileDeleteClicked(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceRemoteFileDownloadClicked(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        void _WorkspaceRemoteFileAuthorizeRootClicked(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Windows::UI::Xaml::RoutedEventArgs& eventArgs);
+        safe_void_coroutine _ShowWorkspaceTeamComposer();
+        safe_void_coroutine _CreateWorkspaceTeamEntity();
+        safe_void_coroutine _RunWorkspaceTeamCommand(winrt::hstring stableId,
+                                                      winrt::hstring teamName,
+                                                      winrt::hstring arguments,
+                                                      winrt::hstring successMessage);
+        safe_void_coroutine _RunWorkspaceComputeCommand(winrt::hstring stableId,
+                                                         winrt::hstring arguments,
+                                                         winrt::hstring progressMessage,
+                                                         winrt::hstring successMessage);
+        safe_void_coroutine _ShowRemoteRuntimeMetrics(winrt::hstring targetId,
+                                                      winrt::hstring remoteSessionId);
+        safe_void_coroutine _ShowWorkspaceGit();
+        safe_void_coroutine _ShowWorkspaceDoctor();
+        safe_void_coroutine _CreateWorkspaceFromComposer();
+        safe_void_coroutine _PreviewWorkspaceComposer();
+        safe_void_coroutine _RestoreDeclarativeWorkspace(RecentlyClosedWorkspace recent);
+        safe_void_coroutine _SnapshotDeclarativeWorkspace(winrt::hstring root,
+                                                           winrt::hstring name);
+        safe_void_coroutine _FocusWorkspaceAgent(winrt::hstring stableId,
+                                                 winrt::hstring target);
+        safe_void_coroutine _VerifyWorkspace(winrt::hstring stableId);
+
+        winrt::hstring _remoteFileTargetId;
+        winrt::hstring _remoteFileWorkspaceId;
+        winrt::hstring _remoteFileRoot;
+        winrt::hstring _remoteFileRootLabel;
+        winrt::hstring _remoteFilePath;
+        winrt::hstring _remoteFileSelectedPath;
+        winrt::hstring _remoteFileSelectedName;
+        bool _remoteFileSelectedDirectory{ false };
+        bool _remoteFileRootWritable{ false };
+        bool _remoteFileRootDeletable{ false };
+        uint64_t _remoteFileRefreshGeneration{ 0 };
 
         // Hot-reload of agent/model settings. Snapshot is captured on first
         // SetSettings and after every rebuild; a diff drives teardown/rebuild
@@ -579,6 +953,17 @@ namespace winrt::TerminalApp::implementation
         void _NotifyAgentTabClosed(const winrt::hstring& tabId);
         void _NotifyAgentTabReset(const winrt::hstring& tabId);
         void _NotifyAgentTabChanged(const winrt::hstring& tabId);
+        void _NotifySurfaceLifecycleChanged(
+            const winrt::com_ptr<Tab>& tab,
+            const std::shared_ptr<Pane>& pane,
+            const winrt::Windows::Foundation::Collections::ValueSet& change);
+        safe_void_coroutine _RemoveClosedSurfaceBinding(
+            winrt::hstring workspaceId,
+            winrt::hstring surfaceId);
+        // Publishes the complete Window -> Workspace -> Pane -> Surface
+        // focus snapshot. The generation is monotonic per window so helpers
+        // can discard late async updates after a rapid focus switch.
+        void _NotifyAgentFocusChanged(const winrt::com_ptr<Tab>& tab);
         // Look up a tab by its StableId; returns nullptr if unknown.
         winrt::com_ptr<Tab> _FindTabByStableId(const winrt::hstring& stableId) const;
 
@@ -587,6 +972,7 @@ namespace winrt::TerminalApp::implementation
         bool _renamerPressedEnter{ false };
 
         TerminalApp::WindowProperties _WindowProperties{ nullptr };
+        uint64_t _focusGeneration{ 0 };
         PaneResources _paneResources;
 
         // Cached agent-pane title-bar fallback brushes (#348). Reused to theme
@@ -636,7 +1022,11 @@ namespace winrt::TerminalApp::implementation
 
         std::wstring _evaluatePathForCwd(std::wstring_view path);
 
-        winrt::Microsoft::Terminal::TerminalConnection::ITerminalConnection _CreateConnectionFromSettings(Microsoft::Terminal::Settings::Model::Profile profile, Microsoft::Terminal::Control::IControlSettings settings, const bool inheritCursor);
+        winrt::Microsoft::Terminal::TerminalConnection::ITerminalConnection _CreateConnectionFromSettings(
+            Microsoft::Terminal::Settings::Model::Profile profile,
+            Microsoft::Terminal::Control::IControlSettings settings,
+            const bool inheritCursor,
+            const winrt::hstring& trustedWorkspaceCapabilityId = {});
         winrt::Microsoft::Terminal::TerminalConnection::ITerminalConnection _duplicateConnectionForRestart(const TerminalApp::TerminalPaneContent& paneContent);
         void _restartPaneConnection(const TerminalApp::TerminalPaneContent&, const winrt::Windows::Foundation::IInspectable&);
 
@@ -674,6 +1064,37 @@ namespace winrt::TerminalApp::implementation
         void _SaveWorkspaceIfNeeded();
 
         void _InitializeTab(winrt::com_ptr<Tab> newTabImpl, uint32_t insertPosition = -1, bool openInBackground = false);
+        void _OpenNewSurface(
+            const std::shared_ptr<Pane>& targetPane,
+            const Microsoft::Terminal::Settings::Model::INewContentArgs& contentArgs = nullptr);
+        safe_void_coroutine _OpenManagedAgentSurface(
+            std::shared_ptr<Pane> targetPane,
+            winrt::hstring targetId,
+            winrt::hstring agentId);
+        Windows::Foundation::IAsyncOperation<Microsoft::Terminal::Protocol::TabCreationResult> _CreateManagedAgentSurface(
+            std::shared_ptr<Pane> targetPane,
+            winrt::com_ptr<Tab> targetTab,
+            winrt::hstring targetId,
+            winrt::hstring agentId);
+        safe_void_coroutine _OpenBrowserSurface(
+            std::shared_ptr<Pane> targetPane,
+            winrt::hstring remoteWorkspaceId,
+            winrt::hstring initialUrl);
+        Windows::Foundation::IAsyncOperation<Microsoft::Terminal::Protocol::TabCreationResult> _CreateBrowserSurface(
+            std::shared_ptr<Pane> targetPane,
+            winrt::com_ptr<Tab> targetTab,
+            winrt::hstring remoteWorkspaceId,
+            winrt::hstring initialUrl);
+        safe_void_coroutine _OpenRemoteWorkspace(winrt::hstring targetId);
+        void _RemoteStorageItemsDroppedHandler(
+            const winrt::Windows::Foundation::IInspectable& sender,
+            const winrt::Microsoft::Terminal::Control::StorageItemsDroppedEventArgs& eventArgs);
+        safe_void_coroutine _UploadDroppedFiles(
+            winrt::Microsoft::Terminal::Control::TermControl term,
+            winrt::Windows::Foundation::Collections::IVectorView<winrt::hstring> paths,
+            winrt::hstring targetId,
+            winrt::hstring workspaceId,
+            winrt::hstring surfaceId);
         void _RegisterTerminalEvents(Microsoft::Terminal::Control::TermControl term);
         std::string _FindSessionIdForControl(const Microsoft::Terminal::Control::TermControl& control);
         std::string _FindTabIdForControl(const Microsoft::Terminal::Control::TermControl& control);
@@ -729,7 +1150,7 @@ namespace winrt::TerminalApp::implementation
         safe_void_coroutine _ClosePanes(weak_ref<Tab> weakTab, std::vector<uint32_t> paneIds);
         void _CloseRemainingPanes(weak_ref<Tab> weakTab, std::vector<uint32_t> paneIds);
         winrt::Windows::Foundation::IAsyncOperation<bool> _PaneConfirmCloseReadOnly(std::shared_ptr<Pane> pane);
-        void _AddPreviouslyClosedPaneOrTab(std::vector<Microsoft::Terminal::Settings::Model::ActionAndArgs>&& args);
+        uint64_t _AddPreviouslyClosedPaneOrTab(std::vector<Microsoft::Terminal::Settings::Model::ActionAndArgs>&& args);
 
         void _Scroll(ScrollDirection scrollDirection, const Windows::Foundation::IReference<uint32_t>& rowsToScroll);
 
@@ -827,7 +1248,8 @@ namespace winrt::TerminalApp::implementation
         TerminalApp::IPaneContent _makeSettingsContent();
         std::shared_ptr<Pane> _MakeTerminalPane(const Microsoft::Terminal::Settings::Model::NewTerminalArgs& newTerminalArgs = nullptr,
                                                 const winrt::TerminalApp::Tab& sourceTab = nullptr,
-                                                winrt::Microsoft::Terminal::TerminalConnection::ITerminalConnection existingConnection = nullptr);
+                                                winrt::Microsoft::Terminal::TerminalConnection::ITerminalConnection existingConnection = nullptr,
+                                                const winrt::hstring& trustedWorkspaceCapabilityId = {});
         std::shared_ptr<Pane> _MakePane(const Microsoft::Terminal::Settings::Model::INewContentArgs& newContentArgs = nullptr,
                                         const winrt::TerminalApp::Tab& sourceTab = nullptr,
                                         winrt::Microsoft::Terminal::TerminalConnection::ITerminalConnection existingConnection = nullptr);

@@ -46,10 +46,7 @@ pub struct AvailableAgent {
     pub source: crate::agent_source::AgentSource,
 }
 
-fn agent_command_on_enter(
-    input: &str,
-    selected: Option<&AvailableAgent>,
-) -> Option<ParsedCommand> {
+fn agent_command_on_enter(input: &str, selected: Option<&AvailableAgent>) -> Option<ParsedCommand> {
     commands::agent_id_prefix(input)?;
     Some(ParsedCommand {
         kind: CommandKind::Agent,
@@ -58,8 +55,8 @@ fn agent_command_on_enter(
     })
 }
 
-mod turn_state;
 mod autofix;
+mod turn_state;
 use autofix::*;
 
 pub use turn_state::{AutofixContext, ChunkKind, SubmittedPrompt, TurnOutcome, TurnState};
@@ -107,7 +104,8 @@ pub fn resolve_sessions_origin_filter() -> crate::agent_sessions::OriginFilter {
 }
 
 use crate::commands::{
-    self, CommandKind, CommandSpec, MovePositionSpec, ParseOutcome, ParsedCommand,
+    self, AgentCommandSpec, CommandCandidate, CommandKind, MovePositionSpec, ParseOutcome,
+    ParsedCommand,
 };
 use crate::coordinator::{
     parse_autofix_response, parse_recommendation_set, recommended_choice_index,
@@ -340,9 +338,7 @@ fn is_post_login_auth_failure(failure: &crate::protocol::acp::failure::AgentFail
 /// was missing. Login succeeds in the browser, but reconnecting to the saved
 /// pipe fails before initialize/authenticate/new_session can run. The right
 /// recovery is still the same fresh-master restart used for stale auth state.
-fn is_post_login_master_unavailable(
-    failure: &crate::protocol::acp::failure::AgentFailure,
-) -> bool {
+fn is_post_login_master_unavailable(failure: &crate::protocol::acp::failure::AgentFailure) -> bool {
     use crate::protocol::acp::failure::{AgentFailure, HandshakeStage};
     matches!(
         failure,
@@ -430,10 +426,9 @@ pub enum ChatMessage {
     /// codes, OSC sequences). Distinct from `Error` so we can theme it
     /// differently and skip autofix wiring.
     AgentEvent(String),
-    /// "Intelligent Terminal uses AI. Check for mistakes" disclaimer.
-    /// Pushed on every agent-pane startup,
-    /// no persistence gating — getting cleared by the next turn is fine,
-    /// the next pane startup re-pushes it.
+    /// Optional disclaimer message retained for restored/native snapshots.
+    /// New panes no longer inject it automatically; the one-time compact
+    /// first-use notice is rendered by `show_welcome_hint` instead.
     Disclaimer,
 }
 
@@ -519,13 +514,17 @@ impl PermOption {
     /// Prefix-checked (not lowercased) to stay allocation-free on the render /
     /// key-handling hot path.
     pub fn is_allow(&self) -> bool {
-        self.kind.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("allow"))
+        self.kind
+            .get(..5)
+            .is_some_and(|p| p.eq_ignore_ascii_case("allow"))
     }
 
     /// True if this is a "reject" option. Allocation-free, case-insensitive —
     /// see [`PermOption::is_allow`].
     pub fn is_reject(&self) -> bool {
-        self.kind.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("reject"))
+        self.kind
+            .get(..6)
+            .is_some_and(|p| p.eq_ignore_ascii_case("reject"))
     }
 }
 
@@ -780,13 +779,19 @@ where
                 .unwrap_or("")
                 .to_string();
             if crate::agent_sessions::is_user_input_tool(&tool_name) {
-                let tool_event = SessionEvent::ToolStarting { key: key.clone(), tool_name };
+                let tool_event = SessionEvent::ToolStarting {
+                    key: key.clone(),
+                    tool_name,
+                };
                 reg.apply(tool_event.clone());
                 hook_sink(tool_event);
-                let message = payload.get("tool_input")
-                    .and_then(|ti| ti.get("question")
-                        .or_else(|| ti.get("prompt"))
-                        .or_else(|| ti.get("message")))
+                let message = payload
+                    .get("tool_input")
+                    .and_then(|ti| {
+                        ti.get("question")
+                            .or_else(|| ti.get("prompt"))
+                            .or_else(|| ti.get("message"))
+                    })
                     .and_then(|v| v.as_str())
                     .unwrap_or("waiting for user input")
                     .to_string();
@@ -930,7 +935,7 @@ pub fn classify_wt_event(
                         summary: String::new(),
                         acknowledged: true, // auto-acknowledge so it never shows
                         age_ticks: 100,     // will be auto-dismissed immediately
-                    }
+                    };
                 }
                 _ => WtNotification {
                     severity: WtEventSeverity::Informational,
@@ -1084,6 +1089,12 @@ pub enum AppEvent {
     /// pane gained focus, false when it lost focus. Sourced from xterm
     /// focus-in/out (CSI I / CSI O) delivered through conpty.
     FocusChanged(bool),
+    /// The helper reached the Terminal COM endpoint, but the protocol client
+    /// could not complete its capability handshake (most importantly when an
+    /// installer mixed incompatible Terminal/wtcli builds). ACP chat can
+    /// remain usable, so this is a scoped terminal-control failure rather
+    /// than an agent connection failure.
+    WtProtocolFailure(String),
     ConnectionStage(String),
     /// `session_id` lets us route the status update to the originating tab
     /// once an ACP session is bound to it. Pre-session statuses (startup
@@ -1125,6 +1136,44 @@ pub enum AppEvent {
         session_id: String,
         available_models: Vec<AcpModelInfo>,
         current_model_id: Option<String>,
+    },
+    /// Dynamic slash commands advertised by the agent for one ACP session.
+    /// The list replaces the prior snapshot atomically.
+    AvailableCommandsUpdated {
+        session_id: String,
+        commands: Vec<AgentCommandSpec>,
+    },
+    /// Initial or updated mode/configuration state for one ACP session.
+    SessionCapabilitiesUpdated {
+        session_id: String,
+        modes: Option<agent_client_protocol::schema::v1::SessionModeState>,
+        config_options: Option<Vec<agent_client_protocol::schema::v1::SessionConfigOption>>,
+    },
+    SessionModeUpdated {
+        session_id: String,
+        current_mode_id: String,
+    },
+    SessionConfigUpdated {
+        session_id: String,
+        config_options: Vec<agent_client_protocol::schema::v1::SessionConfigOption>,
+    },
+    SessionUsageUpdated {
+        session_id: String,
+        used: u64,
+        size: u64,
+        cost: Option<(f64, String)>,
+    },
+    SessionInfoUpdated {
+        session_id: String,
+        title: Option<Option<String>>,
+        updated_at: Option<Option<String>>,
+    },
+    /// Non-text ACP content that cannot be placed in the terminal as binary
+    /// media is represented as a stable, user-visible chat attachment.
+    AgentContent {
+        session_id: String,
+        label: String,
+        detail: String,
     },
     /// Error scoped to a specific tab. Used by paths that know the tab
     /// (e.g. ACP `session/load` failure) but have no session_id yet
@@ -1422,7 +1471,6 @@ impl Scroll {
     }
 }
 
-
 /// Everything that conceptually belongs to one tab's conversation: the
 /// message history, the streaming buffer of the in-flight prompt, the
 /// pending tool calls, the recommendations panel state, etc.
@@ -1516,7 +1564,6 @@ pub struct TabSession {
     /// actually changes.
     pub last_emitted_chip_override: Option<String>,
 
-
     // Input editor state — per-tab so each tab keeps its own draft text,
     // cursor, and slash-command popup across switches.
     pub input: String,
@@ -1537,13 +1584,23 @@ pub struct TabSession {
     /// Recomputed on every input mutation. Empty when not in
     /// command-prefix mode. The popup renderer treats an empty Vec as
     /// "do not render".
-    pub command_popup_candidates: Vec<&'static CommandSpec>,
+    pub command_popup_candidates: Vec<CommandCandidate>,
     /// Position candidates shown after `/move `. Kept separate from command
     /// candidates so the existing command registry remains strongly typed.
     pub move_position_candidates: Vec<&'static MovePositionSpec>,
     /// Index into whichever popup candidate list is active: commands or
     /// `/move` positions. Clamped whenever either list can shrink.
     pub command_popup_selected: usize,
+
+    /// Dynamic ACP capabilities are owned by the conversation surface, never
+    /// by the window. Focusing another surface swaps to that surface's
+    /// commands/mode/config/usage together with its chat history.
+    pub available_agent_commands: Vec<AgentCommandSpec>,
+    pub session_modes: Option<agent_client_protocol::schema::v1::SessionModeState>,
+    pub session_config_options: Vec<agent_client_protocol::schema::v1::SessionConfigOption>,
+    pub session_usage: Option<(u64, u64, Option<(f64, String)>)>,
+    pub session_title: Option<String>,
+    pub session_updated_at: Option<String>,
 
     // Filled in Milestone 2 once each tab has its own ACP SessionId.
     #[allow(dead_code)]
@@ -1923,11 +1980,18 @@ impl TabSession {
         if input.is_empty() {
             return;
         }
-        if let Some(index) = self.input_history.entries.iter().position(|entry| entry == input) {
+        if let Some(index) = self
+            .input_history
+            .entries
+            .iter()
+            .position(|entry| entry == input)
+        {
             self.input_history.entries.remove(index);
         }
         self.input_history.entries.push_front(input.to_string());
-        self.input_history.entries.truncate(INPUT_HISTORY_MAX_ENTRIES);
+        self.input_history
+            .entries
+            .truncate(INPUT_HISTORY_MAX_ENTRIES);
     }
 
     fn input_history_is_browsing(&self) -> bool {
@@ -1998,7 +2062,37 @@ impl TabSession {
             // shape, so the unwrap is safe.
             let trimmed = self.input.trim_start();
             let name = trimmed.strip_prefix('/').unwrap_or("");
-            self.command_popup_candidates = commands::matches(name);
+            let needle = name.to_ascii_lowercase();
+            let explicit_local = needle.starts_with("terminal:");
+            let mut candidates = Vec::new();
+
+            if !explicit_local {
+                candidates.extend(
+                    self.available_agent_commands
+                        .iter()
+                        .filter(|spec| spec.name.to_ascii_lowercase().starts_with(&needle))
+                        .cloned()
+                        .map(CommandCandidate::Agent),
+                );
+            }
+
+            // `/` shows both providers. A non-empty legacy prefix falls back
+            // to a local alias only when the active agent did not advertise a
+            // matching command; collisions therefore resolve to the agent.
+            if explicit_local || needle.is_empty() {
+                candidates.extend(
+                    commands::matches_namespaced(name)
+                        .into_iter()
+                        .map(CommandCandidate::Local),
+                );
+            } else if candidates.is_empty() {
+                candidates.extend(
+                    commands::matches(name)
+                        .into_iter()
+                        .map(CommandCandidate::Local),
+                );
+            }
+            self.command_popup_candidates = candidates;
             self.move_position_candidates.clear();
         } else {
             self.command_popup_candidates.clear();
@@ -2023,10 +2117,9 @@ impl TabSession {
         }
     }
 
-    pub fn selected_command_spec(&self) -> Option<&'static CommandSpec> {
+    pub fn selected_command_candidate(&self) -> Option<&CommandCandidate> {
         self.command_popup_candidates
             .get(self.command_popup_selected)
-            .copied()
     }
 
     pub fn selected_move_position(&self) -> Option<&'static MovePositionSpec> {
@@ -2045,11 +2138,12 @@ impl TabSession {
             self.input = format!("/move {}", position.name);
             self.cursor_pos = self.input.len();
             self.refresh_command_popup();
-        } else if let Some(spec) = self.selected_command_spec() {
-            self.input = if spec.takes_args {
-                format!("/{} ", spec.name)
+        } else if let Some(candidate) = self.selected_command_candidate() {
+            let name = candidate.completion_name();
+            self.input = if candidate.takes_args() {
+                format!("/{name} ")
             } else {
-                format!("/{}", spec.name)
+                format!("/{name}")
             };
             self.cursor_pos = self.input.len();
             self.refresh_command_popup();
@@ -2131,6 +2225,13 @@ pub struct App {
     rename_session_tx: mpsc::UnboundedSender<RenameSessionRequest>,
     restart_tx: mpsc::UnboundedSender<RestartRequest>,
     master_request_tx: mpsc::UnboundedSender<crate::protocol::acp::client::MasterExtRequest>,
+    /// Monotonic correlation id shared by every master extension request.
+    ///
+    /// This must be App-scoped rather than stored in `AgentsViewState`: each
+    /// surface owns an independent view state, and per-surface counters would
+    /// all start at 1. A response for surface A could then also match surface B
+    /// and overwrite its history snapshot.
+    next_master_request_id: u64,
     debug_capture_enabled: Arc<AtomicBool>,
     /// Cached for creating DeferredAcpParams after auth-error recovery.
     shell_mgr: Arc<crate::shell::ShellManager>,
@@ -2166,6 +2267,18 @@ pub struct App {
     // AgentPaneContent / bottom bar window without fan-out.
     pub owner_tab_id: Option<String>,
     pub window_id: Option<String>,
+    /// Complete host-issued focus snapshot. `tab_id` remains the owning
+    /// workspace for native routing; `active_scope_key` selects the isolated
+    /// surface conversation inside that workspace.
+    pub focus_context: PaneContext,
+    active_scope_key: Option<String>,
+    active_scope_by_workspace: HashMap<String, String>,
+    last_focus_generation: u64,
+    /// Last compact native-chat payload published to TerminalPage. The
+    /// helper still renders its TUI as a compatibility fallback, but native
+    /// XAML consumes these immutable snapshots when the active view is Chat.
+    last_native_chat_snapshot: Option<String>,
+    native_chat_snapshot_sequence: u64,
     // WT event notifications (global — affects bottom-bar / banner across tabs)
     pub wt_notifications: std::collections::VecDeque<WtNotification>,
     pub show_notification_banner: bool,
@@ -2226,8 +2339,7 @@ pub struct App {
     /// `agent_config_changed` settings event so the configured delegate
     /// agent/model can change without restarting the agent pane. None in
     /// tests / manual runs where no executor is wired.
-    delegate_agents:
-        Option<Arc<std::sync::Mutex<Vec<crate::coordinator::DelegateAgentRuntime>>>>,
+    delegate_agents: Option<Arc<std::sync::Mutex<Vec<crate::coordinator::DelegateAgentRuntime>>>>,
     /// The helper's own `--agent` cmdline. Needed to re-derive the delegate
     /// runtime commandline when only the delegate agent/model change.
     delegate_base_agent_cmd: String,
@@ -2309,7 +2421,6 @@ pub struct AgentsViewState {
     pub search_focused: bool,
     pub refetch_in_flight: bool,
     pub dirty: bool,
-    pub next_request_id: u64,
     pub latest_request_id: Option<u64>,
     /// Set by F5 in the session view to request a master-side disk re-scan
     /// (`load_for_cli`) on the next dispatched `sessions/list`. Sticky across
@@ -2336,10 +2447,10 @@ pub struct AgentsViewState {
 pub(crate) fn known_cli_id(src: &crate::agent_sessions::CliSource) -> Option<&'static str> {
     use crate::agent_sessions::CliSource;
     match src {
-        CliSource::Claude  => Some("claude"),
-        CliSource::Codex   => Some("codex"),
+        CliSource::Claude => Some("claude"),
+        CliSource::Codex => Some("codex"),
         CliSource::Copilot => Some("copilot"),
-        CliSource::Gemini  => Some("gemini"),
+        CliSource::Gemini => Some("gemini"),
         CliSource::OpenCode => Some("opencode"),
         CliSource::Unknown(_) => None,
     }
@@ -2450,6 +2561,7 @@ impl App {
             rename_session_tx,
             restart_tx,
             master_request_tx,
+            next_master_request_id: 0,
             debug_capture_enabled,
             help_overlay_visible: false,
             transport_lost: false,
@@ -2460,6 +2572,12 @@ impl App {
             tab_id: None,
             owner_tab_id: None,
             window_id: None,
+            focus_context: PaneContext::default(),
+            active_scope_key: None,
+            active_scope_by_workspace: HashMap::new(),
+            last_focus_generation: 0,
+            last_native_chat_snapshot: None,
+            native_chat_snapshot_sequence: 0,
             wt_notifications: VecDeque::new(),
             show_notification_banner: false,
             autofix_enabled,
@@ -2653,30 +2771,29 @@ impl App {
                     let recovery_agent_id = self.current_agent_id.clone();
                     let event_tx_for_pipe = event_tx.clone();
                     tokio::task::spawn_local(async move {
-                        if let Err(e) =
-                            crate::protocol::acp::client::run_acp_client_over_pipe(
-                                pipe_name,
-                                acp_model,
-                                agent_id_opt,
-                                agent_source,
-                                source_cwd,
-                                owner_tab_opt,
-                                None, // initial_load_session_id: already handled by the dead initial task
-                                event_tx_for_pipe.clone(),
-                                prompt_rx,
-                                cancel_rx,
-                                new_session_rx,
-                                load_session_rx,
-                                drop_session_rx,
-                                rename_session_rx,
-                                restart_rx,
-                                shrx,
-                                master_ext_rx,
-                                shell_mgr,
-                                wt_connected,
-                                post_login_auth, // only true on genuine LoginComplete reconnects
-                            )
-                            .await
+                        if let Err(e) = crate::protocol::acp::client::run_acp_client_over_pipe(
+                            pipe_name,
+                            acp_model,
+                            agent_id_opt,
+                            agent_source,
+                            source_cwd,
+                            owner_tab_opt,
+                            None, // initial_load_session_id: already handled by the dead initial task
+                            event_tx_for_pipe.clone(),
+                            prompt_rx,
+                            cancel_rx,
+                            new_session_rx,
+                            load_session_rx,
+                            drop_session_rx,
+                            rename_session_rx,
+                            restart_rx,
+                            shrx,
+                            master_ext_rx,
+                            shell_mgr,
+                            wt_connected,
+                            post_login_auth, // only true on genuine LoginComplete reconnects
+                        )
+                        .await
                         {
                             tracing::error!(
                                 target: "helper",
@@ -2812,6 +2929,30 @@ impl App {
         );
     }
 
+    fn send_session_mode(&self, session_id: String, mode_id: String) {
+        let _ = self.master_request_tx.send(
+            crate::protocol::acp::client::MasterExtRequest::SetSessionMode {
+                session_id: agent_client_protocol::schema::v1::SessionId::new(session_id),
+                mode_id: agent_client_protocol::schema::v1::SessionModeId::new(mode_id),
+            },
+        );
+    }
+
+    fn send_session_config(
+        &self,
+        session_id: String,
+        config_id: String,
+        value: agent_client_protocol::schema::v1::SessionConfigOptionValue,
+    ) {
+        let _ = self.master_request_tx.send(
+            crate::protocol::acp::client::MasterExtRequest::SetSessionConfigOption {
+                session_id: agent_client_protocol::schema::v1::SessionId::new(session_id),
+                config_id: agent_client_protocol::schema::v1::SessionConfigId::new(config_id),
+                value,
+            },
+        );
+    }
+
     /// The model a given tab should run on: its explicit per-pane override
     /// (set via `/model`) wins, else the global `acpModel`. `None` means no
     /// opinion — leave the session on the agent's default.
@@ -2889,11 +3030,7 @@ impl App {
                 let source = crate::agent_source::AgentSource::Host;
                 AvailableAgent {
                     id: profile.id.to_string(),
-                    display_name: format!(
-                        "{} — {}",
-                        profile.display_name,
-                        source.display_suffix()
-                    ),
+                    display_name: format!("{} — {}", profile.display_name, source.display_suffix()),
                     source,
                 }
             })
@@ -2912,8 +3049,8 @@ impl App {
         let allowlist_present = self.host_agent_allowlist_present;
         tokio::task::spawn_local(async move {
             let active_pane = shell_mgr.wt_get_active_pane().await.ok();
-            let Some(distro) =
-                crate::agent_source::active_pane_wsl_distro(active_pane.as_ref()).map(str::to_string)
+            let Some(distro) = crate::agent_source::active_pane_wsl_distro(active_pane.as_ref())
+                .map(str::to_string)
             else {
                 let _ = event_tx.send(AppEvent::AgentSourcesDiscovered {
                     generation,
@@ -2926,8 +3063,7 @@ impl App {
             let candidates = crate::agent_registry::KNOWN_AGENTS
                 .iter()
                 .filter(|profile| {
-                    !allowlist_present
-                        || allowed_agent_ids.iter().any(|id| id == profile.id)
+                    !allowlist_present || allowed_agent_ids.iter().any(|id| id == profile.id)
                 })
                 .map(|profile| (profile.id, profile.display_name));
             let wsl_sources = futures::stream::iter(candidates)
@@ -2937,8 +3073,7 @@ impl App {
                         crate::agent_check::wsl_agent_available(&distro, id)
                             .await
                             .then(|| {
-                                let source =
-                                    crate::agent_source::AgentSource::Wsl { distro };
+                                let source = crate::agent_source::AgentSource::Wsl { distro };
                                 AvailableAgent {
                                     id: id.to_string(),
                                     display_name: format!(
@@ -2987,8 +3122,7 @@ impl App {
         }
 
         self.refresh_available_agents();
-        let selected =
-            Self::find_host_agent_for_command(&self.available_agents, arg).cloned();
+        let selected = Self::find_host_agent_for_command(&self.available_agents, arg).cloned();
         match selected {
             Some(agent) => self.apply_agent_pick(agent),
             None => {
@@ -3378,8 +3512,7 @@ impl App {
                 };
                 let msg = match reason {
                     NotResumableReason::LiveWithoutPane => {
-                        t!("system.cannot_focus_session", session_id = s.key.as_str())
-                            .into_owned()
+                        t!("system.cannot_focus_session", session_id = s.key.as_str()).into_owned()
                     }
                     NotResumableReason::LoadSessionNotSupported => {
                         let agent: String = if self.agent_name.is_empty() {
@@ -3626,8 +3759,7 @@ impl App {
                 format!("Resuming {cli_id} session {short_key}...")
             }
         };
-        let launch_commandline =
-            format!("cmd /c echo \x1b[2;37m{banner}\x1b[0m && {commandline}");
+        let launch_commandline = format!("cmd /c echo \x1b[2;37m{banner}\x1b[0m && {commandline}");
         let mut argv = vec![
             "new-tab".to_string(),
             "-c".to_string(),
@@ -3645,7 +3777,8 @@ impl App {
         // second Enter on the same row sees a non-terminal status and
         // skips this branch (idempotent: ResumeDispatched no-ops on live
         // rows). See `agent_sessions::SessionEvent::ResumeDispatched`.
-        let resume_event = crate::agent_sessions::SessionEvent::ResumeDispatched { key: key.clone() };
+        let resume_event =
+            crate::agent_sessions::SessionEvent::ResumeDispatched { key: key.clone() };
         self.agent_sessions.apply(resume_event.clone());
         self.publish_session_hook(resume_event);
         self.dispatch_session_resume_dispatched_rpc(&key);
@@ -3781,15 +3914,22 @@ impl App {
 
         // Mirror dispatch_resume's optimistic state flip so a rapid
         // double press doesn't double-dispatch.
-        let resume_event = crate::agent_sessions::SessionEvent::ResumeDispatched { key: key.clone() };
+        let resume_event =
+            crate::agent_sessions::SessionEvent::ResumeDispatched { key: key.clone() };
         self.agent_sessions.apply(resume_event.clone());
         self.publish_session_hook(resume_event);
         self.dispatch_session_resume_dispatched_rpc(&key);
 
         let mut params = serde_json::Map::new();
-        params.insert("session_id".to_string(), serde_json::Value::String(key.clone()));
+        params.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(key.clone()),
+        );
         if !cwd_string.is_empty() {
-            params.insert("cwd".to_string(), serde_json::Value::String(cwd_string.clone()));
+            params.insert(
+                "cwd".to_string(),
+                serde_json::Value::String(cwd_string.clone()),
+            );
         }
         let evt = serde_json::json!({
             "type": "event",
@@ -3830,9 +3970,8 @@ impl App {
     }
 
     fn next_agents_rpc_request_id(&mut self) -> u64 {
-        let tab = self.current_tab_mut();
-        tab.agents_view.next_request_id = tab.agents_view.next_request_id.wrapping_add(1);
-        tab.agents_view.next_request_id
+        self.next_master_request_id = self.next_master_request_id.wrapping_add(1);
+        self.next_master_request_id
     }
 
     fn dispatch_session_focus_rpc(&mut self, sid: &str) {
@@ -3910,8 +4049,9 @@ impl App {
     }
 
     fn schedule_agents_refetch_for_tab(&mut self, tab_id: &str) {
-        let request = {
-            let tab = self.tab_mut(tab_id);
+        let scope_key = self.scope_for_workspace(tab_id);
+        {
+            let tab = self.tab_sessions.entry(scope_key.clone()).or_default();
             if tab.agents_view.snapshot.is_none() {
                 return;
             }
@@ -3919,10 +4059,12 @@ impl App {
                 tab.agents_view.dirty = true;
                 return;
             }
+        }
+        let request_id = self.next_agents_rpc_request_id();
+        let request = {
+            let tab = self.tab_sessions.entry(scope_key.clone()).or_default();
             tab.agents_view.refetch_in_flight = true;
             tab.agents_view.dirty = false;
-            tab.agents_view.next_request_id = tab.agents_view.next_request_id.wrapping_add(1);
-            let request_id = tab.agents_view.next_request_id;
             tab.agents_view.latest_request_id = Some(request_id);
             // Consume the sticky F5 rescan intent only when we actually build a
             // request; if we coalesced (in-flight) above, it stays set so the
@@ -3934,7 +4076,21 @@ impl App {
             tab.agents_view.rescan_in_flight = rescan;
             crate::protocol::acp::client::MasterExtRequest::SessionsList { request_id, rescan }
         };
-        let _ = self.master_request_tx.send(request);
+        tracing::debug!(
+            target: "agents_view",
+            request_id,
+            scope = %scope_key,
+            "queueing sessions/list request"
+        );
+        if self.master_request_tx.send(request).is_err() {
+            tracing::warn!(
+                target: "agents_view",
+                request_id,
+                scope = %scope_key,
+                "sessions/list request queue is unavailable"
+            );
+            self.handle_agents_snapshot_failed(request_id);
+        }
     }
 
     fn schedule_agents_refetch_for_open_views(&mut self) {
@@ -4036,15 +4192,17 @@ impl App {
             .and_then(|sid| rows.iter().position(|row| row.key == sid.0.as_ref()))
             .unwrap_or_else(|| old_selected.min(rows.len() - 1));
         tab.agents_list_state.select(Some(idx));
-        tab.agents_view.focused_sid =
-            Some(agent_client_protocol::schema::v1::SessionId::new(rows[idx].key.clone()));
+        tab.agents_view.focused_sid = Some(agent_client_protocol::schema::v1::SessionId::new(
+            rows[idx].key.clone(),
+        ));
     }
 
     fn update_agents_focus_for_tab(&mut self, tab_id: &str) {
+        let scope_key = self.scope_for_workspace(tab_id);
         let rows = self.agents_rows_for_tab(tab_id);
         let selected = self
             .tab_sessions
-            .get(tab_id)
+            .get(&scope_key)
             .and_then(|t| t.agents_list_state.selected());
         let focused = selected.and_then(|idx| {
             rows.get(idx)
@@ -4063,17 +4221,18 @@ impl App {
     }
 
     fn agents_rows_for_tab(&self, tab_id: &str) -> Vec<crate::agent_sessions::AgentSession> {
+        let scope_key = self.scope_for_workspace(tab_id);
         let filter = self.current_cli_filter();
         let origin = self.sessions_origin_filter;
         let query = self
             .tab_sessions
-            .get(tab_id)
+            .get(&scope_key)
             .map(|tab| tab.agents_view.search_query.as_str())
             .unwrap_or_default();
         let folded_query = query.to_lowercase();
         if let Some(snapshot) = self
             .tab_sessions
-            .get(tab_id)
+            .get(&scope_key)
             .and_then(|t| t.agents_view.snapshot.as_ref())
         {
             let mut rows: Vec<_> = snapshot.iter().map(session_info_to_agent_session).collect();
@@ -4336,7 +4495,10 @@ impl App {
                         "login failed"
                     );
                 }
-                tracing::info!("login: spawn_blocking returned, sending LoginComplete success={}", success);
+                tracing::info!(
+                    "login: spawn_blocking returned, sending LoginComplete success={}",
+                    success
+                );
                 let send_result = tx.send(AppEvent::LoginComplete {
                     agent_id: id,
                     success,
@@ -4531,10 +4693,206 @@ impl App {
         }
     }
 
-    /// Key used for lookup into `tab_sessions`. Falls back to
-    /// `DEFAULT_TAB_ID` until `tab_changed` from Windows Terminal arrives.
-    fn active_tab_key(&self) -> &str {
-        self.tab_id.as_deref().unwrap_or(DEFAULT_TAB_ID)
+    /// Key used for lookup into the conversation registry. New hosts select a
+    /// surface-scoped key; old hosts continue to use the workspace/tab id.
+    pub(crate) fn active_tab_key(&self) -> &str {
+        self.active_scope_key
+            .as_deref()
+            .or(self.tab_id.as_deref())
+            .unwrap_or(DEFAULT_TAB_ID)
+    }
+
+    /// User-facing chat always follows the focused terminal surface. These
+    /// alternate kinds are retained only so an older host can finish an
+    /// already-open coordinator/team conversation before the next focus event
+    /// returns routing to the focused surface.
+    fn active_scope_kind(&self) -> &'static str {
+        let active = self.active_tab_key();
+        if active.ends_with("::coordinator") {
+            "workspace"
+        } else if active.ends_with("::team") {
+            "team"
+        } else {
+            "surface"
+        }
+    }
+
+    fn scope_for_workspace(&self, workspace_id: &str) -> String {
+        self.active_scope_by_workspace
+            .get(workspace_id)
+            .cloned()
+            .unwrap_or_else(|| workspace_id.to_string())
+    }
+
+    /// Project the host's authoritative focus identity into the compute
+    /// control plane. This is deliberately best-effort: a damaged compute
+    /// store must never prevent the terminal or ACP conversation from
+    /// following focus. The surface id, not the presentation pane, is the
+    /// durable identity, so moving a surface only updates `pane_id`.
+    fn sync_compute_surface_binding(
+        &self,
+        workspace_id: &str,
+        surface_id: &str,
+        focus_generation: u64,
+        scope_key: &str,
+    ) {
+        use sha2::{Digest, Sha256};
+        use wta::compute::model::{
+            BindingKind, BindingState, SurfaceBinding, COMPUTE_SCHEMA_VERSION,
+        };
+        use wta::compute::store::ComputeStore;
+
+        let Ok(store) = ComputeStore::package_default() else {
+            return;
+        };
+        let window_id = self.window_id.as_deref().unwrap_or("window-unknown");
+        let pane_id = self
+            .focus_context
+            .source_pane_id
+            .as_deref()
+            .or(self.pane_id.as_deref())
+            .unwrap_or("pane-unknown");
+        let mut digest = Sha256::new();
+        digest.update(window_id.as_bytes());
+        digest.update(b"\0");
+        digest.update(workspace_id.as_bytes());
+        digest.update(b"\0");
+        digest.update(surface_id.as_bytes());
+        let binding_id = format!("surface-{}", &hex::encode(digest.finalize())[..24]);
+
+        let existing = store
+            .find_surface_binding(window_id, workspace_id, surface_id)
+            .ok()
+            .flatten();
+        let mut binding = existing.unwrap_or_else(|| SurfaceBinding {
+            schema_version: COMPUTE_SCHEMA_VERSION,
+            binding_id,
+            window_id: window_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            pane_id: pane_id.to_string(),
+            surface_id: surface_id.to_string(),
+            focus_generation,
+            // Focus observation must never turn an ordinary terminal into a
+            // managed agent. The explicit Managed Agent Surface creation
+            // path owns promotion and supplies its target/runtime identity.
+            kind: BindingKind::PlainTerminal,
+            agent_id: None,
+            adapter_kind: None,
+            acp_session_id: None,
+            remote_session_id: None,
+            environment_id: None,
+            preferred_endpoint_kind: None,
+            home_target_id: None,
+            worktree_id: None,
+            writer_lease_id: None,
+            state: BindingState::Ready,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            metadata: serde_json::json!({ "scope_key": scope_key }),
+        });
+        binding.pane_id = pane_id.to_string();
+        binding.focus_generation = focus_generation;
+        binding.metadata["scope_key"] = serde_json::Value::String(scope_key.to_string());
+
+        // A binding explicitly configured as remote/managed by `wta compute`
+        // owns its lifecycle. Focus projection never overwrites its target,
+        // worktree or adapter selection.
+        if binding.kind == BindingKind::ManagedAgent {
+            if binding.agent_id.is_none() && !self.current_agent_id.is_empty() {
+                binding.agent_id = Some(self.current_agent_id.clone());
+            }
+            if binding.adapter_kind.is_none() {
+                binding.adapter_kind = Some("acp".to_string());
+            }
+        }
+
+        // A damaged/legacy managed record without a HomeTarget is not allowed
+        // to survive focus projection as a half-managed surface.
+        if binding.kind == BindingKind::ManagedAgent && binding.home_target_id.is_none() {
+            binding.kind = BindingKind::PlainTerminal;
+            binding.state = BindingState::Ready;
+            binding.agent_id = None;
+            binding.adapter_kind = None;
+            binding.acp_session_id = None;
+            binding.remote_session_id = None;
+        }
+        if let Err(error) = store.upsert_binding("terminal.focus", binding) {
+            tracing::warn!(
+                target: "compute_binding",
+                workspace_id,
+                surface_id,
+                error = %error,
+                "failed to project focused surface into compute store"
+            );
+        }
+    }
+
+    fn sync_active_compute_session(&self, session_id: &str) {
+        use wta::compute::model::{BindingKind, BindingState};
+        use wta::compute::store::ComputeStore;
+
+        let Some(workspace_id) = self.focus_context.workspace_id.as_deref() else {
+            return;
+        };
+        let Some(surface_id) = self.focus_context.surface_id.as_deref() else {
+            return;
+        };
+        let window_id = self.window_id.as_deref().unwrap_or("window-unknown");
+        let Ok(store) = ComputeStore::package_default() else {
+            return;
+        };
+        let Ok(Some(mut binding)) = store.find_surface_binding(window_id, workspace_id, surface_id)
+        else {
+            return;
+        };
+
+        binding.acp_session_id = Some(session_id.to_string());
+        if !self.current_agent_id.is_empty() {
+            binding.agent_id = Some(self.current_agent_id.clone());
+        }
+        binding.adapter_kind = Some("acp".to_string());
+        if binding.home_target_id.is_some() {
+            binding.kind = BindingKind::ManagedAgent;
+            binding.state = BindingState::Ready;
+        }
+        if let Err(error) = store.upsert_binding("terminal.acp", binding) {
+            tracing::warn!(
+                target: "compute_binding",
+                workspace_id,
+                surface_id,
+                error = %error,
+                "failed to attach ACP session to focused surface binding"
+            );
+        }
+    }
+
+    /// Remove the canonical compute record when the terminal reports that a
+    /// surface was closed. Presentation lifecycle is the authority here:
+    /// closing a surface must release its writer/slot leases even if ACP never
+    /// reached Ready or the process exited before publishing a session id.
+    fn remove_compute_surface_binding(&self, workspace_id: &str, surface_id: &str) {
+        use wta::compute::store::ComputeStore;
+
+        let window_id = self.window_id.as_deref().unwrap_or("window-unknown");
+        let Ok(store) = ComputeStore::package_default() else {
+            return;
+        };
+        let Ok(binding) = store.find_surface_binding(window_id, workspace_id, surface_id) else {
+            return;
+        };
+        let Some(binding) = binding else {
+            return;
+        };
+        if let Err(error) = store.remove_binding("terminal.surface_closed", &binding.binding_id) {
+            tracing::warn!(
+                target: "compute_binding",
+                workspace_id,
+                surface_id,
+                binding_id = binding.binding_id,
+                error = %error,
+                "failed to remove closed surface from compute store"
+            );
+        }
     }
 
     /// Read-only view of the currently focused tab's per-tab state. Always
@@ -4551,10 +4909,7 @@ impl App {
     /// Mutable view of the currently focused tab's per-tab state.
     /// Lazily inserts a default `TabSession` if the key is missing.
     pub fn current_tab_mut(&mut self) -> &mut TabSession {
-        let key = self
-            .tab_id
-            .clone()
-            .unwrap_or_else(|| DEFAULT_TAB_ID.to_string());
+        let key = self.active_tab_key().to_string();
         self.tab_sessions.entry(key).or_default()
     }
 
@@ -4563,7 +4918,8 @@ impl App {
     /// Milestone 2) by chunk routing keyed on `SessionId`.
     #[allow(dead_code)]
     pub fn tab_mut(&mut self, tab_id: &str) -> &mut TabSession {
-        self.tab_sessions.entry(tab_id.to_string()).or_default()
+        let key = self.scope_for_workspace(tab_id);
+        self.tab_sessions.entry(key).or_default()
     }
 
     /// Resolve a `SessionId` to the tab that owns it. Returns the active
@@ -4574,7 +4930,7 @@ impl App {
         self.session_to_tab
             .get(session_id)
             .cloned()
-            .or_else(|| self.tab_id.clone())
+            .or_else(|| Some(self.active_tab_key().to_string()))
             .unwrap_or_else(|| DEFAULT_TAB_ID.to_string())
     }
 
@@ -4604,6 +4960,7 @@ impl App {
 
         let initial_draw_started = std::time::Instant::now();
         self.draw_frame(terminal)?;
+        self.publish_native_chat_snapshot_if_changed();
         ui_trace::log_slow("initial_draw", initial_draw_started.elapsed(), || {
             self.trace_state()
         });
@@ -4686,6 +5043,7 @@ impl App {
 
             // Deferred ACP start after login completes
             self.try_start_acp();
+            self.publish_native_chat_snapshot_if_changed();
 
             if self.should_quit {
                 break;
@@ -4759,10 +5117,18 @@ impl App {
             AppEvent::Tick => "tick",
             AppEvent::Resize(_, _) => "resize",
             AppEvent::FocusChanged(_) => "focus_changed",
+            AppEvent::WtProtocolFailure(_) => "wt_protocol_failure",
             AppEvent::ConnectionStage(_) => "connection_stage",
             AppEvent::ProgressStatus { .. } => "progress_status",
             AppEvent::AgentConnected { .. } => "agent_connected",
             AppEvent::SessionAttached { .. } => "session_attached",
+            AppEvent::AvailableCommandsUpdated { .. } => "available_commands_updated",
+            AppEvent::SessionCapabilitiesUpdated { .. } => "session_capabilities_updated",
+            AppEvent::SessionModeUpdated { .. } => "session_mode_updated",
+            AppEvent::SessionConfigUpdated { .. } => "session_config_updated",
+            AppEvent::SessionUsageUpdated { .. } => "session_usage_updated",
+            AppEvent::SessionInfoUpdated { .. } => "session_info_updated",
+            AppEvent::AgentContent { .. } => "agent_content",
             AppEvent::TabError { .. } => "tab_error",
             AppEvent::TabSystemMessage { .. } => "tab_system_message",
             AppEvent::AgentPasteTextReady { .. } => "agent_paste_text_ready",
@@ -4874,9 +5240,7 @@ impl App {
                     CheckStatus::Failed(t!("agent.status.not_found").into_owned())
                 },
                 cli_path: agent_status.cli_path.clone(),
-                auth_status: CheckStatus::Failed(
-                    t!("system.authentication_failed").into_owned(),
-                ),
+                auth_status: CheckStatus::Failed(t!("system.authentication_failed").into_owned()),
                 install_hint: profile.install_hint.to_string(),
                 install_url: String::new(),
                 auth_hint: profile.auth_hint.to_string(),
@@ -4887,11 +5251,9 @@ impl App {
             options,
             title: t!("setup.title.sign_in").into_owned(),
             subtitle: if profile.id == "copilot" {
-                t!("setup.subtitle.copilot_auth", agent = profile.display_name)
-                    .into_owned()
+                t!("setup.subtitle.copilot_auth", agent = profile.display_name).into_owned()
             } else {
-                t!("setup.subtitle.agent_auth", agent = profile.display_name)
-                    .into_owned()
+                t!("setup.subtitle.agent_auth", agent = profile.display_name).into_owned()
             },
         });
         let tab = self.current_tab_mut();
@@ -4939,7 +5301,8 @@ impl App {
         };
         tokio::task::spawn_local(async move {
             let tab_for_result = target_tab.clone();
-            let result = tokio::task::spawn_blocking(crate::win32::read_paste_string_from_clipboard).await;
+            let result =
+                tokio::task::spawn_blocking(crate::win32::read_paste_string_from_clipboard).await;
             let event = match result {
                 Ok(Ok(text)) => AppEvent::AgentPasteTextReady {
                     tab_id: tab_for_result,
@@ -4962,7 +5325,10 @@ impl App {
     }
 
     fn agent_paste_target_tab<'a>(&self, params: &'a serde_json::Value) -> Option<&'a str> {
-        let target_window = params.get("window_id").and_then(|v| v.as_str()).unwrap_or("");
+        let target_window = params
+            .get("window_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let target_tab = params.get("tab_id").and_then(|v| v.as_str()).unwrap_or("");
         let our_window = self.window_id.as_deref().unwrap_or("");
         let owner_tab = self.owner_tab_id.as_deref().unwrap_or("");
@@ -5132,6 +5498,16 @@ impl App {
             AppEvent::FocusChanged(focused) => {
                 self.pane_focused = focused;
             }
+            AppEvent::WtProtocolFailure(message) => {
+                self.wt_connected = false;
+                let tab = self.current_tab_mut();
+                if !tab.messages.iter().any(
+                    |item| matches!(item, ChatMessage::Error(existing) if existing == &message),
+                ) {
+                    tab.messages.push(ChatMessage::Error(message));
+                    tab.scroll_to_bottom();
+                }
+            }
             AppEvent::ConnectionStage(stage) => {
                 self.state = ConnectionState::Connecting(stage);
                 self.publish_agent_status();
@@ -5176,13 +5552,9 @@ impl App {
                     self.mode = AppMode::Chat;
                     self.setup = None;
                 }
-                // Show welcome hint on first-ever connect (persisted in state.json).
-                // The disclaimer card is pushed as a `ChatMessage::Disclaimer`
-                // on every agent-pane startup that lands on an empty chat (no
-                // prior completed turns and no other in-flight messages), so
-                // a session restored with history doesn't get a disclaimer
-                // injected on top. Once shown it's allowed to be cleared by
-                // a subsequent turn — the next startup re-pushes it.
+                // Show one compact safety notice on the first-ever connect.
+                // It is not inserted into conversation history and disappears
+                // after the first prompt or when session management is opened.
                 if !welcome_shown_in_state() {
                     self.show_welcome_hint = true;
                 }
@@ -5194,20 +5566,8 @@ impl App {
                 self.session_to_tab
                     .insert(session_id.clone(), bind_tab.clone());
                 let tab = self.tab_mut(&bind_tab);
-                tab.session_id = Some(session_id);
-                let has_real_content = !tab.completed_turns.is_empty()
-                    || tab
-                        .messages
-                        .iter()
-                        .any(|m| !matches!(m, ChatMessage::Disclaimer));
-                if !has_real_content
-                    && !tab
-                        .messages
-                        .iter()
-                        .any(|m| matches!(m, ChatMessage::Disclaimer))
-                {
-                    tab.messages.insert(0, ChatMessage::Disclaimer);
-                }
+                tab.session_id = Some(session_id.clone());
+                self.sync_active_compute_session(&session_id);
                 self.publish_agent_status();
             }
             AppEvent::SessionAttached {
@@ -5265,7 +5625,83 @@ impl App {
                         self.send_session_model(Some(session_id.clone()), model);
                     }
                 }
+                if tab_id == self.active_tab_key() || tab_id == self.tab_id.as_deref().unwrap_or("")
+                {
+                    self.sync_active_compute_session(&session_id);
+                }
                 self.publish_agent_status();
+            }
+            AppEvent::AvailableCommandsUpdated {
+                session_id,
+                commands,
+            } => {
+                let tab = self.session_tab_mut(&session_id);
+                tab.available_agent_commands = commands;
+                tab.refresh_command_popup();
+            }
+            AppEvent::SessionCapabilitiesUpdated {
+                session_id,
+                modes,
+                config_options,
+            } => {
+                let tab = self.session_tab_mut(&session_id);
+                if let Some(modes) = modes {
+                    tab.session_modes = Some(modes);
+                }
+                if let Some(config_options) = config_options {
+                    tab.session_config_options = config_options;
+                }
+            }
+            AppEvent::SessionModeUpdated {
+                session_id,
+                current_mode_id,
+            } => {
+                let tab = self.session_tab_mut(&session_id);
+                if let Some(modes) = tab.session_modes.as_mut() {
+                    modes.current_mode_id =
+                        agent_client_protocol::schema::v1::SessionModeId::new(current_mode_id);
+                } else {
+                    tab.messages.push(ChatMessage::System(format!(
+                        "Agent mode changed to {current_mode_id}."
+                    )));
+                }
+            }
+            AppEvent::SessionConfigUpdated {
+                session_id,
+                config_options,
+            } => {
+                self.session_tab_mut(&session_id).session_config_options = config_options;
+            }
+            AppEvent::SessionUsageUpdated {
+                session_id,
+                used,
+                size,
+                cost,
+            } => {
+                self.session_tab_mut(&session_id).session_usage = Some((used, size, cost));
+            }
+            AppEvent::SessionInfoUpdated {
+                session_id,
+                title,
+                updated_at,
+            } => {
+                let tab = self.session_tab_mut(&session_id);
+                if let Some(title) = title {
+                    tab.session_title = title;
+                }
+                if let Some(updated_at) = updated_at {
+                    tab.session_updated_at = updated_at;
+                }
+            }
+            AppEvent::AgentContent {
+                session_id,
+                label,
+                detail,
+            } => {
+                let tab = self.session_tab_mut(&session_id);
+                tab.messages
+                    .push(ChatMessage::System(format!("[{label}] {detail}")));
+                tab.scroll_to_bottom();
             }
             AppEvent::TabError { tab_id, message } => {
                 // Scoped error for a specific tab. Bypasses the global
@@ -5925,9 +6361,7 @@ impl App {
                 if self
                     .master_request_tx
                     .send(
-                        crate::protocol::acp::client::MasterExtRequest::SessionBornBound {
-                            event,
-                        },
+                        crate::protocol::acp::client::MasterExtRequest::SessionBornBound { event },
                     )
                     .is_err()
                 {
@@ -6013,10 +6447,7 @@ impl App {
                 if method == "agent_prompt" {
                     // Command palette `?<prompt>` delegation. Not a WT
                     // notification — has nothing to do with banner/queue.
-                    let prompt = params
-                        .get("prompt")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
                     tracing::info!(target: "autofix", prompt_len = prompt.len(), "agent_prompt: delegating");
                     if !prompt.is_empty() {
                         self.delegate_to_tab_agent(prompt);
@@ -6038,9 +6469,7 @@ impl App {
                     // — all in place, with NO agent-pane teardown/restart.
                     // (Agent *identity* changes go through a master respawn
                     // on the C++ side, not this event.)
-                    if let Some(enabled) =
-                        params.get("autofix_enabled").and_then(|v| v.as_bool())
-                    {
+                    if let Some(enabled) = params.get("autofix_enabled").and_then(|v| v.as_bool()) {
                         tracing::info!(
                             target: "autofix",
                             old = self.autofix_enabled,
@@ -6124,6 +6553,277 @@ impl App {
                     } else {
                         tracing::warn!(target: "tab_session", "tab_changed: missing tab_id in params");
                     }
+                    return;
+                }
+
+                if method == "agent_scope_changed" {
+                    let workspace_id = params
+                        .get("workspace_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let scope = params
+                        .get("scope")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("surface")
+                        .trim()
+                        .to_ascii_lowercase();
+                    if workspace_id.is_empty() {
+                        tracing::warn!(target: "surface_session", "agent_scope_changed missing workspace_id");
+                        return;
+                    }
+                    if let Some(owner) = self.owner_tab_id.as_deref() {
+                        if owner != workspace_id {
+                            return;
+                        }
+                    }
+                    let scope_key = match scope.as_str() {
+                        "surface" => self.scope_for_workspace(workspace_id),
+                        "workspace" => format!("{workspace_id}::coordinator"),
+                        "team" => format!("{workspace_id}::team"),
+                        _ => {
+                            tracing::warn!(
+                                target: "surface_session",
+                                scope,
+                                "agent_scope_changed requested unknown scope"
+                            );
+                            return;
+                        }
+                    };
+                    self.active_scope_key = Some(scope_key.clone());
+                    self.tab_sessions.entry(scope_key.clone()).or_default();
+                    tracing::info!(
+                        target: "surface_session",
+                        workspace_id,
+                        scope_key,
+                        "legacy explicit agent destination activated until the next focus change"
+                    );
+                    self.project_active_tab_state();
+                    return;
+                }
+
+                if method == "native_chat_action" {
+                    self.handle_native_chat_action(&params);
+                    return;
+                }
+
+                if matches!(
+                    method.as_str(),
+                    "surface_created"
+                        | "surface_activated"
+                        | "surface_closed"
+                        | "surface_moved"
+                        | "surface_detached"
+                ) {
+                    let target_window = params
+                        .get("window_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let our_window = self.window_id.as_deref().unwrap_or("");
+                    if !target_window.is_empty()
+                        && !our_window.is_empty()
+                        && target_window != our_window
+                    {
+                        return;
+                    }
+                    if params.get("protocol_version").and_then(|v| v.as_u64()) != Some(1) {
+                        tracing::warn!(
+                            target: "surface_session",
+                            method,
+                            "ignoring unsupported surface lifecycle protocol"
+                        );
+                        return;
+                    }
+                    let workspace_id = params
+                        .get("workspace_id")
+                        .or_else(|| params.get("tab_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let surface_id = params
+                        .get("surface_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if workspace_id.is_empty() || surface_id.is_empty() {
+                        tracing::warn!(
+                            target: "surface_session",
+                            method,
+                            "surface lifecycle event missing workspace_id or surface_id"
+                        );
+                        return;
+                    }
+                    if let Some(owner) = self.owner_tab_id.as_deref() {
+                        if owner != workspace_id {
+                            return;
+                        }
+                    }
+
+                    let scope_key = format!("{workspace_id}::surface::{surface_id}");
+                    match method.as_str() {
+                        "surface_created" => {
+                            self.tab_sessions.entry(scope_key.clone()).or_default();
+                            tracing::info!(
+                                target: "surface_session",
+                                workspace_id,
+                                surface_id,
+                                scope_key,
+                                "surface conversation slot created"
+                            );
+                        }
+                        "surface_closed" => {
+                            self.remove_compute_surface_binding(workspace_id, surface_id);
+                            self.drop_surface_session(workspace_id, surface_id);
+                        }
+                        // Activation is authoritatively applied by the
+                        // generation-checked focus_changed event. Move changes
+                        // only presentation order. Detach preserves the ACP
+                        // binding so a cross-pane/window transfer can reattach
+                        // without losing its conversation.
+                        "surface_activated" | "surface_moved" | "surface_detached" => {
+                            tracing::debug!(
+                                target: "surface_session",
+                                method,
+                                workspace_id,
+                                surface_id,
+                                "surface lifecycle acknowledged; routing unchanged"
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                    return;
+                }
+
+                if method == "focus_changed" {
+                    let target_window = params
+                        .get("window_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let our_window = self.window_id.as_deref().unwrap_or("");
+                    if !target_window.is_empty()
+                        && !our_window.is_empty()
+                        && target_window != our_window
+                    {
+                        tracing::debug!(
+                            target: "surface_session",
+                            target_window,
+                            our_window,
+                            "ignoring focus_changed for different window"
+                        );
+                        return;
+                    }
+
+                    let protocol_version = params
+                        .get("protocol_version")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    if protocol_version != 1 {
+                        tracing::warn!(
+                            target: "surface_session",
+                            protocol_version,
+                            "ignoring unsupported focus context protocol"
+                        );
+                        return;
+                    }
+
+                    let workspace_id = params
+                        .get("workspace_id")
+                        .or_else(|| params.get("tab_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let surface_id = params
+                        .get("surface_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if workspace_id.is_empty() || surface_id.is_empty() {
+                        tracing::warn!(
+                            target: "surface_session",
+                            "focus_changed missing workspace_id or surface_id"
+                        );
+                        return;
+                    }
+                    if let Some(owner) = self.owner_tab_id.as_deref() {
+                        if owner != workspace_id {
+                            tracing::debug!(
+                                target: "surface_session",
+                                owner,
+                                workspace_id,
+                                "ignoring focus_changed for non-owner workspace"
+                            );
+                            return;
+                        }
+                    }
+
+                    let generation = params
+                        .get("focus_generation")
+                        .and_then(|v| {
+                            v.as_u64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                        })
+                        .unwrap_or(0);
+                    if generation == 0 || generation <= self.last_focus_generation {
+                        tracing::debug!(
+                            target: "surface_session",
+                            generation,
+                            last = self.last_focus_generation,
+                            "ignoring stale focus_changed"
+                        );
+                        return;
+                    }
+
+                    let string_param = |name: &str| {
+                        params
+                            .get(name)
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                            .map(str::to_string)
+                    };
+                    let context = PaneContext {
+                        pane_id: self.pane_id.clone(),
+                        tab_id: Some(workspace_id.to_string()),
+                        window_id: string_param("window_id").or_else(|| self.window_id.clone()),
+                        cwd: string_param("cwd"),
+                        terminal_session_id: string_param("terminal_session_id"),
+                        workspace_id: Some(workspace_id.to_string()),
+                        surface_id: Some(surface_id.to_string()),
+                        focus_generation: Some(generation),
+                        source_pane_id: string_param("pane_id"),
+                    };
+                    let scope_key = context
+                        .scope_key()
+                        .expect("validated workspace and surface produce a scope");
+
+                    self.last_focus_generation = generation;
+                    self.focus_context = context;
+                    self.tab_id = Some(workspace_id.to_string());
+                    self.active_scope_by_workspace
+                        .insert(workspace_id.to_string(), scope_key.clone());
+                    self.active_scope_key = Some(scope_key.clone());
+                    let message_count = self
+                        .tab_sessions
+                        .entry(scope_key.clone())
+                        .or_default()
+                        .messages
+                        .len();
+                    self.sync_compute_surface_binding(
+                        workspace_id,
+                        surface_id,
+                        generation,
+                        &scope_key,
+                    );
+                    tracing::info!(
+                        target: "surface_session",
+                        workspace_id,
+                        surface_id,
+                        generation,
+                        scope_key,
+                        messages = message_count,
+                        "surface-scoped conversation activated"
+                    );
+                    self.project_active_tab_state();
+                    self.recompute_chip_override(workspace_id);
                     return;
                 }
 
@@ -6374,17 +7074,40 @@ impl App {
                     // path is robust against `tab_changed` ordering races
                     // (e.g. resume-in-new-tab where C++ creates a tab and
                     // immediately fires `set_agent_state` for it).
-                    let target_tab = params
+                    let target_workspace = params
                         .get("tab_id")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| self.active_tab_key().to_string());
+                    let target_scope = params
+                        .get("surface_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|surface| !surface.is_empty())
+                        .map(|surface| format!("{target_workspace}::surface::{surface}"))
+                        .unwrap_or_else(|| self.scope_for_workspace(&target_workspace));
+
+                    // The host includes surface_id specifically to close the
+                    // first-open ordering race where set_agent_state precedes
+                    // focus_changed. Make that scope authoritative now; the
+                    // later generation-checked focus event enriches
+                    // `focus_context` without changing the state owner.
+                    if target_scope != target_workspace {
+                        self.active_scope_by_workspace
+                            .insert(target_workspace.clone(), target_scope.clone());
+                        if self.owner_tab_id.as_deref() == Some(target_workspace.as_str())
+                            || self.tab_id.as_deref() == Some(target_workspace.as_str())
+                        {
+                            self.active_scope_key = Some(target_scope.clone());
+                        }
+                    }
 
                     // Apply `view` if present.
                     if let Some(view_str) = params.get("view").and_then(|v| v.as_str()) {
                         tracing::info!(
                             target: "set_agent_state",
-                            tab = %target_tab,
+                            tab = %target_workspace,
+                            scope = %target_scope,
                             view = view_str,
                             "applying view"
                         );
@@ -6396,10 +7119,10 @@ impl App {
                                     self.show_welcome_hint = false;
                                     set_welcome_shown_in_state();
                                 }
-                                self.open_agents_view_for_tab(target_tab.clone());
+                                self.open_agents_view_for_tab(target_scope.clone());
                             }
                             "chat" => {
-                                self.close_agents_view_for_tab(&target_tab);
+                                self.close_agents_view_for_tab(&target_scope);
                             }
                             other => {
                                 tracing::warn!(
@@ -6415,11 +7138,12 @@ impl App {
                     if let Some(open) = params.get("pane_open").and_then(|v| v.as_bool()) {
                         tracing::info!(
                             target: "set_agent_state",
-                            tab = %target_tab,
+                            tab = %target_workspace,
+                            scope = %target_scope,
                             pane_open = open,
                             "applying pane_open"
                         );
-                        self.tab_mut(&target_tab).pane_open = open;
+                        self.tab_mut(&target_scope).pane_open = open;
                         // If a result is waiting for review on this tab,
                         // re-project the bar: opening the pane makes the
                         // result visible (→ Idle, bar goes quiet), closing
@@ -6428,10 +7152,10 @@ impl App {
                         // helper, not in C++.
                         if let Some(review_pane) = self
                             .tab_sessions
-                            .get(&target_tab)
+                            .get(&target_scope)
                             .and_then(|t| t.autofix.suggested_pane_id.clone())
                         {
-                            self.emit_autofix_state_result(&target_tab, &review_pane);
+                            self.emit_autofix_state_result(&target_scope, &review_pane);
                         }
                     }
 
@@ -6439,7 +7163,7 @@ impl App {
                     // `agent_state_changed` by `tab_id`, so per-tab state
                     // updates apply to the right AgentPaneContent
                     // regardless of which tab is currently focused.
-                    self.project_tab_state(&target_tab);
+                    self.project_tab_state(&target_workspace);
                     return;
                 }
 
@@ -6474,9 +7198,7 @@ impl App {
                             // Capture the key BEFORE PaneClosed clears
                             // the pane→key binding, so the log can report
                             // which row was demoted.
-                            let key_before = self
-                                .agent_sessions
-                                .key_for_pane(&pane_id);
+                            let key_before = self.agent_sessions.key_for_pane(&pane_id);
                             let event = crate::agent_sessions::SessionEvent::PaneClosed {
                                 pane_session_id: pane_id.clone(),
                             };
@@ -6555,7 +7277,8 @@ impl App {
                     // keeps working for its original shell-pane use
                     // case without nuking agent panes.
                     let origin = self.agent_sessions.origin_for_pane(&pane_id);
-                    let is_shell_agent = matches!(origin, Some(crate::agent_sessions::SessionOrigin::Unknown));
+                    let is_shell_agent =
+                        matches!(origin, Some(crate::agent_sessions::SessionOrigin::Unknown));
                     if seq == "osc:133;A" && is_shell_agent {
                         tracing::info!(
                             target: "agent_session_registry",
@@ -6579,14 +7302,10 @@ impl App {
                 // this helper's concern. Drop notifications whose tab_id
                 // doesn't match our owner_tab_id; empty/missing tab_id falls
                 // through (no per-tab scope).
-                if let (Some(event_tab), Some(self_tab)) = (
-                    notification.tab_id.as_deref(),
-                    self.owner_tab_id.as_deref(),
-                ) {
-                    if !event_tab.is_empty()
-                        && !self_tab.is_empty()
-                        && event_tab != self_tab
-                    {
+                if let (Some(event_tab), Some(self_tab)) =
+                    (notification.tab_id.as_deref(), self.owner_tab_id.as_deref())
+                {
+                    if !event_tab.is_empty() && !self_tab.is_empty() && event_tab != self_tab {
                         // Per-cross-tab-event (very high volume in multi-tab
                         // windows) — trace-only.
                         tracing::trace!(
@@ -6610,11 +7329,7 @@ impl App {
                         WtEventSeverity::Informational => None,
                     };
                     if let Some(severity_str) = severity_str {
-                        crate::telemetry::log_error_detected(
-                            severity_str,
-                            &method,
-                            &pane_id,
-                        );
+                        crate::telemetry::log_error_detected(severity_str, &method, &pane_id);
                     }
                 }
 
@@ -6676,9 +7391,8 @@ impl App {
                                         .trigger_echo_pane
                                         .clone();
                                     if echo.as_deref() == Some(pane_id.as_str()) {
-                                        self.tab_mut(&t.to_string())
-                                            .autofix
-                                            .trigger_echo_pane = None;
+                                        self.tab_mut(&t.to_string()).autofix.trigger_echo_pane =
+                                            None;
                                         false
                                     } else {
                                         true
@@ -6704,11 +7418,8 @@ impl App {
                                 // command exited cleanly — the user's problem resolved.
                                 // Elapsed is monotonic (`Instant::elapsed`) from arm to
                                 // clean exit, not wall-clock.
-                                if let Some(armed) = self
-                                    .tab_mut(&target_tab)
-                                    .autofix
-                                    .armed_at
-                                    .take()
+                                if let Some(armed) =
+                                    self.tab_mut(&target_tab).autofix.armed_at.take()
                                 {
                                     let elapsed_ms = armed.elapsed().as_secs_f64() * 1000.0;
                                     crate::telemetry::log_error_fix_resolved(
@@ -6885,8 +7596,16 @@ impl App {
                     }
                 }
             }
-            AppEvent::LoginComplete { success, error, agent_id } => {
-                tracing::info!("LoginComplete received: success={} deferred_acp={}", success, self.deferred_acp.is_some());
+            AppEvent::LoginComplete {
+                success,
+                error,
+                agent_id,
+            } => {
+                tracing::info!(
+                    "LoginComplete received: success={} deferred_acp={}",
+                    success,
+                    self.deferred_acp.is_some()
+                );
                 // Ignore stale/late completions: only act on a completion that
                 // matches the currently active auth attempt. After the user
                 // escapes the auth screen (auth = None) or switches agents, a
@@ -6917,7 +7636,10 @@ impl App {
                     // try_start_acp can spawn a new ACP client.
                     if self.deferred_acp.is_none() {
                         let new_cmd = self.build_agent_cmd(&agent_id);
-                        tracing::info!("LoginComplete: creating deferred_acp for reconnect cmd={}", new_cmd);
+                        tracing::info!(
+                            "LoginComplete: creating deferred_acp for reconnect cmd={}",
+                            new_cmd
+                        );
                         self.deferred_acp = Some(DeferredAcpParams {
                             agent_cmd: new_cmd,
                             acp_model: None,
@@ -7272,14 +7994,14 @@ impl App {
                             .modifiers
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                     {
-                        self.current_tab_mut().agents_view.search_query.push(*character);
+                        self.current_tab_mut()
+                            .agents_view
+                            .search_query
+                            .push(*character);
                         self.reset_agents_search_selection(&tab_id);
                         return;
                     }
-                    KeyCode::Up
-                    | KeyCode::Down
-                    | KeyCode::Enter
-                    | KeyCode::F(5) => {}
+                    KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::F(5) => {}
                     _ => return,
                 }
             }
@@ -7459,8 +8181,7 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Up if self.current_tab().turn.recommendations().is_some() =>
-            {
+            KeyCode::Up if self.current_tab().turn.recommendations().is_some() => {
                 if self.current_tab_mut().selected_recommendation > 0 {
                     self.current_tab_mut().selected_recommendation -= 1;
                     self.current_tab_mut().selected_button = self.default_button_for_selected();
@@ -7471,8 +8192,7 @@ impl App {
                     self.recompute_chip_override(&tab_id);
                 }
             }
-            KeyCode::Down if self.current_tab().turn.recommendations().is_some() =>
-            {
+            KeyCode::Down if self.current_tab().turn.recommendations().is_some() => {
                 let choices_len = self
                     .current_tab()
                     .turn
@@ -7781,14 +8501,15 @@ impl App {
                     let session_id = tab
                         .session_id
                         .clone()
-                        .unwrap_or_else(|| DEFAULT_TAB_ID.to_string());
-                    let pane_context = PaneContext {
-                        pane_id: self.pane_id.clone(),
-                        tab_id: self.tab_id.clone(),
-                        window_id: self.window_id.clone(),
-                        cwd: self.source_cwd.clone(),
-                        source_pane_id: None,
-                    };
+                        .unwrap_or_else(|| self.active_tab_key().to_string());
+                    let mut pane_context = self.focus_context.clone();
+                    pane_context.pane_id = self.pane_id.clone();
+                    pane_context.tab_id = self.tab_id.clone();
+                    pane_context.workspace_id = self.tab_id.clone();
+                    pane_context.window_id = self.window_id.clone();
+                    if pane_context.cwd.is_none() {
+                        pane_context.cwd = self.source_cwd.clone();
+                    }
                     // The echoed user message shows a marker for each queued
                     // image; the ACP text block stays raw (the image rides as a
                     // separate ContentBlock::Image).
@@ -8011,11 +8732,17 @@ impl App {
         // candidates are filtered from the small cached available-agent list.
         let agent_candidates: Vec<_> = self.agent_command_candidates().collect();
         let candidates = if self.transport_lost {
-            let filtered: Vec<&'static crate::commands::CommandSpec> = tab
+            let filtered: Vec<crate::commands::CommandCandidate> = tab
                 .command_popup_candidates
                 .iter()
-                .copied()
-                .filter(|s| s.kind == crate::commands::CommandKind::Restart)
+                .filter(|candidate| {
+                    matches!(
+                        candidate,
+                        crate::commands::CommandCandidate::Local(spec)
+                            if spec.kind == crate::commands::CommandKind::Restart
+                    )
+                })
+                .cloned()
                 .collect();
             if filtered.is_empty() {
                 return None;
@@ -8064,6 +8791,42 @@ impl App {
         Some(name)
     }
 
+    /// Compact capability snapshot for the active surface. This intentionally
+    /// reads only the active `TabSession`; focusing another native surface
+    /// therefore swaps model/mode/context together with the conversation.
+    pub(crate) fn active_session_summary(&self) -> Option<String> {
+        let tab = self.current_tab();
+        let mut parts = Vec::new();
+        if !self.agent_name.trim().is_empty() {
+            parts.push(self.agent_name.clone());
+        }
+        if let Some(model) = self.current_model_display() {
+            parts.push(model);
+        }
+        if let Some(modes) = &tab.session_modes {
+            let current = modes.current_mode_id.to_string();
+            let label = modes
+                .available_modes
+                .iter()
+                .find(|mode| mode.id.to_string() == current)
+                .map(|mode| mode.name.clone())
+                .unwrap_or(current);
+            parts.push(label);
+        }
+        if let Some((used, size, cost)) = &tab.session_usage {
+            if *size > 0 {
+                parts.push(format!(
+                    "context: {:.0}%",
+                    (*used as f64 / *size as f64) * 100.0
+                ));
+            }
+            if let Some((amount, currency)) = cost {
+                parts.push(format!("{currency} {amount:.4}"));
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
     /// Whether the command popup is *effectively* visible — i.e. actually
     /// rendered. This is the same condition `command_popup_state()` uses to
     /// decide whether to draw, so key handlers gate on the real on-screen
@@ -8085,7 +8848,13 @@ impl App {
                 .current_tab()
                 .command_popup_candidates
                 .iter()
-                .any(|s| s.kind == crate::commands::CommandKind::Restart);
+                .any(|candidate| {
+                    matches!(
+                        candidate,
+                        crate::commands::CommandCandidate::Local(spec)
+                            if spec.kind == crate::commands::CommandKind::Restart
+                    )
+                });
         }
         true
     }
@@ -8096,16 +8865,14 @@ impl App {
         } else {
             commands::agent_id_prefix(&self.current_tab().input)
         };
-        self.available_agents
-            .iter()
-            .filter(move |agent| {
-                prefix.is_some_and(|prefix| {
-                    agent
-                        .id
-                        .get(..prefix.len())
-                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
-                })
+        self.available_agents.iter().filter(move |agent| {
+            prefix.is_some_and(|prefix| {
+                agent
+                    .id
+                    .get(..prefix.len())
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
             })
+        })
     }
 
     fn selected_agent_command_candidate(&self) -> Option<&AvailableAgent> {
@@ -8152,6 +8919,13 @@ impl App {
         }
     }
 
+    fn selected_dynamic_command(&self) -> Option<&AgentCommandSpec> {
+        match self.current_tab().selected_command_candidate()? {
+            CommandCandidate::Agent(spec) => Some(spec),
+            CommandCandidate::Local(_) => None,
+        }
+    }
+
     pub(crate) fn command_ghost_suffix(&self) -> Option<&str> {
         let tab = self.current_tab();
         if tab.cursor_pos != tab.input.len() {
@@ -8159,7 +8933,10 @@ impl App {
         }
         let prefix = commands::agent_id_prefix(&tab.input)?;
         let candidate = self.selected_agent_command_candidate()?;
-        candidate.id.get(prefix.len()..).filter(|suffix| !suffix.is_empty())
+        candidate
+            .id
+            .get(prefix.len()..)
+            .filter(|suffix| !suffix.is_empty())
     }
 
     /// Per-frame state for the `/model` picker modal, or `None` when it's not
@@ -8218,6 +8995,20 @@ impl App {
         //    `/he` → /help) and never submits the raw text as a prompt, so
         //    this arm is always consumed even if there is no selection.
         if self.command_popup_visible() {
+            // Agent-advertised commands are not interpreted by the terminal.
+            // Commit the selected name into the editor and fall through to
+            // the normal ACP prompt path, exactly as the protocol specifies.
+            if !self.transport_lost {
+                if let Some(command) = self.selected_dynamic_command().cloned() {
+                    let tab = self.current_tab_mut();
+                    tab.input = format!("/{}", command.name);
+                    tab.cursor_pos = tab.input.len();
+                    tab.command_popup_candidates.clear();
+                    tab.command_popup_selected = 0;
+                    return false;
+                }
+            }
+
             // When the transport to master is lost, only /restart is runnable
             // (everything else would hit the dead pipe). Pick the /restart
             // spec if it's in the filtered candidate list; otherwise there's
@@ -8248,10 +9039,17 @@ impl App {
                 self.current_tab()
                     .command_popup_candidates
                     .iter()
-                    .copied()
-                    .find(|s| s.kind == CommandKind::Restart)
+                    .find_map(|candidate| match candidate {
+                        CommandCandidate::Local(spec) if spec.kind == CommandKind::Restart => {
+                            Some(*spec)
+                        }
+                        _ => None,
+                    })
             } else {
-                self.current_tab().selected_command_spec()
+                match self.current_tab().selected_command_candidate() {
+                    Some(CommandCandidate::Local(spec)) => Some(*spec),
+                    _ => None,
+                }
             };
             match spec {
                 Some(spec) => {
@@ -8277,6 +9075,24 @@ impl App {
         if self.current_tab().input.is_empty() {
             return false;
         }
+        // An exact or argument-bearing agent command may have no popup. Agent
+        // commands win over legacy local aliases; `/terminal:*` always forces
+        // the local namespace.
+        let committed = self.current_tab().input.trim_start();
+        let token = committed
+            .strip_prefix('/')
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or_default();
+        let is_agent_command = !commands::is_explicit_local(committed)
+            && self
+                .current_tab()
+                .available_agent_commands
+                .iter()
+                .any(|command| command.name.eq_ignore_ascii_case(token));
+        if is_agent_command {
+            return false;
+        }
+
         match commands::classify(&self.current_tab().input) {
             ParseOutcome::Command(cmd) => {
                 // Degraded: a typed command other than /restart can't run
@@ -8309,7 +9125,9 @@ impl App {
     /// down (reuses the existing `connection.lost` string).
     fn push_degraded_command_hint(&mut self) {
         let msg = t!("connection.lost").into_owned();
-        self.current_tab_mut().messages.push(ChatMessage::System(msg));
+        self.current_tab_mut()
+            .messages
+            .push(ChatMessage::System(msg));
     }
 
     /// Dispatch a parsed slash-command. The Enter handler is responsible
@@ -8347,6 +9165,8 @@ impl App {
             CommandKind::Agent => self.cmd_agent(cmd.rest),
             CommandKind::Model => self.cmd_model(cmd.rest),
             CommandKind::Move => self.cmd_move(cmd.rest),
+            CommandKind::Mode => self.cmd_mode(cmd.rest),
+            CommandKind::Config => self.cmd_config(cmd.rest),
         }
     }
 
@@ -8394,9 +9214,8 @@ impl App {
     fn cmd_new(&mut self, in_flight: bool) {
         if in_flight {
             let tab = self.current_tab_mut();
-            tab.messages.push(ChatMessage::System(
-                t!("system.busy_use_stop").into_owned(),
-            ));
+            tab.messages
+                .push(ChatMessage::System(t!("system.busy_use_stop").into_owned()));
             tab.scroll_to_bottom();
             return;
         }
@@ -8404,12 +9223,10 @@ impl App {
             .tab_id
             .clone()
             .unwrap_or_else(|| DEFAULT_TAB_ID.to_string());
-        let _ = self
-            .new_session_tx
-            .send(NewSessionForTab {
-                tab_id,
-                cwd: self.source_cwd.clone(),
-            });
+        let _ = self.new_session_tx.send(NewSessionForTab {
+            tab_id,
+            cwd: self.source_cwd.clone(),
+        });
         let tab = self.current_tab_mut();
         tab.clear_chat_history();
         tab.completed_turns.clear();
@@ -8460,14 +9277,13 @@ impl App {
             tab.autofix.generation
         };
 
-        let pane_context = PaneContext {
-            pane_id: self.pane_id.clone(),
-            tab_id: Some(target_tab_id.clone()),
-            window_id: self.window_id.clone(),
-            cwd: None,
-            // None → the client task resolves the active working pane itself.
-            source_pane_id: None,
-        };
+        let mut pane_context = self.focus_context.clone();
+        pane_context.pane_id = self.pane_id.clone();
+        pane_context.tab_id = Some(target_tab_id.clone());
+        pane_context.workspace_id = Some(target_tab_id.clone());
+        pane_context.window_id = self.window_id.clone();
+        // None → the client task resolves the active working pane itself.
+        pane_context.source_pane_id = None;
 
         let hint = hint.trim().to_string();
         let prompt = PromptSubmission::new_autofix(hint.clone(), Some(pane_context));
@@ -8563,6 +9379,181 @@ impl App {
 
         self.current_tab_mut().agent_pane_position = Some(position.pane_position);
         self.project_active_tab_state();
+    }
+
+    /// `/terminal:mode [id-or-name]` — list the active agent's modes or
+    /// change the mode on this surface's ACP session.
+    fn cmd_mode(&mut self, requested: String) {
+        let requested = requested.trim();
+        let (session_id, modes) = {
+            let tab = self.current_tab();
+            (tab.session_id.clone(), tab.session_modes.clone())
+        };
+        let Some(modes) = modes else {
+            self.current_tab_mut().messages.push(ChatMessage::System(
+                "This agent did not advertise session modes.".to_string(),
+            ));
+            return;
+        };
+        if requested.is_empty() {
+            let rows = modes
+                .available_modes
+                .iter()
+                .map(|mode| {
+                    let marker = if mode.id == modes.current_mode_id {
+                        "●"
+                    } else {
+                        "○"
+                    };
+                    format!("{marker} {} ({})", mode.name, mode.id)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.current_tab_mut()
+                .messages
+                .push(ChatMessage::System(format!(
+                    "Agent modes for this surface:\n{rows}\nUse /terminal:mode <id>."
+                )));
+            return;
+        }
+        let matched = modes.available_modes.iter().find(|mode| {
+            mode.id.to_string().eq_ignore_ascii_case(requested)
+                || mode.name.eq_ignore_ascii_case(requested)
+        });
+        let Some(mode) = matched else {
+            self.current_tab_mut()
+                .messages
+                .push(ChatMessage::System(format!(
+                    "Unknown agent mode: {requested}"
+                )));
+            return;
+        };
+        let Some(session_id) = session_id else {
+            self.current_tab_mut().messages.push(ChatMessage::System(
+                "The active surface does not have an ACP session yet.".to_string(),
+            ));
+            return;
+        };
+        self.send_session_mode(session_id, mode.id.to_string());
+    }
+
+    /// `/terminal:config [id=value]` — display all typed ACP configuration
+    /// options for this surface or set a validated select/boolean value.
+    fn cmd_config(&mut self, requested: String) {
+        use agent_client_protocol::schema::v1::{
+            SessionConfigKind, SessionConfigOptionValue, SessionConfigSelectOptions,
+        };
+
+        let (session_id, options) = {
+            let tab = self.current_tab();
+            (tab.session_id.clone(), tab.session_config_options.clone())
+        };
+        if options.is_empty() {
+            self.current_tab_mut().messages.push(ChatMessage::System(
+                "This agent did not advertise session configuration options.".to_string(),
+            ));
+            return;
+        }
+        let requested = requested.trim();
+        if requested.is_empty() {
+            let rows = options
+                .iter()
+                .map(|option| {
+                    let current = match &option.kind {
+                        SessionConfigKind::Select(select) => select.current_value.to_string(),
+                        SessionConfigKind::Boolean(boolean) => boolean.current_value.to_string(),
+                        _ => "unsupported".to_string(),
+                    };
+                    format!("• {} ({}) = {current}", option.name, option.id)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.current_tab_mut()
+                .messages
+                .push(ChatMessage::System(format!(
+                "Agent configuration for this surface:\n{rows}\nUse /terminal:config <id>=<value>."
+            )));
+            return;
+        }
+        let Some((config_id, raw_value)) = requested
+            .split_once('=')
+            .or_else(|| requested.split_once(char::is_whitespace))
+        else {
+            self.current_tab_mut().messages.push(ChatMessage::System(
+                "Expected /terminal:config <id>=<value>.".to_string(),
+            ));
+            return;
+        };
+        let config_id = config_id.trim();
+        let raw_value = raw_value.trim();
+        let Some(option) = options.iter().find(|option| {
+            option.id.to_string().eq_ignore_ascii_case(config_id)
+                || option.name.eq_ignore_ascii_case(config_id)
+        }) else {
+            self.current_tab_mut()
+                .messages
+                .push(ChatMessage::System(format!(
+                    "Unknown agent configuration option: {config_id}"
+                )));
+            return;
+        };
+
+        let value = match &option.kind {
+            SessionConfigKind::Boolean(_) => match raw_value.to_ascii_lowercase().as_str() {
+                "true" | "on" | "1" | "yes" => SessionConfigOptionValue::boolean(true),
+                "false" | "off" | "0" | "no" => SessionConfigOptionValue::boolean(false),
+                _ => {
+                    self.current_tab_mut()
+                        .messages
+                        .push(ChatMessage::System(format!(
+                            "{} expects true/false.",
+                            option.name
+                        )));
+                    return;
+                }
+            },
+            SessionConfigKind::Select(select) => {
+                let valid = match &select.options {
+                    SessionConfigSelectOptions::Ungrouped(values) => values.iter().any(|value| {
+                        value.value.to_string().eq_ignore_ascii_case(raw_value)
+                            || value.name.eq_ignore_ascii_case(raw_value)
+                    }),
+                    SessionConfigSelectOptions::Grouped(groups) => groups.iter().any(|group| {
+                        group.options.iter().any(|value| {
+                            value.value.to_string().eq_ignore_ascii_case(raw_value)
+                                || value.name.eq_ignore_ascii_case(raw_value)
+                        })
+                    }),
+                    _ => false,
+                };
+                if !valid {
+                    self.current_tab_mut()
+                        .messages
+                        .push(ChatMessage::System(format!(
+                            "Invalid value for {}: {raw_value}",
+                            option.name
+                        )));
+                    return;
+                }
+                SessionConfigOptionValue::value_id(raw_value.to_string())
+            }
+            _ => {
+                self.current_tab_mut()
+                    .messages
+                    .push(ChatMessage::System(format!(
+                        "{} uses a configuration type this client cannot edit yet.",
+                        option.name
+                    )));
+                return;
+            }
+        };
+        let Some(session_id) = session_id else {
+            self.current_tab_mut().messages.push(ChatMessage::System(
+                "The active surface does not have an ACP session yet.".to_string(),
+            ));
+            return;
+        };
+        self.send_session_config(session_id, option.id.to_string(), value);
     }
 
     /// `/restart` — reset the agent CLI subprocess. Behavior depends on which
@@ -8736,16 +9727,19 @@ impl App {
         }
 
         let old_tab = self.tab_id.clone();
-        let entry = self.tab_sessions.entry(new_tab_id.clone()).or_default();
+        let scope_key = self.scope_for_workspace(&new_tab_id);
+        let entry = self.tab_sessions.entry(scope_key.clone()).or_default();
         tracing::info!(
             target: "tab_session",
             from = ?old_tab,
             to = %new_tab_id,
+            scope = %scope_key,
             target_completed_turns = entry.completed_turns.len(),
             target_messages = entry.messages.len(),
             "switch_tab_session"
         );
-        self.tab_id = Some(new_tab_id);
+        self.tab_id = Some(new_tab_id.clone());
+        self.active_scope_key = Some(scope_key);
 
         // The new active tab's `current_view` (and autofix bar) is now
         // authoritative for the shared C++ agent pane. Re-emit so the bar
@@ -8779,8 +9773,20 @@ impl App {
             );
             return;
         }
-        let removed = self.tab_sessions.remove(closed_tab_id);
-        self.session_to_tab.retain(|_, tab| tab != closed_tab_id);
+        let scope_prefix = format!("{closed_tab_id}::");
+        let removed_keys: Vec<String> = self
+            .tab_sessions
+            .keys()
+            .filter(|key| key.as_str() == closed_tab_id || key.starts_with(&scope_prefix))
+            .cloned()
+            .collect();
+        let had_session = !removed_keys.is_empty();
+        for key in &removed_keys {
+            self.tab_sessions.remove(key);
+        }
+        self.session_to_tab
+            .retain(|_, scope| scope != closed_tab_id && !scope.starts_with(&scope_prefix));
+        self.active_scope_by_workspace.remove(closed_tab_id);
 
         // Tell the ACP client to release the binding for this tab so
         // the agent process can `session/cancel` the orphaned session.
@@ -8788,9 +9794,17 @@ impl App {
         // behind on the CLI side — `tab_sessions` and `session_to_tab`
         // are cleaned above but the ACP layer's own `tab_to_session`
         // map and the agent's session state are not.
-        let _ = self.drop_session_tx.send(DropSessionRequest {
-            tab_id: closed_tab_id.to_string(),
-        });
+        if removed_keys.is_empty() {
+            let _ = self.drop_session_tx.send(DropSessionRequest {
+                tab_id: closed_tab_id.to_string(),
+            });
+        } else {
+            for key in removed_keys {
+                let _ = self
+                    .drop_session_tx
+                    .send(DropSessionRequest { tab_id: key });
+            }
+        }
 
         if self.tab_id.as_deref() == Some(closed_tab_id) {
             // Active tab is gone; the next focused tab's tab_changed will
@@ -8800,6 +9814,7 @@ impl App {
             // fallback session is empty by design; renders during the gap
             // just show nothing.
             self.tab_id = None;
+            self.active_scope_key = None;
             self.tab_sessions
                 .entry(DEFAULT_TAB_ID.to_string())
                 .or_default();
@@ -8807,9 +9822,51 @@ impl App {
         tracing::info!(
             target: "tab_session",
             tab_id = closed_tab_id,
-            had_session = removed.is_some(),
+            had_session,
             remaining_tabs = self.tab_sessions.len(),
             "drop_tab_session"
+        );
+    }
+
+    /// Release exactly one surface-scoped conversation after the native
+    /// surface is permanently closed. Detach is intentionally handled
+    /// elsewhere as a non-destructive move operation.
+    fn drop_surface_session(&mut self, workspace_id: &str, surface_id: &str) {
+        let scope_key = format!("{workspace_id}::surface::{surface_id}");
+        let removed = self.tab_sessions.remove(&scope_key).is_some();
+        self.session_to_tab.retain(|_, scope| scope != &scope_key);
+
+        if removed {
+            let _ = self.drop_session_tx.send(DropSessionRequest {
+                tab_id: scope_key.clone(),
+            });
+        }
+
+        if self
+            .active_scope_by_workspace
+            .get(workspace_id)
+            .is_some_and(|scope| scope == &scope_key)
+        {
+            self.active_scope_by_workspace.remove(workspace_id);
+        }
+
+        if self.active_scope_key.as_deref() == Some(scope_key.as_str()) {
+            // Never route a later prompt to a terminal that no longer
+            // exists. The legacy workspace key is a safe inert fallback until
+            // the host's focus_changed for the replacement surface arrives;
+            // coordinator/team are never selected implicitly.
+            let fallback = workspace_id.to_string();
+            self.tab_sessions.entry(fallback.clone()).or_default();
+            self.active_scope_key = Some(fallback);
+            self.project_active_tab_state();
+        }
+
+        tracing::info!(
+            target: "surface_session",
+            workspace_id,
+            surface_id,
+            removed,
+            "surface-scoped conversation released"
         );
     }
 
@@ -8846,25 +9903,52 @@ impl App {
             );
             return;
         }
-        let had_session = if let Some(mut entry) = self.tab_sessions.remove(old_tab_id) {
-            // Preserve target slot's TabSession if one was lazily
-            // created under the new id before this event arrived — but
-            // in normal flow that shouldn't happen (WT mints the new
-            // id atomically with the drag). Defensive only: prefer the
-            // entry that already has conversation state.
-            if let Some(existing) = self.tab_sessions.remove(new_tab_id) {
-                if !existing.messages.is_empty() && entry.messages.is_empty() {
-                    entry = existing;
+        let old_prefix = format!("{old_tab_id}::");
+        let scoped_keys: Vec<String> = self
+            .tab_sessions
+            .keys()
+            .filter(|key| key.as_str() == old_tab_id || key.starts_with(&old_prefix))
+            .cloned()
+            .collect();
+        let had_session = !scoped_keys.is_empty();
+        let mut renamed_scopes = Vec::new();
+        for old_key in scoped_keys {
+            let suffix = old_key.strip_prefix(old_tab_id).unwrap_or("");
+            let new_key = format!("{new_tab_id}{suffix}");
+            if let Some(mut entry) = self.tab_sessions.remove(&old_key) {
+                if let Some(existing) = self.tab_sessions.remove(&new_key) {
+                    if !existing.messages.is_empty() && entry.messages.is_empty() {
+                        entry = existing;
+                    }
                 }
+                self.tab_sessions.insert(new_key.clone(), entry);
+                renamed_scopes.push((old_key, new_key));
             }
-            self.tab_sessions.insert(new_tab_id.to_string(), entry);
-            true
-        } else {
-            false
-        };
+        }
 
         if self.tab_id.as_deref() == Some(old_tab_id) {
             self.tab_id = Some(new_tab_id.to_string());
+        }
+        if let Some(active) = self.active_scope_key.as_mut() {
+            if active == old_tab_id || active.starts_with(&old_prefix) {
+                *active = format!(
+                    "{new_tab_id}{}",
+                    active.strip_prefix(old_tab_id).unwrap_or("")
+                );
+            }
+        }
+        if let Some(scope) = self.active_scope_by_workspace.remove(old_tab_id) {
+            self.active_scope_by_workspace.insert(
+                new_tab_id.to_string(),
+                format!(
+                    "{new_tab_id}{}",
+                    scope.strip_prefix(old_tab_id).unwrap_or("")
+                ),
+            );
+        }
+        if self.focus_context.workspace_id.as_deref() == Some(old_tab_id) {
+            self.focus_context.workspace_id = Some(new_tab_id.to_string());
+            self.focus_context.tab_id = Some(new_tab_id.to_string());
         }
         // owner_tab_id is the helper's anchor for outbound per-pane events
         // (agent_status / autofix_state). Follow the rename so subsequent
@@ -8899,8 +9983,8 @@ impl App {
         // borrow while we mutate.
         let mut rebound_sessions = 0usize;
         for tab in self.session_to_tab.values_mut() {
-            if tab == old_tab_id {
-                *tab = new_tab_id.to_string();
+            if tab == old_tab_id || tab.starts_with(&old_prefix) {
+                *tab = format!("{new_tab_id}{}", tab.strip_prefix(old_tab_id).unwrap_or(""));
                 rebound_sessions += 1;
             }
         }
@@ -8953,17 +10037,22 @@ impl App {
         // from `&mut App` directly — mirror the DropSessionRequest plumb.
         // Send-failure means the ACP task is gone; logged for traces but
         // not actionable.
-        if let Err(e) = self.rename_session_tx.send(RenameSessionRequest {
-            old_tab_id: old_tab_id.to_string(),
-            new_tab_id: new_tab_id.to_string(),
-        }) {
-            tracing::warn!(
-                target: "helper",
-                old_tab_id,
-                new_tab_id,
-                error = ?e,
-                "rename_session_tx send failed (ACP client task closed?)"
-            );
+        if renamed_scopes.is_empty() {
+            renamed_scopes.push((old_tab_id.to_string(), new_tab_id.to_string()));
+        }
+        for (old_scope, new_scope) in renamed_scopes {
+            if let Err(e) = self.rename_session_tx.send(RenameSessionRequest {
+                old_tab_id: old_scope.clone(),
+                new_tab_id: new_scope.clone(),
+            }) {
+                tracing::warn!(
+                    target: "helper",
+                    old_tab_id = old_scope,
+                    new_tab_id = new_scope,
+                    error = ?e,
+                    "rename_session_tx send failed (ACP client task closed?)"
+                );
+            }
         }
     }
 
@@ -8982,10 +10071,15 @@ impl App {
     /// next tab_changed back into this tab finds an empty-but-present
     /// `TabSession` and just renders an empty chat.
     fn reset_tab_session_for(&mut self, tab_id: &str) {
+        let scope_key = if self.tab_id.as_deref() == Some(tab_id) {
+            self.active_tab_key().to_string()
+        } else {
+            self.scope_for_workspace(tab_id)
+        };
         // Same wipe as the `/clear` slash command: clear in-flight chat state
         // via `clear_chat_history` AND the completed-turn history that
         // `clear_chat_history` deliberately leaves alone.
-        if let Some(tab) = self.tab_sessions.get_mut(tab_id) {
+        if let Some(tab) = self.tab_sessions.get_mut(&scope_key) {
             tab.clear_chat_history();
             tab.completed_turns.clear();
             tab.selected_completed_turn_idx = None;
@@ -8995,16 +10089,17 @@ impl App {
 
         // Prune the reverse SessionId → tab routing so late ACP chunks for
         // the dropped session can't land on this tab's slot.
-        self.session_to_tab.retain(|_, t| t != tab_id);
+        self.session_to_tab.retain(|_, t| t != &scope_key);
 
         // Ask the ACP client task to release the binding for this tab.
         let _ = self.drop_session_tx.send(DropSessionRequest {
-            tab_id: tab_id.to_string(),
+            tab_id: scope_key.clone(),
         });
 
         tracing::info!(
             target: "tab_session",
             tab_id = tab_id,
+            scope = scope_key,
             "reset_tab_session_for done"
         );
     }
@@ -9051,7 +10146,6 @@ impl App {
         let _ = cmd.spawn();
     }
 
-
     /// Ask WT to tear down this agent pane. Wired to the second tap of the
     /// double-Ctrl+C close sequence. WT closes the Pane, which causes its
     /// ConPty to SIGKILL us — so the natural side effect of pane teardown
@@ -9082,7 +10176,6 @@ impl App {
         tracing::info!(target: "close_pane", "double-Ctrl+C → asking WT to close agent pane");
         send_wt_protocol_event(evt.to_string());
     }
-
 
     /// Recompute the chip-target override for the tab and, if it changed
     /// since the last emit, publish a `set_agent_chip_target` event so the
@@ -10139,7 +11232,310 @@ fn format_recommendations_for_chat(set: &RecommendationSet) -> String {
     out
 }
 
+fn native_chat_text(value: &str) -> String {
+    const MAX_CHARS: usize = 65_536;
+    let mut chars = value.chars();
+    let mut result: String = (&mut chars).take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        result.push_str("\n…");
+    }
+    result
+}
+
+fn native_chat_message(message: &ChatMessage) -> serde_json::Value {
+    match message {
+        ChatMessage::User(text) => serde_json::json!({
+            "kind": "user",
+            "text": native_chat_text(text),
+        }),
+        ChatMessage::Agent(text) => serde_json::json!({
+            "kind": "agent",
+            "text": native_chat_text(text),
+        }),
+        ChatMessage::System(text) => serde_json::json!({
+            "kind": "system",
+            "text": native_chat_text(text),
+        }),
+        ChatMessage::ToolCall { id, title, status } => serde_json::json!({
+            "kind": "tool",
+            "id": id,
+            "title": title,
+            "status": status,
+        }),
+        ChatMessage::Plan(entries) => serde_json::json!({
+            "kind": "plan",
+            "entries": entries.iter().map(|entry| serde_json::json!({
+                "content": native_chat_text(&entry.content),
+                "status": match entry.status {
+                    PlanEntryStatus::Pending => "pending",
+                    PlanEntryStatus::InProgress => "in_progress",
+                    PlanEntryStatus::Completed => "completed",
+                },
+            })).collect::<Vec<_>>(),
+        }),
+        ChatMessage::Error(text) => serde_json::json!({
+            "kind": "error",
+            "text": native_chat_text(text),
+        }),
+        ChatMessage::AgentEvent(text) => serde_json::json!({
+            "kind": "event",
+            "text": native_chat_text(text),
+        }),
+        ChatMessage::Disclaimer => serde_json::json!({
+            "kind": "disclaimer",
+            "text": t!("chat.welcome_disclaimer").into_owned(),
+        }),
+    }
+}
+
 impl App {
+    fn handle_native_chat_action(&mut self, params: &serde_json::Value) {
+        let target_workspace = params
+            .get("workspace_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim();
+        let owned_workspace = self
+            .owner_tab_id
+            .as_deref()
+            .or(self.focus_context.workspace_id.as_deref())
+            .unwrap_or("");
+        if target_workspace.is_empty() || target_workspace != owned_workspace {
+            tracing::warn!(
+                target: "native_chat",
+                target_workspace,
+                owned_workspace,
+                "dropping native chat action for another workspace"
+            );
+            return;
+        }
+
+        let scope_key = params
+            .get("scope_key")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if scope_key.is_empty() || scope_key != self.active_tab_key() {
+            tracing::warn!(
+                target: "native_chat",
+                scope_key,
+                active = self.active_tab_key(),
+                "dropping missing or stale native chat action scope"
+            );
+            return;
+        }
+
+        match params
+            .get("action")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+        {
+            "submit" => {
+                let text = params
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if text.is_empty()
+                    || text.len() > 65_536
+                    || self.mode != AppMode::Chat
+                    || self.current_tab().current_view != View::Chat
+                    || !self.current_tab().permission.is_empty()
+                    || !self.current_tab().turn.accepts_new_prompt()
+                {
+                    return;
+                }
+                let tab = self.current_tab_mut();
+                tab.input = text.to_string();
+                tab.cursor_pos = tab.input.len();
+                tab.refresh_command_popup();
+                self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            "permission" => {
+                let option_id = params
+                    .get("option_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                if option_id.is_empty() {
+                    return;
+                }
+                let resolved = {
+                    let tab = self.current_tab_mut();
+                    let matches = tab
+                        .permission
+                        .front()
+                        .map(|permission| {
+                            permission
+                                .options
+                                .iter()
+                                .any(|option| option.id == option_id)
+                        })
+                        .unwrap_or(false);
+                    if matches {
+                        tab.permission.pop_front()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(permission) = resolved {
+                    if let Some(responder) = permission.responder {
+                        let _ = responder.send(option_id.to_string());
+                    } else {
+                        let _ = self.permission_tx.send(option_id.to_string());
+                    }
+                }
+            }
+            "cancel" => {
+                if self.current_tab().turn.is_in_flight() {
+                    self.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+                }
+            }
+            "retry" => {
+                let tab = self.current_tab_mut();
+                tab.input = "/restart".to_string();
+                tab.cursor_pos = tab.input.len();
+                tab.refresh_command_popup();
+                self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            _ => {}
+        }
+    }
+
+    fn publish_native_chat_snapshot_if_changed(&mut self) {
+        let active_key = self.active_tab_key().to_string();
+        let Some(tab) = self.tab_sessions.get(&active_key) else {
+            return;
+        };
+        let workspace_id = self
+            .owner_tab_id
+            .as_deref()
+            .or(self.focus_context.workspace_id.as_deref())
+            .unwrap_or("");
+        if workspace_id.is_empty() {
+            return;
+        }
+
+        let mut messages = Vec::new();
+        for turn in tab.completed_turns.iter().rev().take(20).rev() {
+            messages.push(serde_json::json!({
+                "kind": "turn",
+                "text": native_chat_text(&turn.prompt),
+                "expanded": turn.expanded,
+                "trailing_marker": turn.trailing_marker,
+            }));
+            if turn.expanded {
+                messages.extend(turn.details.iter().map(native_chat_message));
+            }
+        }
+        messages.extend(
+            tab.messages
+                .iter()
+                .rev()
+                .take(80)
+                .rev()
+                .map(native_chat_message),
+        );
+
+        let mut active_tools = tab
+            .tool_calls
+            .iter()
+            .map(|(id, (title, status))| {
+                serde_json::json!({
+                    "id": id,
+                    "title": title,
+                    "status": status,
+                })
+            })
+            .collect::<Vec<_>>();
+        active_tools.sort_by(|left, right| {
+            left["id"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(right["id"].as_str().unwrap_or(""))
+        });
+
+        let permission = tab.permission.front().map(|permission| {
+            serde_json::json!({
+                "description": native_chat_text(&permission.description),
+                "options": permission.options.iter().map(|option| serde_json::json!({
+                    "id": option.id,
+                    "name": option.name,
+                    "kind": option.kind,
+                })).collect::<Vec<_>>(),
+            })
+        });
+        let connection_state = match &self.state {
+            ConnectionState::Disconnected => "disconnected",
+            ConnectionState::Connecting(_) => "connecting",
+            ConnectionState::Connected => "connected",
+            ConnectionState::Failed(_) => "failed",
+        };
+        let connection_detail = match &self.state {
+            ConnectionState::Connecting(detail) | ConnectionState::Failed(detail) => {
+                Some(native_chat_text(detail))
+            }
+            _ => None,
+        };
+        let streaming = tab.turn.buffer().map(native_chat_text).or_else(|| {
+            (!tab.pending_agent_response.is_empty())
+                .then(|| native_chat_text(&tab.pending_agent_response))
+        });
+        let view = if tab.current_view == View::Chat {
+            "chat"
+        } else {
+            "sessions"
+        };
+        let mode = match self.mode {
+            AppMode::Chat => "chat",
+            AppMode::Setup => "setup",
+            AppMode::Auth => "auth",
+        };
+        let mut params = serde_json::json!({
+            "protocol_version": 1,
+            "workspace_id": workspace_id,
+            "tab_id": workspace_id,
+            "surface_id": self.focus_context.surface_id,
+            "scope": self.active_scope_kind(),
+            "scope_key": active_key,
+            "view": view,
+            "mode": mode,
+            "agent": self.agent_name,
+            "backend": self.current_agent_source.display_suffix(),
+            "model": self.current_model_id.as_ref().or(self.agent_model.as_ref()),
+            "connection": connection_state,
+            "connection_detail": connection_detail,
+            "session_id": tab.session_id,
+            "cwd": self.focus_context.cwd.as_ref().or(self.source_cwd.as_ref()),
+            "permission_profile": "server-enforced",
+            "busy": tab.turn.is_in_flight(),
+            "can_submit": self.state == ConnectionState::Connected
+                && self.mode == AppMode::Chat
+                && tab.current_view == View::Chat
+                && tab.permission.is_empty()
+                && tab.turn.accepts_new_prompt(),
+            "messages": messages,
+            "streaming": streaming,
+            "active_tools": active_tools,
+            "permission": permission,
+        });
+
+        let canonical = params.to_string();
+        if self.last_native_chat_snapshot.as_deref() == Some(canonical.as_str()) {
+            return;
+        }
+        self.last_native_chat_snapshot = Some(canonical);
+        self.native_chat_snapshot_sequence = self.native_chat_snapshot_sequence.wrapping_add(1);
+        params["sequence"] = serde_json::json!(self.native_chat_snapshot_sequence);
+
+        send_wt_protocol_event(
+            serde_json::json!({
+                "type": "event",
+                "method": "native_chat_snapshot",
+                "params": params,
+            })
+            .to_string(),
+        );
+    }
+
     /// Push the current agent status (name / version / model / connection state)
     /// to the host so a XAML-rendered agent bar can update itself. The COM
     /// server special-cases `method == "agent_status"` and dispatches it
@@ -10242,10 +11638,18 @@ impl App {
     /// apply state changes to any tab, not just the focused one, so
     /// the old "defer until next tab_changed" gate was wrong.
     pub fn project_tab_state(&self, target_tab: &str) {
-        let Some(tab) = self.tab_sessions.get(target_tab) else {
+        // `target_tab` is the workspace/WT StableId carried by the protocol.
+        // Chat state, however, follows the focused surface and therefore lives
+        // under the workspace's active scope key. Mutations already use
+        // `tab_mut`, which performs this same resolution; projection must read
+        // from that exact key or it will echo a stale workspace-level snapshot
+        // after the user switches between Chat and Sessions.
+        let scope_key = self.scope_for_workspace(target_tab);
+        let Some(tab) = self.tab_sessions.get(&scope_key) else {
             tracing::warn!(
                 target: "project_tab_state",
-                tab_id = %target_tab,
+                workspace_id = %target_tab,
+                scope_key = %scope_key,
                 "no tab_session for target — skipping echo"
             );
             return;
@@ -10269,21 +11673,21 @@ impl App {
         // Autofix bar is window-level (single bottom bar reflecting the
         // active tab), so only re-emit when we're projecting the active
         // tab. A non-active mutation does not change the visible bar.
-        if target_tab == self.active_tab_key() {
+        if scope_key == self.active_tab_key() {
             send_bar_event(&tab.autofix.bar_snapshot, Some(target_tab));
         }
     }
 }
 
-/// Publish a raw JSON event via `wtcli publish`. The event flows through
+/// Publish a raw JSON event via the persistent `wtcli publish-stdin` bridge.
+/// The event flows through
 /// IProtocolServer::SendEvent; our modified COM server special-cases
 /// method=="autofix_state" and dispatches directly to TerminalPage.
 ///
-/// Events are funnelled through a single background thread that waits
-/// for each `wtcli publish` subprocess to exit before launching the next.
-/// Without this, two rapid emits (e.g. armed → cleared) could race at
-/// the OS process-scheduling layer and arrive at WT out of order,
-/// leaving the bottom-bar stuck in the earlier state.
+/// Events are funnelled through one background thread and one authenticated
+/// child process. This preserves ordering without spawning a process for every
+/// streaming update. If an older/missing wtcli cannot host the stream, the
+/// worker falls back to ordered one-shot `wtcli publish` calls.
 pub fn send_wt_protocol_event(json_payload: String) {
     let tx = publisher_sender();
     let _ = tx.send(json_payload);
@@ -10309,7 +11713,6 @@ fn build_switch_agent_event(
     .to_string()
 }
 
-
 /// Tell WT which pane in `tab_id` should display the blue "Agent" chip.
 /// `pane_session_id = None` releases the override and lets the C++ side
 /// fall back to its source-of-agent driven default. Fires per-tab; multiple
@@ -10334,8 +11737,18 @@ fn publisher_sender() -> &'static std::sync::mpsc::Sender<String> {
         std::thread::Builder::new()
             .name("wt-event-publisher".into())
             .spawn(move || {
+                let mut persistent = None;
                 while let Ok(payload) = rx.recv() {
-                    publish_event_blocking(&payload);
+                    if !publish_event_persistent(&payload, &mut persistent) {
+                        // Compatibility fallback for an older/missing wtcli.
+                        // It remains ordered because this publisher has one
+                        // worker and waits for the one-shot child to exit.
+                        publish_event_blocking(&payload);
+                    }
+                }
+                if let Some((mut child, _stdin, _stdout)) = persistent {
+                    let _ = child.kill();
+                    let _ = child.wait();
                 }
             })
             .expect("spawn wt-event-publisher thread");
@@ -10343,13 +11756,98 @@ fn publisher_sender() -> &'static std::sync::mpsc::Sender<String> {
     })
 }
 
-fn publish_event_blocking(json_payload: &str) {
-    let exe = std::env::current_exe()
+fn wtcli_executable() -> std::path::PathBuf {
+    std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("wtcli.exe")))
         .filter(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("wtcli.exe"));
-    let mut cmd = std::process::Command::new(exe);
+        .unwrap_or_else(|| std::path::PathBuf::from("wtcli.exe"))
+}
+
+type PersistentPublisher = (
+    std::process::Child,
+    std::process::ChildStdin,
+    std::sync::mpsc::Receiver<String>,
+);
+
+fn spawn_persistent_publisher() -> Option<PersistentPublisher> {
+    let mut cmd = std::process::Command::new(wtcli_executable());
+    cmd.arg("publish-stdin");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let Some(stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+    if std::thread::Builder::new()
+        .name("wt-event-publisher-acks".into())
+        .spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        if ack_tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .is_err()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    Some((child, stdin, ack_rx))
+}
+
+fn publish_event_persistent(
+    json_payload: &str,
+    publisher: &mut Option<PersistentPublisher>,
+) -> bool {
+    use std::io::Write;
+
+    for _ in 0..2 {
+        if publisher.is_none() {
+            *publisher = spawn_persistent_publisher();
+        }
+        if let Some((_child, stdin, acknowledgements)) = publisher.as_mut() {
+            if writeln!(stdin, "{json_payload}").is_ok() && stdin.flush().is_ok() {
+                if acknowledgements
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_ok_and(|acknowledgement| acknowledgement == "ok")
+                {
+                    return true;
+                }
+            }
+        }
+        if let Some((mut child, _stdin, _stdout)) = publisher.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    false
+}
+
+fn publish_event_blocking(json_payload: &str) {
+    let mut cmd = std::process::Command::new(wtcli_executable());
     cmd.arg("publish").arg(json_payload);
     #[cfg(windows)]
     {
@@ -10666,8 +12164,8 @@ mod tests {
     // Helper to create an App for testing (avoids needing real channels for simple state tests).
     // `pub(super)` so the sibling `slash_command_tests` module (see the
     // `#[path]` mod in app.rs) can reuse it instead of duplicating App::new.
-    pub(super) fn test_app() -> App {
-        let (prompt_tx, _prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+    fn test_app_with_prompt_rx() -> (App, tokio::sync::mpsc::UnboundedReceiver<PromptSubmission>) {
+        let (prompt_tx, prompt_rx) = tokio::sync::mpsc::unbounded_channel();
         let (recommendation_tx, _recommendation_rx) = tokio::sync::mpsc::unbounded_channel();
         let (permission_tx, _permission_rx) = tokio::sync::mpsc::unbounded_channel();
         let (cancel_tx, _cancel_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -10678,7 +12176,7 @@ mod tests {
         let (restart_tx, _restart_rx) = tokio::sync::mpsc::unbounded_channel();
         let debug_capture = Arc::new(AtomicBool::new(false));
         let (master_tx, _master_rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(
+        let app = App::new(
             prompt_tx,
             recommendation_tx,
             permission_tx,
@@ -10693,7 +12191,478 @@ mod tests {
             true,
             false,
             Arc::new(crate::shell::ShellManager::new()),
-        )
+        );
+        (app, prompt_rx)
+    }
+
+    pub(super) fn test_app() -> App {
+        test_app_with_prompt_rx().0
+    }
+
+    #[test]
+    fn native_chat_text_truncates_on_unicode_scalar_boundaries() {
+        let text = "界".repeat(65_537);
+        let truncated = native_chat_text(&text);
+        assert_eq!(truncated.chars().take(65_536).count(), 65_536);
+        assert!(truncated.ends_with("\n…"));
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn native_chat_action_requires_owned_workspace_and_exact_scope() {
+        let mut app = test_app();
+        app.owner_tab_id = Some("workspace-1".into());
+        app.current_tab_mut().input = "keep-me".into();
+        let active_scope = app.active_tab_key().to_string();
+
+        app.handle_native_chat_action(&json!({
+            "action": "submit",
+            "workspace_id": "workspace-2",
+            "scope_key": active_scope,
+            "text": "must not route",
+        }));
+        assert_eq!(app.current_tab().input, "keep-me");
+
+        app.handle_native_chat_action(&json!({
+            "action": "submit",
+            "workspace_id": "workspace-1",
+            "scope_key": "workspace-1::surface::stale",
+            "text": "must not route",
+        }));
+        assert_eq!(app.current_tab().input, "keep-me");
+
+        app.handle_native_chat_action(&json!({
+            "action": "submit",
+            "workspace_id": "workspace-1",
+            "text": "missing scope must fail closed",
+        }));
+        assert_eq!(app.current_tab().input, "keep-me");
+    }
+
+    #[test]
+    fn native_chat_submit_uses_the_existing_prompt_pipeline() {
+        let (mut app, mut prompt_rx) = test_app_with_prompt_rx();
+        app.owner_tab_id = Some("workspace-1".into());
+        app.state = ConnectionState::Connected;
+        let active_scope = app.active_tab_key().to_string();
+
+        app.handle_native_chat_action(&json!({
+            "action": "submit",
+            "workspace_id": "workspace-1",
+            "scope_key": active_scope,
+            "text": "inspect the active surface",
+        }));
+
+        let prompt = prompt_rx
+            .try_recv()
+            .expect("native composer must use the normal ACP prompt channel");
+        assert_eq!(prompt.text, "inspect the active surface");
+        assert!(app.current_tab().input.is_empty());
+        assert!(app.current_tab().turn.is_in_flight());
+    }
+
+    #[test]
+    fn native_chat_permission_resolves_only_an_advertised_option() {
+        let mut app = test_app();
+        app.owner_tab_id = Some("workspace-1".into());
+        let active_scope = app.active_tab_key().to_string();
+        let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+        app.current_tab_mut().permission.push_back(PermissionState {
+            description: "Allow the tool?".into(),
+            options: vec![
+                PermOption {
+                    id: "allow-once".into(),
+                    name: "Allow once".into(),
+                    kind: "AllowOnce".into(),
+                },
+                PermOption {
+                    id: "reject-once".into(),
+                    name: "Reject".into(),
+                    kind: "RejectOnce".into(),
+                },
+            ],
+            selected: 0,
+            responder: Some(response_tx),
+        });
+
+        app.handle_native_chat_action(&json!({
+            "action": "permission",
+            "workspace_id": "workspace-1",
+            "scope_key": active_scope,
+            "option_id": "not-advertised",
+        }));
+        assert_eq!(app.current_tab().permission.len(), 1);
+        assert!(matches!(
+            response_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        app.handle_native_chat_action(&json!({
+            "action": "permission",
+            "workspace_id": "workspace-1",
+            "scope_key": active_scope,
+            "option_id": "allow-once",
+        }));
+        assert!(app.current_tab().permission.is_empty());
+        assert_eq!(response_rx.try_recv().unwrap(), "allow-once");
+    }
+
+    #[test]
+    fn focus_events_isolate_surface_conversations_and_reject_stale_generations() {
+        let mut app = test_app();
+        app.window_id = Some("window-1".into());
+        app.owner_tab_id = Some("workspace-1".into());
+        app.tab_id = Some("workspace-1".into());
+
+        let focus = |surface: &str, generation: u64| AppEvent::WtEvent {
+            method: "focus_changed".into(),
+            pane_id: String::new(),
+            tab_id: None,
+            params: json!({
+                "protocol_version": 1,
+                "window_id": "window-1",
+                "workspace_id": "workspace-1",
+                "pane_id": "4",
+                "surface_id": surface,
+                "terminal_session_id": surface,
+                "focus_generation": generation,
+                "cwd": "C:\\repo",
+            }),
+        };
+
+        app.handle_event(focus("surface-a", 1));
+        assert_eq!(app.active_tab_key(), "workspace-1::surface::surface-a");
+        app.current_tab_mut().input = "draft-a".into();
+
+        app.handle_event(focus("surface-b", 2));
+        assert_eq!(app.active_tab_key(), "workspace-1::surface::surface-b");
+        assert!(app.current_tab().input.is_empty());
+        app.current_tab_mut().input = "draft-b".into();
+
+        app.handle_event(focus("surface-a", 3));
+        assert_eq!(app.current_tab().input, "draft-a");
+
+        // A delayed generation must not route the dock back to surface B.
+        app.handle_event(focus("surface-b", 2));
+        assert_eq!(app.active_tab_key(), "workspace-1::surface::surface-a");
+        assert_eq!(app.current_tab().input, "draft-a");
+    }
+
+    #[test]
+    fn set_agent_state_surface_identity_closes_first_open_focus_race() {
+        let (mut app, mut master_rx) = test_app_with_master_rx();
+        app.window_id = Some("window-1".into());
+        app.owner_tab_id = Some("workspace-1".into());
+        app.tab_id = Some("workspace-1".into());
+
+        // Deliberately send the UI mutation before any focus_changed event,
+        // matching the first click that creates/unstashes the agent pane.
+        app.handle_event(AppEvent::WtEvent {
+            method: "set_agent_state".into(),
+            pane_id: String::new(),
+            tab_id: None,
+            params: json!({
+                "window_id": "window-1",
+                "workspace_id": "workspace-1",
+                "tab_id": "workspace-1",
+                "surface_id": "surface-a",
+                "view": "sessions",
+                "pane_open": true,
+            }),
+        });
+
+        let scope = "workspace-1::surface::surface-a";
+        assert_eq!(app.active_tab_key(), scope);
+        assert_eq!(app.active_scope_by_workspace["workspace-1"], scope);
+        assert_eq!(app.tab_sessions[scope].current_view, View::Agents);
+        assert!(app.tab_sessions[scope].pane_open);
+        assert!(app.tab_sessions[scope].agents_view.refetch_in_flight);
+        match master_rx
+            .try_recv()
+            .expect("surface-addressed session view must request history")
+        {
+            crate::protocol::acp::client::MasterExtRequest::SessionsList { .. } => {}
+            other => panic!("expected SessionsList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_agent_state_projection_reads_the_focused_surface_scope() {
+        let mut app = test_app();
+        app.window_id = Some("window-1".into());
+        app.owner_tab_id = Some("workspace-1".into());
+        app.tab_id = Some("workspace-1".into());
+
+        let surface_scope = "workspace-1::surface::surface-a";
+        app.active_scope_by_workspace
+            .insert("workspace-1".into(), surface_scope.into());
+        app.active_scope_key = Some(surface_scope.into());
+
+        {
+            let surface = app.tab_mut("workspace-1");
+            surface.current_view = View::Agents;
+            surface.pane_open = true;
+        }
+        // A legacy workspace-level entry can still exist after upgrading.
+        // Projection must not read this stale snapshot when a surface is active.
+        {
+            let stale = app.tab_sessions.entry("workspace-1".into()).or_default();
+            stale.current_view = View::Chat;
+            stale.pane_open = false;
+        }
+
+        let resolved = app.scope_for_workspace("workspace-1");
+        let projected = app
+            .tab_sessions
+            .get(&resolved)
+            .expect("focused surface state must be projectable");
+        assert_eq!(resolved, surface_scope);
+        assert_eq!(projected.current_view, View::Agents);
+        assert!(projected.pane_open);
+        assert_eq!(
+            app.tab_sessions.get("workspace-1").unwrap().current_view,
+            View::Chat,
+            "the stale workspace snapshot is intentionally different"
+        );
+    }
+
+    #[test]
+    fn dynamic_acp_capabilities_follow_the_focused_surface() {
+        let mut app = test_app();
+        app.window_id = Some("window-1".into());
+        app.owner_tab_id = Some("workspace-1".into());
+        app.tab_id = Some("workspace-1".into());
+        let focus = |surface: &str, generation: u64| AppEvent::WtEvent {
+            method: "focus_changed".into(),
+            pane_id: String::new(),
+            tab_id: None,
+            params: json!({
+                "protocol_version": 1,
+                "window_id": "window-1",
+                "workspace_id": "workspace-1",
+                "pane_id": "4",
+                "surface_id": surface,
+                "focus_generation": generation,
+            }),
+        };
+
+        app.handle_event(focus("surface-a", 1));
+        let scope_a = app.active_tab_key().to_string();
+        app.current_tab_mut().session_id = Some("session-a".into());
+        app.session_to_tab
+            .insert("session-a".into(), scope_a.clone());
+        app.handle_event(AppEvent::AvailableCommandsUpdated {
+            session_id: "session-a".into(),
+            commands: vec![AgentCommandSpec {
+                name: "review".into(),
+                description: "Review this surface".into(),
+                input_hint: Some("<path>".into()),
+            }],
+        });
+        app.handle_event(AppEvent::SessionUsageUpdated {
+            session_id: "session-a".into(),
+            used: 25,
+            size: 100,
+            cost: Some((0.5, "USD".into())),
+        });
+
+        app.handle_event(focus("surface-b", 2));
+        let scope_b = app.active_tab_key().to_string();
+        app.current_tab_mut().session_id = Some("session-b".into());
+        app.session_to_tab
+            .insert("session-b".into(), scope_b.clone());
+        app.handle_event(AppEvent::AvailableCommandsUpdated {
+            session_id: "session-b".into(),
+            commands: vec![AgentCommandSpec {
+                name: "compact".into(),
+                description: "Compact this conversation".into(),
+                input_hint: None,
+            }],
+        });
+
+        assert_eq!(
+            app.current_tab().available_agent_commands[0].name,
+            "compact"
+        );
+        assert!(app.current_tab().session_usage.is_none());
+
+        app.handle_event(focus("surface-a", 3));
+        assert_eq!(app.current_tab().available_agent_commands[0].name, "review");
+        assert_eq!(
+            app.current_tab().session_usage,
+            Some((25, 100, Some((0.5, "USD".into()))))
+        );
+        assert!(app.active_session_summary().is_some_and(|summary| {
+            summary.contains("context: 25%")
+                && !summary.contains("commands")
+                && !summary.contains("mode:")
+        }));
+    }
+
+    #[test]
+    fn agent_command_wins_legacy_collision_but_terminal_namespace_remains_local() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, mut prompt_rx) = test_app_with_prompt_rx();
+        app.state = ConnectionState::Connected;
+        app.current_tab_mut().session_id = Some("session-a".into());
+        app.current_tab_mut()
+            .available_agent_commands
+            .push(AgentCommandSpec {
+                name: "new".into(),
+                description: "Create an agent-specific object".into(),
+                input_hint: None,
+            });
+
+        app.current_tab_mut().input = "/new".into();
+        app.current_tab_mut().cursor_pos = 4;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            prompt_rx.try_recv().unwrap().text,
+            "/new",
+            "the active agent owns an advertised collision"
+        );
+
+        app.current_tab_mut().turn = TurnState::Idle;
+        app.current_tab_mut().input = "/terminal:new".into();
+        app.current_tab_mut().cursor_pos = "/terminal:new".len();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            prompt_rx.try_recv().is_err(),
+            "the explicit local namespace must never be sent to the agent"
+        );
+    }
+
+    #[test]
+    fn surface_lifecycle_creates_and_closes_only_the_target_scope() {
+        let mut app = test_app();
+        app.window_id = Some("window-1".into());
+        app.owner_tab_id = Some("workspace-1".into());
+        app.tab_id = Some("workspace-1".into());
+
+        let lifecycle = |method: &str, surface: &str| AppEvent::WtEvent {
+            method: method.into(),
+            pane_id: String::new(),
+            tab_id: None,
+            params: json!({
+                "protocol_version": 1,
+                "window_id": "window-1",
+                "workspace_id": "workspace-1",
+                "surface_id": surface,
+            }),
+        };
+
+        app.handle_event(lifecycle("surface_created", "surface-a"));
+        app.handle_event(lifecycle("surface_created", "surface-b"));
+        let a = "workspace-1::surface::surface-a";
+        let b = "workspace-1::surface::surface-b";
+        app.tab_sessions.get_mut(a).unwrap().input = "draft-a".into();
+        app.tab_sessions.get_mut(b).unwrap().input = "draft-b".into();
+        app.session_to_tab.insert("session-a".into(), a.into());
+        app.session_to_tab.insert("session-b".into(), b.into());
+        app.active_scope_by_workspace
+            .insert("workspace-1".into(), a.into());
+        app.active_scope_key = Some(a.into());
+
+        app.handle_event(lifecycle("surface_closed", "surface-a"));
+
+        assert!(!app.tab_sessions.contains_key(a));
+        assert!(!app.session_to_tab.contains_key("session-a"));
+        assert_eq!(app.tab_sessions.get(b).unwrap().input, "draft-b");
+        assert_eq!(app.session_to_tab.get("session-b").unwrap(), b);
+        assert_eq!(app.active_tab_key(), "workspace-1");
+
+        // Detach is a transfer primitive, not a close. It must preserve the
+        // conversation for the eventual reattach in another pane/window.
+        app.handle_event(lifecycle("surface_detached", "surface-b"));
+        assert_eq!(app.tab_sessions.get(b).unwrap().input, "draft-b");
+    }
+
+    #[test]
+    fn surface_lifecycle_is_filtered_by_owner_window_and_protocol() {
+        let mut app = test_app();
+        app.window_id = Some("window-1".into());
+        app.owner_tab_id = Some("workspace-1".into());
+
+        for params in [
+            json!({
+                "protocol_version": 1,
+                "window_id": "window-2",
+                "workspace_id": "workspace-1",
+                "surface_id": "wrong-window",
+            }),
+            json!({
+                "protocol_version": 1,
+                "window_id": "window-1",
+                "workspace_id": "workspace-2",
+                "surface_id": "wrong-owner",
+            }),
+            json!({
+                "protocol_version": 99,
+                "window_id": "window-1",
+                "workspace_id": "workspace-1",
+                "surface_id": "wrong-version",
+            }),
+        ] {
+            app.handle_event(AppEvent::WtEvent {
+                method: "surface_created".into(),
+                pane_id: String::new(),
+                tab_id: None,
+                params,
+            });
+        }
+
+        assert!(app.tab_sessions.keys().all(|key| !key.contains("wrong-")));
+    }
+
+    #[test]
+    fn legacy_explicit_destination_is_separate_but_next_focus_returns_to_surface() {
+        let mut app = test_app();
+        app.window_id = Some("window-1".into());
+        app.owner_tab_id = Some("workspace-1".into());
+        app.tab_id = Some("workspace-1".into());
+        app.handle_event(AppEvent::WtEvent {
+            method: "focus_changed".into(),
+            pane_id: String::new(),
+            tab_id: None,
+            params: json!({
+                "protocol_version": 1,
+                "window_id": "window-1",
+                "workspace_id": "workspace-1",
+                "surface_id": "surface-a",
+                "focus_generation": 1,
+            }),
+        });
+        app.current_tab_mut().input = "surface draft".into();
+
+        app.handle_event(AppEvent::WtEvent {
+            method: "agent_scope_changed".into(),
+            pane_id: String::new(),
+            tab_id: None,
+            params: json!({
+                "window_id": "window-1",
+                "workspace_id": "workspace-1",
+                "scope": "workspace",
+            }),
+        });
+        assert_eq!(app.active_tab_key(), "workspace-1::coordinator");
+        assert_eq!(app.active_scope_kind(), "workspace");
+        assert!(app.current_tab().input.is_empty());
+
+        app.handle_event(AppEvent::WtEvent {
+            method: "focus_changed".into(),
+            pane_id: String::new(),
+            tab_id: None,
+            params: json!({
+                "protocol_version": 1,
+                "window_id": "window-1",
+                "workspace_id": "workspace-1",
+                "surface_id": "surface-a",
+                "focus_generation": 2,
+            }),
+        });
+        assert_eq!(app.active_tab_key(), "workspace-1::surface::surface-a");
+        assert_eq!(app.active_scope_kind(), "surface");
+        assert_eq!(app.current_tab().input, "surface draft");
     }
 
     fn agent_paste_params(window_id: &str, tab_id: &str) -> serde_json::Value {
@@ -10731,7 +12700,10 @@ mod tests {
         let tab = app.tab_sessions.get("tab-a").expect("target tab exists");
         assert_eq!(tab.input, expected);
         assert_eq!(tab.cursor_pos, tab.input.len());
-        assert!(tab.messages.iter().all(|m| !matches!(m, ChatMessage::User(_))));
+        assert!(tab
+            .messages
+            .iter()
+            .all(|m| !matches!(m, ChatMessage::User(_))));
     }
 
     #[test]
@@ -10763,8 +12735,14 @@ mod tests {
         app.tab_id = Some("tab-a".into());
         app.tab_mut("tab-a");
 
-        assert_eq!(app.agent_paste_target_tab(&agent_paste_params("w2", "tab-a")), None);
-        assert_eq!(app.agent_paste_target_tab(&agent_paste_params("w1", "tab-b")), None);
+        assert_eq!(
+            app.agent_paste_target_tab(&agent_paste_params("w2", "tab-a")),
+            None
+        );
+        assert_eq!(
+            app.agent_paste_target_tab(&agent_paste_params("w1", "tab-b")),
+            None
+        );
 
         assert!(app.tab_sessions.get("tab-a").unwrap().input.is_empty());
         assert!(
@@ -10781,8 +12759,15 @@ mod tests {
         let mut app = test_app();
         app.window_id = Some("w1".into());
         app.owner_tab_id = None;
-        assert_eq!(app.agent_paste_target_tab(&agent_paste_params("w1", "tab-a")), None);
-        assert!(app.tab_sessions.get("tab-a").map(|t| t.input.is_empty()).unwrap_or(true));
+        assert_eq!(
+            app.agent_paste_target_tab(&agent_paste_params("w1", "tab-a")),
+            None
+        );
+        assert!(app
+            .tab_sessions
+            .get("tab-a")
+            .map(|t| t.input.is_empty())
+            .unwrap_or(true));
 
         app.owner_tab_id = Some("tab-a".into());
         let missing_window = json!({ "tab_id": "tab-a" });
@@ -10888,7 +12873,10 @@ mod tests {
 
         let tab = app.tab_sessions.get("tab-a").unwrap();
         assert!(tab.input.is_empty());
-        assert!(tab.paste_pending, "stale completion must not clear a newer pending paste");
+        assert!(
+            tab.paste_pending,
+            "stale completion must not clear a newer pending paste"
+        );
     }
 
     #[test]
@@ -10905,7 +12893,11 @@ mod tests {
             tab_id: Some("tab-a".into()),
             params: agent_paste_params("w1", "tab-a"),
         });
-        assert!(app.tab_sessions.get("tab-a").map(|t| t.input.is_empty()).unwrap_or(true));
+        assert!(app
+            .tab_sessions
+            .get("tab-a")
+            .map(|t| t.input.is_empty())
+            .unwrap_or(true));
 
         app.mode = AppMode::Setup;
         app.handle_event(AppEvent::WtEvent {
@@ -10914,7 +12906,11 @@ mod tests {
             tab_id: Some("tab-a".into()),
             params: agent_paste_params("w1", "tab-a"),
         });
-        assert!(app.tab_sessions.get("tab-a").map(|t| t.input.is_empty()).unwrap_or(true));
+        assert!(app
+            .tab_sessions
+            .get("tab-a")
+            .map(|t| t.input.is_empty())
+            .unwrap_or(true));
     }
 
     #[test]
@@ -10937,12 +12933,18 @@ mod tests {
             |event| published.push(event),
         );
 
-        assert!(!dirty, "an internal sidekick event must not dirty the registry");
+        assert!(
+            !dirty,
+            "an internal sidekick event must not dirty the registry"
+        );
         assert!(
             reg.iter_sorted().is_empty(),
             "an internal sidekick must not create a session row"
         );
-        assert!(published.is_empty(), "an internal sidekick event must not reach master");
+        assert!(
+            published.is_empty(),
+            "an internal sidekick event must not reach master"
+        );
     }
 
     /// Bug-1 fix (PR #73 follow-up): an `agent.notification` hook event
@@ -10961,9 +12963,7 @@ mod tests {
     /// `Attention` locally AND a real-key event is published to master.
     #[test]
     fn sessionless_notification_falls_back_to_recent_live_cli_session() {
-        use crate::agent_sessions::{
-            AgentSessionRegistry, AgentStatus, CliSource, SessionEvent,
-        };
+        use crate::agent_sessions::{AgentSessionRegistry, AgentStatus, CliSource, SessionEvent};
         let mut reg = AgentSessionRegistry::new();
         // One live Copilot session bound to a known pane.
         reg.apply(SessionEvent::SessionStarted {
@@ -10987,15 +12987,14 @@ mod tests {
         });
 
         let mut published: Vec<SessionEvent> = Vec::new();
-        route_agent_event_to_registry_with_hook_sink(
-            &mut reg,
-            unrelated_pane,
-            &params,
-            |ev| published.push(ev),
-        );
+        route_agent_event_to_registry_with_hook_sink(&mut reg, unrelated_pane, &params, |ev| {
+            published.push(ev)
+        });
 
         // Local reducer flipped the real row to Attention.
-        let s = reg.get(&"real-copilot-sid".to_string()).expect("row preserved");
+        let s = reg
+            .get(&"real-copilot-sid".to_string())
+            .expect("row preserved");
         assert_eq!(
             s.status,
             AgentStatus::Attention,
@@ -11030,9 +13029,7 @@ mod tests {
     /// multi-tool turn flickers to (and sits at) Idle while the agent is busy.
     #[test]
     fn copilot_tool_finished_keeps_working_only_agent_stop_idles() {
-        use crate::agent_sessions::{
-            AgentSessionRegistry, AgentStatus, CliSource, SessionEvent,
-        };
+        use crate::agent_sessions::{AgentSessionRegistry, AgentStatus, CliSource, SessionEvent};
         let mut reg = AgentSessionRegistry::new();
         let pane = "11111111-1111-1111-1111-111111111111";
         let sid = "copilot-sid";
@@ -11057,13 +13054,19 @@ mod tests {
 
         // User prompt → Working (turn start).
         route(&mut reg, "agent.prompt.submit");
-        assert_eq!(reg.get(&sid.to_string()).unwrap().status, AgentStatus::Working);
+        assert_eq!(
+            reg.get(&sid.to_string()).unwrap().status,
+            AgentStatus::Working
+        );
 
         // A parallel batch: three starts, then three finishes.
         route(&mut reg, "agent.tool.starting");
         route(&mut reg, "agent.tool.starting");
         route(&mut reg, "agent.tool.starting");
-        assert_eq!(reg.get(&sid.to_string()).unwrap().status, AgentStatus::Working);
+        assert_eq!(
+            reg.get(&sid.to_string()).unwrap().status,
+            AgentStatus::Working
+        );
         route(&mut reg, "agent.tool.finished");
         assert_eq!(
             reg.get(&sid.to_string()).unwrap().status,
@@ -11092,9 +13095,7 @@ mod tests {
     /// wins over the heuristic.
     #[test]
     fn notification_with_real_session_id_skips_fallback() {
-        use crate::agent_sessions::{
-            AgentSessionRegistry, AgentStatus, CliSource, SessionEvent,
-        };
+        use crate::agent_sessions::{AgentSessionRegistry, AgentStatus, CliSource, SessionEvent};
         let mut reg = AgentSessionRegistry::new();
         // Two Copilot sessions; `target` is the explicit one in the hook,
         // `other` is the most-recently-active and would win the fallback.
@@ -11122,9 +13123,7 @@ mod tests {
             "payload": { "message": "explicit" }
         });
         let unrelated_pane = "99999999-9999-9999-9999-999999999999";
-        route_agent_event_to_registry_with_hook_sink(
-            &mut reg, unrelated_pane, &params, |_| {},
-        );
+        route_agent_event_to_registry_with_hook_sink(&mut reg, unrelated_pane, &params, |_| {});
 
         assert_eq!(
             reg.get(&"target".to_string()).unwrap().status,
@@ -11144,9 +13143,7 @@ mod tests {
     /// the most recent across ALL CLIs.
     #[test]
     fn sessionless_notification_with_unknown_cli_does_not_fall_back() {
-        use crate::agent_sessions::{
-            AgentSessionRegistry, AgentStatus, CliSource, SessionEvent,
-        };
+        use crate::agent_sessions::{AgentSessionRegistry, AgentStatus, CliSource, SessionEvent};
         let mut reg = AgentSessionRegistry::new();
         reg.apply(SessionEvent::SessionStarted {
             key: "copilot".into(),
@@ -11399,7 +13396,10 @@ mod tests {
                 other => panic!("unexpected event: {:?}", other),
             }
         }
-        assert!(count >= 1, "at least one real-keyed event must reach master");
+        assert!(
+            count >= 1,
+            "at least one real-keyed event must reach master"
+        );
     }
 
     fn test_app_with_master_rx() -> (
@@ -11434,6 +13434,77 @@ mod tests {
             Arc::new(crate::shell::ShellManager::new()),
         );
         (app, master_rx)
+    }
+
+    #[test]
+    fn mode_and_config_commands_target_only_the_active_surface_session() {
+        use crate::protocol::acp::client::MasterExtRequest;
+        use agent_client_protocol::schema::v1::{
+            SessionConfigOption, SessionConfigOptionValue, SessionConfigSelectOption, SessionMode,
+            SessionModeState,
+        };
+
+        let (mut app, mut master_rx) = test_app_with_master_rx();
+        app.current_tab_mut().session_id = Some("surface-session".into());
+        app.current_tab_mut().session_modes = Some(SessionModeState::new(
+            "default",
+            vec![
+                SessionMode::new("default", "Default"),
+                SessionMode::new("plan", "Plan"),
+            ],
+        ));
+        app.current_tab_mut().session_config_options = vec![
+            SessionConfigOption::boolean("fast", "Fast mode", false),
+            SessionConfigOption::select(
+                "reasoning",
+                "Reasoning",
+                "medium",
+                vec![
+                    SessionConfigSelectOption::new("medium", "Medium"),
+                    SessionConfigSelectOption::new("high", "High"),
+                ],
+            ),
+        ];
+
+        app.cmd_mode("plan".into());
+        match master_rx.try_recv().unwrap() {
+            MasterExtRequest::SetSessionMode {
+                session_id,
+                mode_id,
+            } => {
+                assert_eq!(session_id.to_string(), "surface-session");
+                assert_eq!(mode_id.to_string(), "plan");
+            }
+            other => panic!("expected SetSessionMode, got {other:?}"),
+        }
+
+        app.cmd_config("fast=true".into());
+        match master_rx.try_recv().unwrap() {
+            MasterExtRequest::SetSessionConfigOption {
+                session_id,
+                config_id,
+                value,
+            } => {
+                assert_eq!(session_id.to_string(), "surface-session");
+                assert_eq!(config_id.to_string(), "fast");
+                assert_eq!(value, SessionConfigOptionValue::boolean(true));
+            }
+            other => panic!("expected SetSessionConfigOption, got {other:?}"),
+        }
+
+        app.cmd_config("reasoning=high".into());
+        match master_rx.try_recv().unwrap() {
+            MasterExtRequest::SetSessionConfigOption {
+                session_id,
+                config_id,
+                value,
+            } => {
+                assert_eq!(session_id.to_string(), "surface-session");
+                assert_eq!(config_id.to_string(), "reasoning");
+                assert_eq!(value, SessionConfigOptionValue::value_id("high"));
+            }
+            other => panic!("expected SetSessionConfigOption, got {other:?}"),
+        }
     }
 
     // ─── word boundary helpers ──────────────────────────────────────────────
@@ -12064,7 +14135,9 @@ mod tests {
         assert_eq!(t0.prompt, "# Terminal Agent…");
         // details = [original full User, Agent reply].
         assert_eq!(t0.details.len(), 2);
-        assert!(matches!(&t0.details[0], ChatMessage::User(s) if s.starts_with("# Terminal Agent\nYou are")));
+        assert!(
+            matches!(&t0.details[0], ChatMessage::User(s) if s.starts_with("# Terminal Agent\nYou are"))
+        );
         assert!(matches!(&t0.details[1], ChatMessage::Agent(_)));
         assert!(!t0.expanded, "replayed turn must default to collapsed");
         assert!(t0.trailing_marker.is_none());
@@ -12149,10 +14222,14 @@ mod tests {
         });
         // Simulate replay chunks landing in messages.
         let tab = app.tab_sessions.get_mut("OWNER-TAB").unwrap();
-        tab.messages.push(ChatMessage::User("first prompt".to_string()));
-        tab.messages.push(ChatMessage::Agent("first reply".to_string()));
-        tab.messages.push(ChatMessage::User("second prompt".to_string()));
-        tab.messages.push(ChatMessage::Agent("second reply".to_string()));
+        tab.messages
+            .push(ChatMessage::User("first prompt".to_string()));
+        tab.messages
+            .push(ChatMessage::Agent("first reply".to_string()));
+        tab.messages
+            .push(ChatMessage::User("second prompt".to_string()));
+        tab.messages
+            .push(ChatMessage::Agent("second reply".to_string()));
 
         app.handle_event(AppEvent::SessionAttached {
             tab_id: "OWNER-TAB".to_string(),
@@ -12515,6 +14592,68 @@ mod tests {
     }
 
     #[test]
+    fn agents_view_requests_are_unique_and_responses_stay_surface_scoped() {
+        let (mut app, mut master_rx) = test_app_with_master_rx();
+        app.tab_id = Some("workspace-1".into());
+
+        let surface_a = "workspace-1::surface::surface-a";
+        app.active_scope_by_workspace
+            .insert("workspace-1".into(), surface_a.into());
+        app.active_scope_key = Some(surface_a.into());
+        app.open_agents_view_for_tab("workspace-1".into());
+        let request_a = match master_rx.try_recv().expect("surface A request") {
+            crate::protocol::acp::client::MasterExtRequest::SessionsList { request_id, .. } => {
+                request_id
+            }
+            other => panic!("expected SessionsList, got {other:?}"),
+        };
+
+        let surface_b = "workspace-1::surface::surface-b";
+        app.active_scope_by_workspace
+            .insert("workspace-1".into(), surface_b.into());
+        app.active_scope_key = Some(surface_b.into());
+        app.open_agents_view_for_tab("workspace-1".into());
+        let request_b = match master_rx.try_recv().expect("surface B request") {
+            crate::protocol::acp::client::MasterExtRequest::SessionsList { request_id, .. } => {
+                request_id
+            }
+            other => panic!("expected SessionsList, got {other:?}"),
+        };
+
+        assert_ne!(
+            request_a, request_b,
+            "master request correlation ids must be unique across surfaces"
+        );
+
+        app.handle_event(AppEvent::AgentsSnapshotLoaded {
+            request_id: request_a,
+            sessions: vec![session_info_for_test("only-surface-a")],
+        });
+        assert_eq!(
+            app.tab_sessions[surface_a]
+                .agents_view
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            app.tab_sessions[surface_b]
+                .agents_view
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .is_empty(),
+            "surface A's response must not overwrite surface B"
+        );
+        assert!(
+            app.tab_sessions[surface_b].agents_view.refetch_in_flight,
+            "surface B must continue waiting for its own response"
+        );
+    }
+
+    #[test]
     fn born_bound_registration_uses_current_master_request_sender() {
         let (mut app, mut old_master_rx) = test_app_with_master_rx();
         let (new_master_tx, mut new_master_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -12536,9 +14675,9 @@ mod tests {
             .try_recv()
             .expect("registration should use the replacement sender")
         {
-            crate::protocol::acp::client::MasterExtRequest::SessionBornBound {
-                event: actual,
-            } => assert_eq!(actual, event),
+            crate::protocol::acp::client::MasterExtRequest::SessionBornBound { event: actual } => {
+                assert_eq!(actual, event)
+            }
             other => panic!("expected SessionBornBound, got {other:?}"),
         }
     }
@@ -12751,7 +14890,8 @@ mod tests {
             cwd: PathBuf::from("/x"),
             title: "pane".into(),
         });
-        app.agent_sessions.set_origin("pane-key", SessionOrigin::AgentPane);
+        app.agent_sessions
+            .set_origin("pane-key", SessionOrigin::AgentPane);
 
         let rows = app.agents_rows_for_tab(DEFAULT_TAB_ID);
         assert_eq!(rows.len(), 1);
@@ -12778,7 +14918,9 @@ mod tests {
 
         let mut info = session_info_for_test("wsl-1");
         info.origin = Some(crate::agent_sessions::SessionOrigin::Unknown);
-        info.location = SessionLocation::Wsl { distro: "Ubuntu".into() };
+        info.location = SessionLocation::Wsl {
+            distro: "Ubuntu".into(),
+        };
 
         app.current_tab_mut().current_view = View::Agents;
         app.current_tab_mut().agents_view.snapshot = Some(vec![info]);
@@ -12792,7 +14934,9 @@ mod tests {
         );
         assert_eq!(
             rows[0].location,
-            SessionLocation::Wsl { distro: "Ubuntu".into() },
+            SessionLocation::Wsl {
+                distro: "Ubuntu".into()
+            },
             "distro name must round-trip through session_info_to_agent_session"
         );
     }
@@ -12816,7 +14960,9 @@ mod tests {
         let mut info = session_info_for_test("wsl-render-1");
         info.title = Some("hack on wsl".into());
         info.origin = Some(crate::agent_sessions::SessionOrigin::Unknown);
-        info.location = SessionLocation::Wsl { distro: "Ubuntu".into() };
+        info.location = SessionLocation::Wsl {
+            distro: "Ubuntu".into(),
+        };
 
         app.current_tab_mut().current_view = View::Agents;
         app.current_tab_mut().agents_view.snapshot = Some(vec![info]);
@@ -12844,17 +14990,29 @@ mod tests {
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         std::env::remove_var("WTA_SESSIONS_SHOW_AGENT_PANE");
-        assert_eq!(crate::app::resolve_sessions_origin_filter(), MVP_SESSIONS_ORIGIN_FILTER);
+        assert_eq!(
+            crate::app::resolve_sessions_origin_filter(),
+            MVP_SESSIONS_ORIGIN_FILTER
+        );
         assert_eq!(MVP_SESSIONS_ORIGIN_FILTER, OriginFilter::ShellOnly);
 
         std::env::set_var("WTA_SESSIONS_SHOW_AGENT_PANE", "1");
-        assert_eq!(crate::app::resolve_sessions_origin_filter(), OriginFilter::All);
+        assert_eq!(
+            crate::app::resolve_sessions_origin_filter(),
+            OriginFilter::All
+        );
 
         std::env::set_var("WTA_SESSIONS_SHOW_AGENT_PANE", "true");
-        assert_eq!(crate::app::resolve_sessions_origin_filter(), OriginFilter::All);
+        assert_eq!(
+            crate::app::resolve_sessions_origin_filter(),
+            OriginFilter::All
+        );
 
         std::env::set_var("WTA_SESSIONS_SHOW_AGENT_PANE", "0");
-        assert_eq!(crate::app::resolve_sessions_origin_filter(), MVP_SESSIONS_ORIGIN_FILTER);
+        assert_eq!(
+            crate::app::resolve_sessions_origin_filter(),
+            MVP_SESSIONS_ORIGIN_FILTER
+        );
 
         std::env::remove_var("WTA_SESSIONS_SHOW_AGENT_PANE");
     }
@@ -13118,7 +15276,10 @@ mod tests {
         // First snapshot landed: rows present, fetch settled — not loading.
         app.current_tab_mut().agents_view.snapshot = Some(vec![session_info_for_test("a")]);
         app.current_tab_mut().agents_view.refetch_in_flight = false;
-        assert!(!app.agents_view_awaiting_snapshot(), "a settled list is not loading");
+        assert!(
+            !app.agents_view_awaiting_snapshot(),
+            "a settled list is not loading"
+        );
 
         // F5 dispatches a rescan: the loading shimmer must show even though the
         // list already has rows, so the refresh is visible.
@@ -13225,24 +15386,21 @@ mod tests {
         let mut title_match = session_info_for_test("title-match");
         title_match.title = Some("PowerShell repair".into());
         title_match.cwd = std::path::PathBuf::from(r"C:\Windows");
-        title_match.pane_session_id =
-            Some("00000000-0000-0000-0000-0000000000a1".into());
+        title_match.pane_session_id = Some("00000000-0000-0000-0000-0000000000a1".into());
         title_match.origin = Some(SessionOrigin::Unknown);
         title_match.last_activity_at_ms = Some(300);
 
         let mut unrelated = session_info_for_test("unrelated");
         unrelated.title = Some("fix the build".into());
         unrelated.cwd = std::path::PathBuf::from(r"C:\Windows");
-        unrelated.pane_session_id =
-            Some("00000000-0000-0000-0000-0000000000b2".into());
+        unrelated.pane_session_id = Some("00000000-0000-0000-0000-0000000000b2".into());
         unrelated.origin = Some(SessionOrigin::Unknown);
         unrelated.last_activity_at_ms = Some(200);
 
         let mut second_title_match = session_info_for_test("second-title-match");
         second_title_match.title = Some("portal review".into());
         second_title_match.cwd = std::path::PathBuf::from(r"C:\repos\portal");
-        second_title_match.pane_session_id =
-            Some("00000000-0000-0000-0000-0000000000c3".into());
+        second_title_match.pane_session_id = Some("00000000-0000-0000-0000-0000000000c3".into());
         second_title_match.origin = Some(SessionOrigin::Unknown);
         second_title_match.last_activity_at_ms = Some(100);
 
@@ -13310,7 +15468,6 @@ mod tests {
             View::Agents,
             "the first Esc dismisses search instead of closing session management"
         );
-
     }
 
     // Esc out of the session-management (Agents) view restores the pane
@@ -13349,7 +15506,8 @@ mod tests {
             "fold-restore must not switch to chat (would flash before stashing)"
         );
         assert_eq!(
-            app.current_tab().agents_view_prev_pane_open, None,
+            app.current_tab().agents_view_prev_pane_open,
+            None,
             "the snapshot must be cleared after Esc so a re-entry re-captures"
         );
     }
@@ -13491,7 +15649,9 @@ mod tests {
             argv
         );
         assert!(
-            cmd.argv.windows(2).any(|args| args == ["--title", "Fix the build"]),
+            cmd.argv
+                .windows(2)
+                .any(|args| args == ["--title", "Fix the build"]),
             "resume tab must use the session title: {:?}",
             cmd.argv
         );
@@ -13506,9 +15666,7 @@ mod tests {
         // low-contrast tone similar to the cwd line in a typical
         // Copilot-CLI shell prompt.)
         assert!(
-            argv.contains(
-                "cmd /c echo \x1b[2;37mResuming claude session abc-123...\x1b[0m"
-            ),
+            argv.contains("cmd /c echo \x1b[2;37mResuming claude session abc-123...\x1b[0m"),
             "expected dim-white Resuming banner echo; argv: {:?}",
             argv
         );
@@ -14176,15 +16334,19 @@ mod tests {
         }));
         // An authenticate-RPC rejection/timeout must NOT trigger auth recovery
         // (a master restart can't fix bad credentials) — it routes to sign-in.
-        assert!(!is_post_login_auth_failure(&AgentFailure::HandshakeFailed {
-            stage: HandshakeStage::Authenticate,
-            detail: "authenticate rejected/timed out".to_string()
-        }));
+        assert!(!is_post_login_auth_failure(
+            &AgentFailure::HandshakeFailed {
+                stage: HandshakeStage::Authenticate,
+                detail: "authenticate rejected/timed out".to_string()
+            }
+        ));
         // A non-auth handshake stage must NOT trigger auth recovery.
-        assert!(!is_post_login_auth_failure(&AgentFailure::HandshakeFailed {
-            stage: HandshakeStage::Initialize,
-            detail: "boom".to_string()
-        }));
+        assert!(!is_post_login_auth_failure(
+            &AgentFailure::HandshakeFailed {
+                stage: HandshakeStage::Initialize,
+                detail: "boom".to_string()
+            }
+        ));
     }
 
     #[test]
@@ -14244,19 +16406,11 @@ mod tests {
             detail: "pipe missing".to_string(),
         };
         assert!(
-            should_trigger_post_login_recovery(
-                true,
-                false,
-                &pipe_connect
-            ),
+            should_trigger_post_login_recovery(true, false, &pipe_connect),
             "post-login master-unavailable recovery must not be gated on External auth flow"
         );
         assert!(
-            !should_trigger_post_login_recovery(
-                false,
-                false,
-                &pipe_connect
-            ),
+            !should_trigger_post_login_recovery(false, false, &pipe_connect),
             "non-post-login pipe failures should surface normally"
         );
 
@@ -14422,8 +16576,7 @@ mod tests {
             failure: crate::protocol::acp::failure::AgentFailure::AuthRequired {
                 message: "authentication required".to_string(),
             },
-            message: "new_session over master pipe failed: authentication required"
-                .to_string(),
+            message: "new_session over master pipe failed: authentication required".to_string(),
         });
         assert_eq!(
             app.mode,
@@ -14611,7 +16764,10 @@ mod tests {
             cwd: PathBuf::from("/work"),
             title: "t".into(),
         });
-        assert!(app.agent_sessions.is_agent_pane(pane), "precondition: pane is registered as agent-bound");
+        assert!(
+            app.agent_sessions.is_agent_pane(pane),
+            "precondition: pane is registered as agent-bound"
+        );
 
         app.handle_event(AppEvent::WtEvent {
             method: "vt_sequence".to_string(),
@@ -14998,8 +17154,7 @@ mod tests {
             .expect("row exists");
         assert!(matches!(
             before.status,
-            crate::agent_sessions::AgentStatus::Idle
-                | crate::agent_sessions::AgentStatus::Working
+            crate::agent_sessions::AgentStatus::Idle | crate::agent_sessions::AgentStatus::Working
         ));
         assert_eq!(before.origin, SessionOrigin::AgentPane);
 
@@ -15067,7 +17222,6 @@ mod tests {
     async fn mock_agent_reply_streams_into_app_chat() {
         use crate::protocol::acp::client::mock_agent_tests::connect_mock_agent;
         use agent_client_protocol as acp;
-        
 
         let local = tokio::task::LocalSet::new();
         local
@@ -15075,9 +17229,11 @@ mod tests {
                 // Borrow the acp-module harness: deterministic mock wired to a
                 // real WtaClient over an in-memory duplex.
                 let (conn, mut event_rx, _seen) = connect_mock_agent();
-                conn.initialize(acp::schema::v1::InitializeRequest::new(acp::schema::ProtocolVersion::LATEST))
-                    .await
-                    .expect("initialize failed");
+                conn.initialize(acp::schema::v1::InitializeRequest::new(
+                    acp::schema::ProtocolVersion::LATEST,
+                ))
+                .await
+                .expect("initialize failed");
                 let session = conn
                     .new_session(acp::schema::v1::NewSessionRequest::new("/test"))
                     .await
@@ -15112,7 +17268,10 @@ mod tests {
                     }
                 })
                 .await;
-                assert!(pumped.is_ok(), "timed out waiting for the agent message chunk");
+                assert!(
+                    pumped.is_ok(),
+                    "timed out waiting for the agent message chunk"
+                );
 
                 // "What the chat shows" while streaming: the mock's reply is in
                 // the active tab's streaming buffer.
@@ -15135,12 +17294,13 @@ mod tests {
     async fn run_permission_scenario(expected_keys: &[KeyCode], want: &str) {
         use crate::protocol::acp::client::mock_agent_tests::connect_mock_agent_asking_permission;
         use agent_client_protocol as acp;
-        
 
         let (conn, mut event_rx, outcome) = connect_mock_agent_asking_permission();
-        conn.initialize(acp::schema::v1::InitializeRequest::new(acp::schema::ProtocolVersion::LATEST))
-            .await
-            .expect("initialize failed");
+        conn.initialize(acp::schema::v1::InitializeRequest::new(
+            acp::schema::ProtocolVersion::LATEST,
+        ))
+        .await
+        .expect("initialize failed");
         let session = conn
             .new_session(acp::schema::v1::NewSessionRequest::new("/test"))
             .await
@@ -15172,7 +17332,10 @@ mod tests {
             }
         })
         .await;
-        assert!(pumped.is_ok(), "timed out waiting for the permission request");
+        assert!(
+            pumped.is_ok(),
+            "timed out waiting for the permission request"
+        );
 
         // Display assertion: the permission card is queued with allow/reject,
         // allow selected by default.
@@ -15245,10 +17408,7 @@ mod tests {
     async fn permission_quick_allow_key_round_trips_to_agent() {
         let local = tokio::task::LocalSet::new();
         local
-            .run_until(run_permission_scenario(
-                &[KeyCode::Char('y')],
-                "allow-once",
-            ))
+            .run_until(run_permission_scenario(&[KeyCode::Char('y')], "allow-once"))
             .await;
     }
 
@@ -15338,8 +17498,16 @@ mod tests {
             .push_back(PermissionState {
                 description: "Allow tool X?".into(),
                 options: vec![
-                    PermOption { id: "allow-once".into(), name: "Allow".into(), kind: "AllowOnce".into() },
-                    PermOption { id: "reject-once".into(), name: "Deny".into(), kind: "RejectOnce".into() },
+                    PermOption {
+                        id: "allow-once".into(),
+                        name: "Allow".into(),
+                        kind: "AllowOnce".into(),
+                    },
+                    PermOption {
+                        id: "reject-once".into(),
+                        name: "Deny".into(),
+                        kind: "RejectOnce".into(),
+                    },
                 ],
                 selected: 0,
                 responder: None,
@@ -15364,15 +17532,16 @@ mod tests {
     async fn tool_call_surfaces_card_in_chat() {
         use crate::protocol::acp::client::mock_agent_tests::connect_mock_agent_proposing_tool;
         use agent_client_protocol as acp;
-        
 
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let (conn, mut event_rx) = connect_mock_agent_proposing_tool();
-                conn.initialize(acp::schema::v1::InitializeRequest::new(acp::schema::ProtocolVersion::LATEST))
-                    .await
-                    .expect("initialize failed");
+                conn.initialize(acp::schema::v1::InitializeRequest::new(
+                    acp::schema::ProtocolVersion::LATEST,
+                ))
+                .await
+                .expect("initialize failed");
                 let session = conn
                     .new_session(acp::schema::v1::NewSessionRequest::new("/test"))
                     .await
@@ -15405,9 +17574,9 @@ mod tests {
                 assert!(pumped.is_ok(), "timed out waiting for the tool call");
 
                 // Display assertion: the proposed command shows as a tool-call card.
-                let has_card = app.current_tab().messages.iter().any(|m| {
-                    matches!(m, ChatMessage::ToolCall { title, .. } if title == "Run: echo hi")
-                });
+                let has_card = app.current_tab().messages.iter().any(
+                    |m| matches!(m, ChatMessage::ToolCall { title, .. } if title == "Run: echo hi"),
+                );
                 assert!(
                     has_card,
                     "a tool-call card must surface in the chat; got {:?}",
@@ -15446,14 +17615,14 @@ mod tests {
     /// leaving an in-flight turn whose streamed notifications the caller pumps
     /// into a real `App`. Returns `()` — it only drives ACP traffic; the caller
     /// owns the `App`.
-    async fn app_after_prompt(
-        conn: &crate::protocol::acp::conn::ClientLink,
-    ) {
+    async fn app_after_prompt(conn: &crate::protocol::acp::conn::ClientLink) {
         use agent_client_protocol as acp;
-        
-        conn.initialize(acp::schema::v1::InitializeRequest::new(acp::schema::ProtocolVersion::LATEST))
-            .await
-            .expect("initialize failed");
+
+        conn.initialize(acp::schema::v1::InitializeRequest::new(
+            acp::schema::ProtocolVersion::LATEST,
+        ))
+        .await
+        .expect("initialize failed");
         let session = conn
             .new_session(acp::schema::v1::NewSessionRequest::new("/test"))
             .await
@@ -15525,13 +17694,22 @@ mod tests {
                     .messages
                     .iter()
                     .filter_map(|m| match m {
-                        ChatMessage::ToolCall { id, status, .. } => Some((id.clone(), status.clone())),
+                        ChatMessage::ToolCall { id, status, .. } => {
+                            Some((id.clone(), status.clone()))
+                        }
                         _ => None,
                     })
                     .collect();
-                assert_eq!(cards.len(), 1, "the update must edit in place, not add a card");
+                assert_eq!(
+                    cards.len(),
+                    1,
+                    "the update must edit in place, not add a card"
+                );
                 assert_eq!(cards[0].0, "mock-tool-1");
-                assert_eq!(cards[0].1, "Completed", "card status must reflect the update");
+                assert_eq!(
+                    cards[0].1, "Completed",
+                    "card status must reflect the update"
+                );
             })
             .await;
     }
@@ -15550,7 +17728,10 @@ mod tests {
                 let mut app = test_app();
                 submit_test_prompt(&mut app, "go");
 
-                pump_until(&mut app, &mut event_rx, |ev| matches!(ev, AppEvent::Plan { .. })).await;
+                pump_until(&mut app, &mut event_rx, |ev| {
+                    matches!(ev, AppEvent::Plan { .. })
+                })
+                .await;
 
                 let plan = app.current_tab().messages.iter().find_map(|m| match m {
                     ChatMessage::Plan(entries) => Some(entries.clone()),
@@ -15704,6 +17885,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn render_agents_view_uses_focused_surface_instead_of_stale_workspace_state() {
+        let _g = crate::test_support::lock_locale();
+        rust_i18n::set_locale("en-US");
+        let mut app = test_app();
+        app.tab_id = Some("workspace-1".into());
+
+        let surface_scope = "workspace-1::surface::surface-a";
+        app.active_scope_by_workspace
+            .insert("workspace-1".into(), surface_scope.into());
+        app.active_scope_key = Some(surface_scope.into());
+        {
+            let surface = app.tab_sessions.entry(surface_scope.into()).or_default();
+            surface.current_view = View::Agents;
+            surface.agents_view.snapshot = Some(Vec::new());
+            surface.agents_view.refetch_in_flight = false;
+        }
+        {
+            // This is the exact upgrade/focus-transition residue that caused
+            // the real UI to remain on "Loading…" forever.
+            let stale_workspace = app.tab_sessions.entry("workspace-1".into()).or_default();
+            stale_workspace.current_view = View::Agents;
+            stale_workspace.agents_view.snapshot = Some(Vec::new());
+            stale_workspace.agents_view.refetch_in_flight = true;
+        }
+
+        let text = render_to_text(&mut app, 80, 24);
+        let loading = rust_i18n::t!("agents.loading").into_owned();
+        assert!(
+            !text.contains(&loading),
+            "rendering must read the settled focused-surface snapshot, not the stale workspace placeholder; rendered:\n{text}"
+        );
+        assert!(
+            text.contains('↑') && text.contains('↓'),
+            "the settled empty state should render its navigation footer; rendered:\n{text}"
+        );
+    }
+
     /// Render: a queued permission request must paint its description and the
     /// allow/reject option labels. Lifts `ui/permission.rs` coverage.
     #[test]
@@ -15768,8 +17987,8 @@ mod tests {
 
         let text = render_to_text(&mut app, 80, 24);
         assert!(
-            text.contains("/restart"),
-            "the help overlay must list slash commands; rendered:\n{text}"
+            text.contains("/terminal:restart"),
+            "the help overlay must list namespaced terminal commands; rendered:\n{text}"
         );
     }
 
@@ -16154,7 +18373,10 @@ mod tests {
         app.begin_auth_checking();
 
         let auth = app.auth.as_ref().expect("auth screen present");
-        assert!(auth.checking, "begin_auth_checking must enter the checking state");
+        assert!(
+            auth.checking,
+            "begin_auth_checking must enter the checking state"
+        );
         assert!(
             auth.status_message.is_empty(),
             "a retry must clear the stale failure status so the checking view \
@@ -16181,9 +18403,16 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-        assert_eq!(app.mode, AppMode::Auth, "collapse stays on the sign-in screen");
+        assert_eq!(
+            app.mode,
+            AppMode::Auth,
+            "collapse stays on the sign-in screen"
+        );
         let auth = app.auth.as_ref().expect("collapse keeps the auth screen");
-        assert!(!auth.enterprise_mode, "first Esc collapses the enterprise input");
+        assert!(
+            !auth.enterprise_mode,
+            "first Esc collapses the enterprise input"
+        );
         assert!(
             auth.status_message.is_empty(),
             "collapsing must clear the enterprise failure status so it does not linger"
@@ -16258,11 +18487,22 @@ mod tests {
             .auth
             .as_ref()
             .expect("Esc collapse must not leave the sign-in screen");
-        assert!(!auth.enterprise_mode, "Esc must collapse the enterprise input");
-        assert_eq!(app.mode, AppMode::Auth, "Esc collapse must stay in Auth mode");
+        assert!(
+            !auth.enterprise_mode,
+            "Esc must collapse the enterprise input"
+        );
+        assert_eq!(
+            app.mode,
+            AppMode::Auth,
+            "Esc collapse must stay in Auth mode"
+        );
     }
 
-    fn agent_status_for_test(id: &str, display: &str, cli_found: bool) -> crate::agent_check::AgentStatus {
+    fn agent_status_for_test(
+        id: &str,
+        display: &str,
+        cli_found: bool,
+    ) -> crate::agent_check::AgentStatus {
         crate::agent_check::AgentStatus {
             id: id.into(),
             display_name: display.into(),
@@ -16317,7 +18557,10 @@ mod tests {
         app.show_copilot_auth_screen();
 
         assert_eq!(app.mode, AppMode::Auth);
-        assert!(app.setup.is_none(), "auth screen should replace setup state");
+        assert!(
+            app.setup.is_none(),
+            "auth screen should replace setup state"
+        );
         assert_eq!(app.current_agent_id, "copilot");
         let auth = app.auth.as_ref().expect("copilot auth state");
         assert_eq!(auth.agent_id, "copilot");
@@ -16466,7 +18709,6 @@ mod tests {
         );
     }
 
-
     /// the action's command body (the card shows the command, not the choice
     /// `title` field, which only surfaces for action-less choices) plus the
     /// run-command button. Lifts `ui/recommendations.rs` (reached only when
@@ -16522,9 +18764,12 @@ mod tests {
         {
             let tab = app.current_tab_mut();
             tab.messages.push(ChatMessage::User("USER_MSG_XYZ".into()));
-            tab.messages.push(ChatMessage::Agent("AGENT_MSG_XYZ".into()));
-            tab.messages.push(ChatMessage::System("SYSTEM_MSG_XYZ".into()));
-            tab.messages.push(ChatMessage::Error("ERROR_MSG_XYZ".into()));
+            tab.messages
+                .push(ChatMessage::Agent("AGENT_MSG_XYZ".into()));
+            tab.messages
+                .push(ChatMessage::System("SYSTEM_MSG_XYZ".into()));
+            tab.messages
+                .push(ChatMessage::Error("ERROR_MSG_XYZ".into()));
             tab.messages
                 .push(ChatMessage::AgentEvent("AGENT_EVENT_MSG_XYZ".into()));
             tab.messages.push(ChatMessage::Plan(vec![
@@ -16616,7 +18861,11 @@ mod tests {
         let probe: String = title.chars().take(6).collect();
         assert!(
             !probe.trim().is_empty() && text.contains(&probe),
-            "chat must paint the welcome title ({title:?}); rendered:\n{text}"
+            "chat must paint the compact first-use safety notice ({title:?}); rendered:\n{text}"
+        );
+        assert!(
+            !text.contains("Ctrl+Shift+."),
+            "the empty state must not duplicate host shortcut help; rendered:\n{text}"
         );
     }
 
@@ -16726,7 +18975,11 @@ mod tests {
 
         // The matching prompt id binds the resolved working pane.
         app.apply_autofix_target_resolved(Some(DEFAULT_TAB_ID.into()), 42, "pane-7".into());
-        assert_eq!(fix_target_pane(&app), "pane-7", "matching id binds the pane");
+        assert_eq!(
+            fix_target_pane(&app),
+            "pane-7",
+            "matching id binds the pane"
+        );
     }
 
     #[test]
@@ -17348,11 +19601,10 @@ mod tests {
 
         assert!(app.current_tab().input.is_empty());
         assert_eq!(app.current_tab().input_history.entries[0], "remember me");
-        assert!(
-            app.tab_sessions
-                .get("another-tab")
-                .is_some_and(|tab| tab.input_history.entries.is_empty())
-        );
+        assert!(app
+            .tab_sessions
+            .get("another-tab")
+            .is_some_and(|tab| tab.input_history.entries.is_empty()));
     }
 
     #[test]
@@ -17500,7 +19752,8 @@ mod tests {
     fn command_popup_keeps_arrow_priority_over_input_history() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = test_app();
-        app.current_tab_mut().record_input_history("historical prompt");
+        app.current_tab_mut()
+            .record_input_history("historical prompt");
         app.current_tab_mut().input.push('/');
         app.current_tab_mut().cursor_pos = 1;
         app.current_tab_mut().refresh_command_popup();
@@ -17593,12 +19846,7 @@ mod tests {
     #[test]
     fn chip_target_uses_send_parent_when_set() {
         let mut app = test_app();
-        stage_surfaced_recommendation(
-            &mut app,
-            vec![send_choice("pane-A", "ls")],
-            0,
-            None,
-        );
+        stage_surfaced_recommendation(&mut app, vec![send_choice("pane-A", "ls")], 0, None);
         assert_eq!(
             app.current_tab().compute_chip_card_target(),
             Some("pane-A".to_string()),
@@ -17629,12 +19877,7 @@ mod tests {
         // Some("") would let the helper's dedupe believe it pinned the chip
         // while WT silently ignores the event.
         let mut app = test_app();
-        stage_surfaced_recommendation(
-            &mut app,
-            vec![send_choice("", "fix")],
-            0,
-            Some(""),
-        );
+        stage_surfaced_recommendation(&mut app, vec![send_choice("", "fix")], 0, Some(""));
         assert_eq!(app.current_tab().compute_chip_card_target(), None);
     }
 
@@ -17672,12 +19915,7 @@ mod tests {
         // the next recompute observe a different value and clear the
         // last_emitted slot.
         let mut app = test_app();
-        stage_surfaced_recommendation(
-            &mut app,
-            vec![send_choice("pane-A", "ls")],
-            0,
-            None,
-        );
+        stage_surfaced_recommendation(&mut app, vec![send_choice("pane-A", "ls")], 0, None);
         app.recompute_chip_override(DEFAULT_TAB_ID);
         assert_eq!(
             app.tab_mut(DEFAULT_TAB_ID).last_emitted_chip_override,
@@ -17688,26 +19926,51 @@ mod tests {
         // the dedupe slot must follow so a fresh surface re-emits cleanly.
         app.tab_mut(DEFAULT_TAB_ID).turn = TurnState::Idle;
         app.recompute_chip_override(DEFAULT_TAB_ID);
-        assert_eq!(
-            app.tab_mut(DEFAULT_TAB_ID).last_emitted_chip_override,
-            None,
-        );
+        assert_eq!(app.tab_mut(DEFAULT_TAB_ID).last_emitted_chip_override, None,);
     }
 
     #[test]
     fn known_cli_id_returns_some_for_all_first_party_clis() {
         use crate::agent_sessions::CliSource;
-        assert_eq!(known_cli_id(&CliSource::Claude),  Some("claude"));
-        assert_eq!(known_cli_id(&CliSource::Codex),   Some("codex"));
+        assert_eq!(known_cli_id(&CliSource::Claude), Some("claude"));
+        assert_eq!(known_cli_id(&CliSource::Codex), Some("codex"));
         assert_eq!(known_cli_id(&CliSource::Copilot), Some("copilot"));
-        assert_eq!(known_cli_id(&CliSource::Gemini),  Some("gemini"));
+        assert_eq!(known_cli_id(&CliSource::Gemini), Some("gemini"));
         assert_eq!(known_cli_id(&CliSource::OpenCode), Some("opencode"));
     }
 
     #[test]
     fn known_cli_id_returns_none_for_unknown_variant() {
         use crate::agent_sessions::CliSource;
-        assert_eq!(known_cli_id(&CliSource::Unknown("anything".to_string())), None);
+        assert_eq!(
+            known_cli_id(&CliSource::Unknown("anything".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn wt_protocol_failure_keeps_chat_alive_and_surfaces_repair_action() {
+        let mut app = test_app();
+        app.state = ConnectionState::Connected;
+        app.wt_connected = true;
+        let message =
+            "Terminal controls unavailable: installed components are incompatible. Repair or reinstall Intelligent Terminal."
+                .to_string();
+
+        app.handle_event(AppEvent::WtProtocolFailure(message.clone()));
+        app.handle_event(AppEvent::WtProtocolFailure(message.clone()));
+
+        assert_eq!(app.state, ConnectionState::Connected);
+        assert!(!app.wt_connected);
+        assert_eq!(
+            app.current_tab()
+                .messages
+                .iter()
+                .filter(|item| matches!(item, ChatMessage::Error(existing) if existing == &message))
+                .count(),
+            1,
+            "the repair action must be visible but deduplicated"
+        );
     }
 
     #[test]
@@ -17715,22 +19978,24 @@ mod tests {
         use crate::agent_sessions::{AgentStatus, CliSource, SessionLocation, SessionOrigin};
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let row = crate::agent_sessions::AgentSession {
-            key:              "abc-123".to_string(),
-            cli_source:       CliSource::Copilot,
-            pane_session_id:  None,
-            window_id:        None,
-            tab_id:           None,
-            title:            "t".to_string(),
-            cwd:              std::path::PathBuf::from("/home/u/proj"),
-            started_at:       std::time::SystemTime::UNIX_EPOCH,
+            key: "abc-123".to_string(),
+            cli_source: CliSource::Copilot,
+            pane_session_id: None,
+            window_id: None,
+            tab_id: None,
+            title: "t".to_string(),
+            cwd: std::path::PathBuf::from("/home/u/proj"),
+            started_at: std::time::SystemTime::UNIX_EPOCH,
             last_activity_at: std::time::SystemTime::UNIX_EPOCH,
-            status:           AgentStatus::Historical,
-            last_error:       None,
-            current_tool:     None,
+            status: AgentStatus::Historical,
+            last_error: None,
+            current_tool: None,
             attention_reason: None,
-            log_path:         None,
-            origin:           SessionOrigin::Unknown,
-            location:         SessionLocation::Wsl { distro: "Ubuntu".to_string() },
+            log_path: None,
+            origin: SessionOrigin::Unknown,
+            location: SessionLocation::Wsl {
+                distro: "Ubuntu".to_string(),
+            },
         };
         let mut app = test_app();
         app.agent_sessions.merge_historical(vec![row]);
@@ -17744,7 +20009,9 @@ mod tests {
         assert_eq!(cmd.kind, DispatchedCommandKind::NewTabResume);
         let argv = cmd.argv.join(" ");
         assert!(
-            argv.contains("wsl -d Ubuntu --cd \"/home/u/proj\" -- bash -lc \"copilot --resume abc-123\""),
+            argv.contains(
+                "wsl -d Ubuntu --cd \"/home/u/proj\" -- bash -lc \"copilot --resume abc-123\""
+            ),
             "expected in-distro resume; argv: {argv}"
         );
         // The loading banner keeps the short session id and also names the
@@ -17754,6 +20021,9 @@ mod tests {
             "expected distro-named WSL banner; argv: {argv}"
         );
         // WSL rows must not also pass the Windows `-d <cwd>` flag.
-        assert!(!argv.contains(" -d /home"), "WSL row must not pass Windows -d cwd");
+        assert!(
+            !argv.contains(" -d /home"),
+            "WSL row must not pass Windows -d cwd"
+        );
     }
 }

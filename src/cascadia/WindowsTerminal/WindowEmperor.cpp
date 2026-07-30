@@ -1748,6 +1748,13 @@ void WindowEmperor::_initializeProtocolServer()
 {
     // Register COM class factory for cross-process access (runs on MTA thread).
     TerminalProtocolComServer::s_setEmperor(this);
+    GUID capabilityGuid{};
+    if (SUCCEEDED(CoCreateGuid(&capabilityGuid)))
+    {
+        _protocolCapabilityToken = Utils::GuidToPlainString(capabilityGuid);
+        TerminalProtocolComServer::s_setCapabilityToken(_protocolCapabilityToken);
+        SetEnvironmentVariableW(L"WT_PROTOCOL_TOKEN", _protocolCapabilityToken.c_str());
+    }
     if (SUCCEEDED_LOG(TerminalProtocolComServer::s_StartListening()))
     {
         // Stringify the CLSID so child processes can discover us via CoCreateInstance.

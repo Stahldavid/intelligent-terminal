@@ -10,10 +10,11 @@ no MCP server**; bare `wta` with neither `--master` nor `--connect-master` exits
 with an error.
 
 - **`wta-master`** (`--master <pipe>`, spawned once by the C++ `SharedWta`
-  singleton) -- the ACP **multiplexer**. Owns the *single* `ACP/stdio`
-  connection to the agent CLI subprocess (Copilot, Claude, Gemini, Codex, or a
-  custom command), listens on a named pipe, and fans per-helper ACP sessions
-  onto that one agent CLI. Implementation: `src/master/mod.rs`.
+  singleton) -- the ACP **multiplexer**. Owns a lazy pool of `ACP/stdio`
+  adapter connections keyed by trusted, registry-resolved commands. Helpers
+  selecting the same adapter reuse it; different adapters can run in parallel.
+  The master listens on a named pipe and routes each helper session to its
+  selected adapter. Implementation: `src/master/mod.rs`.
 - **`wta-helper`** (`--connect-master <pipe>`, spawned once per agent pane by
   Windows Terminal) -- the per-pane **TUI**. Drives the ratatui chat UI (`app.rs`)
   but, instead of spawning its own agent CLI, speaks ACP/JSON-RPC to master over
@@ -48,7 +49,7 @@ a single implementation today:
         +------+-------+                +--------+---------+
                |  ACP/stdio                      |  ShellManager
                v                                 |  (create_terminal /
-         Agent CLI                               |   permission)
+         Adapter pool                            |   permission)
       (copilot/claude/                           v
        gemini/codex)                        CliChannel
                                                  |
@@ -66,7 +67,7 @@ a single implementation today:
 
 ### ACP (Agent Client Protocol)
 
-ACP (`agent-client-protocol = "0.10"`, JSON-RPC 2.0) is spoken on **two hops**,
+ACP (`agent-client-protocol = "1.2.0"`, JSON-RPC 2.0) is spoken on **two hops**,
 because of the helper+master split:
 
 - **master ↔ agent CLI** (stdio): master is the ACP **client** of the agent CLI
@@ -123,7 +124,7 @@ Claude and Codex are launched through ACP adapters:
 
 ```
 wta --agent "npx -y @agentclientprotocol/claude-agent-acp"
-wta --agent "npx -y @agentclientprotocol/codex-acp@1.1.0"
+wta --agent "npx -y @agentclientprotocol/codex-acp@1.1.7"
 ```
 
 The Terminal settings layer resolves the built-in agent IDs to these adapter commands.
@@ -148,6 +149,8 @@ Agents that can shell out, and humans debugging WTA, can use WTA as a small WT h
 | `list-tabs` | `lst` | `list_tabs` |
 | `list-panes` | `lsp` | `list_panes` |
 | `new-tab` | `neww` | `create_tab` |
+| `new-surface` | `news` | `create_surface` |
+| `new-agent-surface` | `newas` | `create_managed_surface` |
 | `split-pane` | `splitw` | `split_pane` |
 | `capture-pane` | `capturep` | `read_pane_output` |
 | `kill-pane` | `killp` | `close_pane` |
@@ -241,7 +244,7 @@ green build says nothing about the tests.
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `agent-client-protocol` | 0.10 | ACP client library |
+| `agent-client-protocol` | 1.2.0 | ACP client library |
 | `tokio` | 1 | Async runtime |
 | `ratatui` | 0.30 | TUI rendering |
 | `crossterm` | 0.29 | Terminal I/O |

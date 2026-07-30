@@ -192,13 +192,17 @@ fn acp_command_for(cli: &CliSource) -> Option<String> {
 /// single argv element so its internal spaces survive intact (no quoting
 /// games).
 fn wsl_acp_argv(distro: &str, acp_cmd: &str) -> Vec<String> {
+    let script = format!(
+        "{} exec {acp_cmd}",
+        crate::agent_check::wsl_portable_node_path_prelude()
+    );
     vec![
         "-d".to_string(),
         distro.to_string(),
         "--".to_string(),
         "bash".to_string(),
         "-lc".to_string(),
-        acp_cmd.to_string(),
+        script,
     ]
 }
 
@@ -222,7 +226,10 @@ mod tests {
     use std::time::SystemTime;
 
     fn session_info(id: &str, cwd: &str) -> acp::schema::v1::SessionInfo {
-        acp::schema::v1::SessionInfo::new(acp::schema::v1::SessionId::new(id.to_string()), PathBuf::from(cwd))
+        acp::schema::v1::SessionInfo::new(
+            acp::schema::v1::SessionId::new(id.to_string()),
+            PathBuf::from(cwd),
+        )
     }
 
     fn map_wsl_session(
@@ -294,7 +301,7 @@ mod tests {
         );
         assert_eq!(
             acp_command_for(&CliSource::Codex).as_deref(),
-            Some("npx -y @agentclientprotocol/codex-acp@1.1.0")
+            Some("npx -y @agentclientprotocol/codex-acp@1.1.7")
         );
         assert_eq!(
             acp_command_for(&CliSource::OpenCode).as_deref(),
@@ -307,14 +314,12 @@ mod tests {
     #[test]
     fn wsl_acp_argv_uses_login_shell_and_single_cmd_arg() {
         let argv = wsl_acp_argv("Ubuntu", "copilot --acp --stdio");
-        assert_eq!(
-            argv,
-            vec!["-d", "Ubuntu", "--", "bash", "-lc", "copilot --acp --stdio"]
-        );
+        assert_eq!(&argv[..5], &["-d", "Ubuntu", "--", "bash", "-lc"]);
         // The whole ACP command must be ONE argv element (login shell sees
         // it as the script string), not split on spaces.
         assert_eq!(argv.len(), 6);
-        assert_eq!(argv[5], "copilot --acp --stdio");
+        assert!(argv[5].contains("$HOME/.local/share/intelligent-terminal/toolchains"));
+        assert!(argv[5].ends_with("exec copilot --acp --stdio"));
     }
 
     #[test]

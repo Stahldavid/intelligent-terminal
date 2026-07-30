@@ -3337,20 +3337,25 @@ dependencies = [
 
 [[package]]
 name = "wta"
-version = "0.1.0"
+version = "0.9.4"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
  "async-trait",
+ "base64",
  "clap",
  "crossterm",
  "futures",
+ "hex",
  "image",
+ "nix",
  "notify",
  "ratatui",
  "rust-i18n",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "sha2",
  "strsim",
  "sys-locale",
  "textwrap",

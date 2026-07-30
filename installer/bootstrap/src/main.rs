@@ -1,8 +1,9 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const FOOTER_MAGIC: &[u8; 16] = b"WTA-INSTALLER-V1";
@@ -35,17 +36,17 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let exit_code = (|| -> Result<i32, Box<dyn std::error::Error>> {
         extract_embedded_files(&exe_path, &temp_dir, &manifest)?;
 
-        let install_cmd = temp_dir.join("install.cmd");
-        if !install_cmd.is_file() {
-            return Err(format!("missing install.cmd in {}", temp_dir.display()).into());
+        for required_file in [
+            "install-local-terminal.ps1",
+            "ComProxyRegistration.ps1",
+            "payload.zip",
+        ] {
+            if !temp_dir.join(required_file).is_file() {
+                return Err(format!("missing {required_file} in {}", temp_dir.display()).into());
+            }
         }
 
-        let status = Command::new("cmd.exe")
-            .arg("/c")
-            .arg(&install_cmd)
-            .args(env::args_os().skip(1))
-            .current_dir(&temp_dir)
-            .status()?;
+        let status = run_installer(&temp_dir, env::args_os().skip(1))?;
 
         match status.code() {
             Some(code) => Ok(code),
@@ -68,6 +69,41 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         )
         .into()),
     }
+}
+
+fn run_installer<I, S>(temp_dir: &Path, forwarded_args: I) -> io::Result<ExitStatus>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    // Avoid cmd.exe's special /c quote stripping entirely. It can turn a
+    // batch file's `%~dp0` into the drive root (for example C:\), making the
+    // sibling script and payload appear missing. The bootstrap already owns
+    // the trusted extracted paths, so invoke PowerShell with those absolute
+    // paths and translate only the three documented switches.
+    let mut command = Command::new("powershell.exe");
+    command
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(temp_dir.join("install-local-terminal.ps1"))
+        .arg("-PayloadZip")
+        .arg(temp_dir.join("payload.zip"))
+        .current_dir(temp_dir);
+
+    for argument in forwarded_args {
+        let argument = argument.as_ref().to_string_lossy();
+        if argument.eq_ignore_ascii_case("/quiet") {
+            command.arg("-Quiet");
+        } else if argument.eq_ignore_ascii_case("/nopath") {
+            command.arg("-NoPathUpdate");
+        } else if argument.eq_ignore_ascii_case("/noshortcuts") {
+            command.arg("-NoShortcuts");
+        }
+    }
+
+    command.status()
 }
 
 fn create_temp_dir() -> io::Result<PathBuf> {
@@ -201,7 +237,8 @@ fn extract_embedded_files(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_manifest, EmbeddedFile};
+    use super::{create_temp_dir, parse_manifest, run_installer, EmbeddedFile};
+    use std::fs;
 
     #[test]
     fn parse_manifest_reads_multiple_entries() {
@@ -229,5 +266,39 @@ mod tests {
     fn parse_manifest_rejects_unknown_entry_kind() {
         let err = parse_manifest("dir|payload|0|10\n").expect_err("manifest should fail");
         assert!(err.to_string().contains("unsupported manifest entry kind"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installer_uses_absolute_extracted_paths_and_forwards_documented_arguments() {
+        let temp_dir = create_temp_dir().expect("temporary directory should be created");
+        let script_path = temp_dir.join("install-local-terminal.ps1");
+        fs::write(
+            &script_path,
+            "param([string]$PayloadZip,[switch]$Quiet,[switch]$NoPathUpdate,[switch]$NoShortcuts)\n@(\"PAYLOAD=$PayloadZip\", \"QUIET=$Quiet\", \"NOPATH=$NoPathUpdate\", \"NOSHORTCUTS=$NoShortcuts\") | Set-Content -Path invocation.txt\n",
+        )
+        .expect("test installer script should be written");
+        fs::write(temp_dir.join("payload.zip"), b"test payload")
+            .expect("test payload should be written");
+
+        let status = run_installer(&temp_dir, ["/quiet", "/nopath", "/noshortcuts"])
+            .expect("test installer should execute");
+        assert!(status.success());
+
+        let invocation = fs::read_to_string(temp_dir.join("invocation.txt"))
+            .expect("test installer should record its invocation");
+        let expected_payload = format!("PAYLOAD={}\\payload.zip", temp_dir.display());
+        assert!(
+            invocation.lines().any(|line| line == expected_payload),
+            "absolute payload path was not preserved: {invocation:?}"
+        );
+        for expected in ["QUIET=True", "NOPATH=True", "NOSHORTCUTS=True"] {
+            assert!(
+                invocation.lines().any(|line| line == expected),
+                "documented argument was not preserved: {invocation:?}"
+            );
+        }
+
+        fs::remove_dir_all(temp_dir).expect("temporary directory should be removed");
     }
 }

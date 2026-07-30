@@ -74,8 +74,10 @@ fn model_option_from_config(
     // non-Select entry happened to come first, hiding a valid Select later in
     // the list.
     let (opt, sel) = opts.iter().find_map(|o| {
-        let is_model = matches!(o.category, Some(acp::schema::v1::SessionConfigOptionCategory::Model))
-            || o.id.0.as_ref() == "model";
+        let is_model = matches!(
+            o.category,
+            Some(acp::schema::v1::SessionConfigOptionCategory::Model)
+        ) || o.id.0.as_ref() == "model";
         if !is_model {
             return None;
         }
@@ -304,15 +306,19 @@ mod tests {
             .on_receive_request(
                 |_req: acp::schema::v1::AgentRequest,
                  responder: acp::Responder<serde_json::Value>,
-                 _cx| async move { responder.respond_with_error(acp::Error::method_not_found()) },
+                 _cx| async move {
+                    responder.respond_with_error(acp::Error::method_not_found())
+                },
                 acp::on_receive_request!(),
             )
             .on_receive_notification(
                 |_n: acp::schema::v1::AgentNotification, _cx| async move { Ok(()) },
                 acp::on_receive_notification!(),
             );
-        let (client, client_io_fut) =
-            conn::spawn_client(client_builder, conn::byte_streams(cw.compat_write(), cr.compat()));
+        let (client, client_io_fut) = conn::spawn_client(
+            client_builder,
+            conn::byte_streams(cw.compat_write(), cr.compat()),
+        );
 
         let agent_builder = acp::Agent
             .builder()
@@ -349,8 +355,10 @@ mod tests {
                 |_n: acp::schema::v1::ClientNotification, _cx| async move { Ok(()) },
                 acp::on_receive_notification!(),
             );
-        let (_agent, agent_io_fut) =
-            conn::spawn_agent(agent_builder, conn::byte_streams(aw.compat_write(), ar.compat()));
+        let (_agent, agent_io_fut) = conn::spawn_agent(
+            agent_builder,
+            conn::byte_streams(aw.compat_write(), ar.compat()),
+        );
 
         tokio::task::spawn_local(async move {
             let _ = client_io_fut.await;
@@ -410,7 +418,10 @@ mod tests {
                 "set_model must NOT be called for a non-MethodNotFound error"
             );
             assert!(
-                matches!(*MODEL_SWITCH.read().unwrap(), ModelSwitchChannel::Config { .. }),
+                matches!(
+                    *MODEL_SWITCH.read().unwrap(),
+                    ModelSwitchChannel::Config { .. }
+                ),
                 "a non-MethodNotFound error must leave the channel on Config"
             );
         });

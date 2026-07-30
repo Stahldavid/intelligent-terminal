@@ -4,8 +4,10 @@
 > describes the *early* single-process design (standalone ACP TUI + `wta mcp`
 > server). The architecture has since moved to a **helper + master** model and
 > the MCP server mode was removed. For the current architecture see
-> [`OVERVIEW.md`](OVERVIEW.md) and [`AGENTS.md`](AGENTS.md). The sections below
-> are kept for history; treat their mode descriptions as outdated.
+> [`OVERVIEW.md`](OVERVIEW.md), [`AGENTS.md`](AGENTS.md), and
+> [`../../doc/fork-architecture-and-status.md`](../../doc/fork-architecture-and-status.md).
+> The sections below are kept for history; treat their mode descriptions and
+> dependency versions as outdated.
 
 ## Overview
 
